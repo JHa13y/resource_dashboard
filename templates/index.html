@@ -94,6 +94,13 @@
     .chart-wrap {
       position: relative;
       height: 200px;
+      min-width: 0; /* allow grid item to shrink below canvas content size */
+    }
+
+    /* Cap rendered canvas width so a wide canvas can never blow out its card */
+    .chart-wrap canvas {
+      max-width: 100%;
+      display: block;
     }
 
     /* ---- GPU cards ---- */
@@ -110,6 +117,7 @@
       border-radius: 12px;
       padding: 20px;
       box-shadow: 0 4px 24px rgba(0,0,0,.3);
+      min-width: 0; /* grid items default to min-width:auto – allow shrinking */
     }
 
     .gpu-header {
