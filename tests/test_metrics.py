@@ -108,18 +108,7 @@ def test_gpu_cli_not_found():
 def test_lspci_vendor_map_parses_subsystem():
     from app import _lspci_vendor_map, _parse_lspci_subsystem
 
-    lspci_output = (
-        "Slot:\t01:00.0\n"
-        "Class:\tVGA compatible controller\n"
-        "Vendor:\tNVIDIA Corporation\n"
-        "Device:\tGA102 [GeForce RTX 3080]\n"
-        "SVendor:\tGigabyte Technology Co., Ltd\n"
-        "SDevice:\tDevice 1234\n"
-    )
-
-    assert _parse_lspci_subsystem(lspci_output) == "Unknown"  # no Subsystem line in -vmm format
-
-    # Now test with the verbose format that has Subsystem:
+    # Machine-readable ``lspci -vm`` format uses a tab-separated SVendor line
     lspci_vm = (
         "Slot:\t01:00.0\n"
         "Class:\tVGA compatible controller\n"
@@ -128,7 +117,9 @@ def test_lspci_vendor_map_parses_subsystem():
         "SVendor:\tGigabyte Technology Co., Ltd\n"
         "SDevice:\tDevice 1234\n"
     )
-    # -vm format has Subsystem line
+    assert _parse_lspci_subsystem(lspci_vm) == "Gigabyte"
+
+    # Verbose ``lspci -v`` format has a Subsystem line instead
     lspci_subsys = (
         "01:00.0 VGA compatible controller: NVIDIA Corporation GA102 [GeForce RTX 3080]\n"
         "        Subsystem: Gigabyte Technology Co., Ltd Device 1234\n"
@@ -141,6 +132,15 @@ def test_lspci_vendor_map_parses_subsystem():
         "        Subsystem: Dell Device 5678\n"
     )
     assert _parse_lspci_subsystem(lspci_dell) == "Dell"
+
+    # Neither SVendor nor Subsystem present → empty string so caller fallbacks kick in
+    lspci_none = (
+        "Slot:\t01:00.0\n"
+        "Class:\tVGA compatible controller\n"
+        "Vendor:\tNVIDIA Corporation\n"
+        "Device:\tGA102 [GeForce RTX 3080]\n"
+    )
+    assert _parse_lspci_subsystem(lspci_none) == ""
 
 
 def test_lspci_vendor_map_not_found():

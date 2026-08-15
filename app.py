@@ -77,19 +77,37 @@ def _lspci_vendor_map(bus_ids: list[str]) -> dict[str, str]:
 
 
 def _parse_lspci_subsystem(output: str) -> str:
-    """Extract manufacturer name from an lspci Subsystem line.
+    """Extract the board vendor name from lspci output.
 
-    Expected format::
+    Handles both real-world formats::
 
-        Subsystem: Dell Device 1234
+        # ``lspci -s <bus> -vm`` (machine-readable, tab-separated):
+        Slot:\t01:00.0
+        Class:\tVGA compatible controller
+        Vendor:\tNVIDIA Corporation
+        Device:\tGA102 [GeForce RTX 3080]
+        SVendor:\tGigabyte Technology Co., Ltd
+        SDevice:\tDevice 1234
 
-    Returns the first token after "Subsystem:" (e.g. "Dell").
+        # ``lspci -s <bus> -v`` (verbose):
+        01:00.0 VGA compatible controller: NVIDIA Corporation GA102 [GeForce RTX 3080]
+                Subsystem: Dell Device 5678
+
+    An "SVendor:" line is preferred; the first token after it is returned
+    (e.g. "Gigabyte", "Dell"). If no SVendor line exists, falls back to the
+    first token after a "Subsystem:" line. Returns an empty string when
+    neither line is present so callers can apply their own fallbacks
+    (hex id / "unknown").
     """
+    for line in output.splitlines():
+        if "SVendor:" in line:
+            vendor_part = line.split("SVendor:", 1)[1].strip()
+            return vendor_part.split()[0] if vendor_part else ""
     for line in output.splitlines():
         if "Subsystem:" in line:
             vendor_part = line.split("Subsystem:", 1)[1].strip()
-            return vendor_part.split()[0] if vendor_part else "Unknown"
-    return "Unknown"
+            return vendor_part.split()[0] if vendor_part else ""
+    return ""
 
 
 # ---------------------------------------------------------------------------
