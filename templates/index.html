@@ -460,9 +460,14 @@ function updateGPUs(gpus) {
       card.id = `gpu-${gpu.index}`;
       card.className = 'gpu-card';
 
+      const vendor = (typeof gpu.board_vendor === 'string' ? gpu.board_vendor : '').trim();
+      const title = (vendor && vendor.toLowerCase() !== 'unknown')
+        ? `GPU ${gpu.index} · ${vendor} · ${gpu.name || `GPU ${gpu.index}`}`
+        : `GPU ${gpu.index}: ${gpu.name || `GPU ${gpu.index}`}`;
+
       card.innerHTML = `
         <div class="gpu-header">
-          <h3>GPU ${gpu.index}: ${gpu.name || `GPU ${gpu.index}`}</h3>
+          <h3>${title}</h3>
           <div class="badges">
             <span id="badge-hw-${gpu.index}" class="badge ok">HW Thermal</span>
             <span id="badge-sw-${gpu.index}" class="badge ok">SW Thermal</span>
