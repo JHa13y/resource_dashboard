@@ -164,11 +164,10 @@
 
     #conn-dot.connected { background: var(--green); }
 
-    /* ---- GPU chart grid (replaces inline style) ---- */
+    /* ---- GPU chart grid (single combined chart per card) ---- */
     .gpu-charts-grid {
       display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 8px;
+      grid-template-columns: 1fr;
     }
 
     /* ---- Mobile responsive fixes ---- */
@@ -203,10 +202,6 @@
 
       .gpu-card {
         padding: 14px;
-      }
-
-      .gpu-charts-grid {
-        grid-template-columns: 1fr;
       }
 
       #conn-status {
@@ -325,9 +320,70 @@ function makeLineChart(canvasId, label, color) {
 const cpuChart = makeLineChart('cpuChart', 'CPU %', '#6366f1');
 const memChart = makeLineChart('memChart', 'Memory %', '#22d3ee');
 
+/* Combined per-GPU chart: utilization (filled, left axis) + temperature (plain line, right axis) */
+function makeGpuChart(canvasId) {
+  const ctx = document.getElementById(canvasId).getContext('2d');
+  return new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [
+        {
+          label: 'Util %',
+          data: [],
+          yAxisID: 'y',
+          borderColor: '#f97316',
+          backgroundColor: 'rgba(249,115,22,.35)',
+          borderWidth: 2,
+          pointRadius: 0,
+          tension: 0.35,
+          fill: true,
+        },
+        {
+          label: 'Temp °C',
+          data: [],
+          yAxisID: 'y1',
+          borderColor: '#ef4444',
+          borderWidth: 2,
+          pointRadius: 0,
+          tension: 0.35,
+          fill: false,
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: { duration: 0 },
+      plugins: {
+        legend: {
+          display: true,
+          labels: { color: '#e2e8f0' },
+        },
+      },
+      scales: {
+        x: { ticks: { color: '#94a3b8', maxTicksLimit: 8 }, grid: { color: 'rgba(255,255,255,.06)' } },
+        y: {
+          position: 'left',
+          min: 0,
+          max: 100,
+          ticks: { color: '#94a3b8' },
+          grid: { color: 'rgba(255,255,255,.06)' },
+        },
+        y1: {
+          position: 'right',
+          min: 0,
+          max: 120,
+          ticks: { color: '#94a3b8' },
+          grid: { drawOnChartArea: false },
+        },
+      },
+    },
+  });
+}
+
 /* GPU chart registry – keyed by GPU index */
-const gpuChartsUtil = {};
-const gpuChartsTemp = {};
+const gpuCharts = {};
 
 /* ------------------------------------------------------------------ */
 /* SSE connection                                                      */
@@ -431,18 +487,12 @@ function updateGPUs(gpus) {
           </div>
         </div>
         <div class="gpu-charts-grid">
-          <div><canvas id="gpu-util-chart-${gpu.index}"></canvas></div>
-          <div><canvas id="gpu-temp-chart-${gpu.index}"></canvas></div>
+          <div class="chart-wrap"><canvas id="gpu-util-chart-${gpu.index}"></canvas></div>
         </div>`;
       container.appendChild(card);
 
-      /* Per-GPU charts */
-      gpuChartsUtil[gpu.index] = makeLineChart(
-        `gpu-util-chart-${gpu.index}`, 'GPU Util %', '#f97316'
-      );
-      gpuChartsTemp[gpu.index] = makeLineChart(
-        `gpu-temp-chart-${gpu.index}`, 'Temp °C', '#ef4444'
-      );
+      /* Per-GPU combined chart */
+      gpuCharts[gpu.index] = makeGpuChart(`gpu-util-chart-${gpu.index}`);
     }
 
     /* Update gauges */
@@ -468,22 +518,18 @@ function updateGPUs(gpus) {
     hwBadge.className = `badge ${gpu.throttle?.hw_thermal_slowdown ? 'active' : 'ok'}`;
     swBadge.className = `badge ${gpu.throttle?.sw_thermal_slowdown ? 'active' : 'ok'}`;
 
-    /* Per-GPU charts */
+    /* Per-GPU combined chart */
     const label = nowLabel();
-    [gpuChartsUtil[gpu.index], gpuChartsTemp[gpu.index]].forEach(c => {
-      c.data.labels.push(label);
-      c.data.datasets[0].data.push(
-        c === gpuChartsUtil[gpu.index] ? gpu.utilization_pct : gpu.temperature_c
-      );
-      if (c.data.labels.length > MAX_POINTS) {
-        c.data.labels.shift();
-        c.data.datasets[0].data.shift();
-      }
-    });
-    // Temp chart y-axis: 0-120 °C
-    gpuChartsTemp[gpu.index].options.scales.y.max = 120;
-    gpuChartsUtil[gpu.index].update('none');
-    gpuChartsTemp[gpu.index].update('none');
+    const gpuChart = gpuCharts[gpu.index];
+    gpuChart.data.labels.push(label);
+    gpuChart.data.datasets[0].data.push(gpu.utilization_pct);
+    gpuChart.data.datasets[1].data.push(gpu.temperature_c);
+    if (gpuChart.data.labels.length > MAX_POINTS) {
+      gpuChart.data.labels.shift();
+      gpuChart.data.datasets[0].data.shift();
+      gpuChart.data.datasets[1].data.shift();
+    }
+    gpuChart.update('none');
   }
 }
 </script>
