@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Resource Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg: #1a1b2e;
+      --card-bg: #232540;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --green: #22c55e;
+      --yellow: #eab308;
+      --red: #ef4444;
+      --accent: #6366f1;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 24px;
+    }
+
+    h1 {
+      text-align: center;
+      font-size: 1.6rem;
+      margin-bottom: 8px;
+      letter-spacing: -0.5px;
+    }
+
+    .subtitle {
+      text-align: center;
+      color: var(--muted);
+      font-size: 0.85rem;
+      margin-bottom: 24px;
+    }
+
+    /* ---- Grid layout ---- */
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+      gap: 16px;
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+
+    .card {
+      background: var(--card-bg);
+      border-radius: 12px;
+      padding: 20px;
+      box-shadow: 0 4px 24px rgba(0,0,0,.3);
+    }
+
+    .card h2 {
+      font-size: 0.95rem;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--muted);
+      margin-bottom: 12px;
+    }
+
+    /* ---- Gauge row ---- */
+    .gauges {
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    .gauge {
+      flex: 1;
+      min-width: 140px;
+      text-align: center;
+    }
+
+    .gauge-value {
+      font-size: 2.4rem;
+      font-weight: 700;
+      line-height: 1;
+    }
+
+    .gauge-label {
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin-top: 4px;
+    }
+
+    /* ---- Chart containers ---- */
+    .chart-wrap {
+      position: relative;
+      height: 200px;
+    }
+
+    /* ---- GPU cards ---- */
+    .gpu-section { grid-column: 1 / -1; }
+
+    .gpu-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+      gap: 16px;
+    }
+
+    .gpu-card {
+      background: var(--card-bg);
+      border-radius: 12px;
+      padding: 20px;
+      box-shadow: 0 4px 24px rgba(0,0,0,.3);
+    }
+
+    .gpu-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+
+    .gpu-header h3 { font-size: 1rem; }
+
+    /* ---- Throttle badges ---- */
+    .badges { display: flex; gap: 6px; }
+
+    .badge {
+      font-size: 0.7rem;
+      padding: 3px 8px;
+      border-radius: 999px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .badge.ok { background: rgba(34,197,94,.15); color: var(--green); }
+    .badge.active {
+      background: rgba(239,68,68,.2);
+      color: var(--red);
+      animation: pulse 1.2s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: .45; }
+    }
+
+    /* ---- Connection status ---- */
+    #conn-status {
+      position: fixed;
+      top: 12px;
+      right: 16px;
+      font-size: 0.75rem;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    #conn-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--red);
+    }
+
+    #conn-dot.connected { background: var(--green); }
+
+    /* ---- GPU chart grid (replaces inline style) ---- */
+    .gpu-charts-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
+    /* ---- Mobile responsive fixes ---- */
+    @media (max-width: 768px) {
+      body {
+        padding: 12px;
+      }
+
+      h1 {
+        font-size: 1.3rem;
+      }
+
+      .grid {
+        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      }
+
+      .gpu-grid {
+        grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      }
+
+      .chart-wrap {
+        height: 150px;
+      }
+
+      .gauge {
+        min-width: 100px;
+      }
+
+      .gauge-value {
+        font-size: 1.8rem;
+      }
+
+      .gpu-card {
+        padding: 14px;
+      }
+
+      .gpu-charts-grid {
+        grid-template-columns: 1fr;
+      }
+
+      #conn-status {
+        top: 6px;
+        right: 8px;
+        font-size: 0.65rem;
+      }
+
+      #conn-dot {
+        width: 6px;
+        height: 6px;
+      }
+    }
+  </style>
+</head>
+<body>
+
+  <div id="conn-status">
+    <span id="conn-dot"></span>
+    <span id="conn-text">Connecting…</span>
+  </div>
+
+  <h1>⚡ Resource Dashboard</h1>
+  <p class="subtitle" id="clock"></p>
+
+  <!-- System row -->
+  <div class="grid">
+    <div class="card">
+      <h2>CPU &amp; Memory</h2>
+      <div class="gauges">
+        <div class="gauge">
+          <div class="gauge-value" id="cpu-val">–</div>
+          <div class="gauge-label">CPU %</div>
+        </div>
+        <div class="gauge">
+          <div class="gauge-value" id="mem-val">–</div>
+          <div class="gauge-label">Memory %</div>
+        </div>
+        <div class="gauge">
+          <div class="gauge-value" id="mem-detail">–</div>
+          <div class="gauge-label">Used / Total GB</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>CPU Trend (60 s)</h2>
+      <div class="chart-wrap"><canvas id="cpuChart"></canvas></div>
+    </div>
+
+    <div class="card">
+      <h2>Memory Trend (60 s)</h2>
+      <div class="chart-wrap"><canvas id="memChart"></canvas></div>
+    </div>
+  </div>
+
+  <!-- GPU section -->
+  <div class="gpu-section" style="margin-top:16px;">
+    <div class="gpu-grid" id="gpu-container">
+      <!-- GPU cards injected by JS -->
+    </div>
+  </div>
+
+<script>
+/* ------------------------------------------------------------------ */
+/* Helpers                                                             */
+/* ------------------------------------------------------------------ */
+const MAX_POINTS = 60;
+
+function colorFor(pct) {
+  if (pct == null) return '#94a3b8';
+  if (pct < 60) return '#22c55e';
+  if (pct < 85) return '#eab308';
+  return '#ef4444';
+}
+
+function nowLabel() {
+  const d = new Date();
+  return d.toLocaleTimeString('en-GB'); // HH:MM:SS
+}
+
+/* ------------------------------------------------------------------ */
+/* Chart setup                                                         */
+/* ------------------------------------------------------------------ */
+const chartDefaults = {
+  responsive: true,
+  maintainAspectRatio: false,
+  animation: { duration: 0 },
+  plugins: { legend: { display: false } },
+  scales: {
+    x: { ticks: { color: '#94a3b8', maxTicksLimit: 8 }, grid: { color: 'rgba(255,255,255,.06)' } },
+    y: { min: 0, max: 100, ticks: { color: '#94a3b8' }, grid: { color: 'rgba(255,255,255,.06)' } },
+  },
+};
+
+function makeLineChart(canvasId, label, color) {
+  const ctx = document.getElementById(canvasId).getContext('2d');
+  return new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [{
+        label,
+        data: [],
+        borderColor: color,
+        borderWidth: 2,
+        pointRadius: 0,
+        tension: 0.35,
+        fill: { target: 'origin', above: color.replace(')', ',.1)').replace('rgb', 'rgba') },
+      }],
+    },
+    options: chartDefaults,
+  });
+}
+
+const cpuChart = makeLineChart('cpuChart', 'CPU %', '#6366f1');
+const memChart = makeLineChart('memChart', 'Memory %', '#22d3ee');
+
+/* GPU chart registry – keyed by GPU index */
+const gpuChartsUtil = {};
+const gpuChartsTemp = {};
+
+/* ------------------------------------------------------------------ */
+/* SSE connection                                                      */
+/* ------------------------------------------------------------------ */
+const connDot  = document.getElementById('conn-dot');
+const connText = document.getElementById('conn-text');
+
+function setConnected(ok) {
+  connDot.classList.toggle('connected', ok);
+  connText.textContent = ok ? 'Live' : 'Disconnected';
+}
+
+const source = new EventSource('/events');
+
+source.addEventListener('error', () => setConnected(false));
+source.onopen = () => setConnected(true);
+
+source.onmessage = (e) => {
+  const m = JSON.parse(e.data);
+  updateSystem(m);
+  updateGPUs(m.gpus || []);
+};
+
+/* ------------------------------------------------------------------ */
+/* System gauges + charts                                              */
+/* ------------------------------------------------------------------ */
+function updateSystem(m) {
+  // Gauges
+  const cpuEl = document.getElementById('cpu-val');
+  const memEl = document.getElementById('mem-val');
+  const detailEl = document.getElementById('mem-detail');
+
+  cpuEl.textContent = m.cpu != null ? `${m.cpu}%` : '–';
+  cpuEl.style.color = colorFor(m.cpu);
+
+  memEl.textContent = m.memory?.percent != null ? `${m.memory.percent}%` : '–';
+  memEl.style.color = colorFor(m.memory?.percent);
+
+  if (m.memory) {
+    detailEl.textContent = `${m.memory.used_gb} / ${m.memory.total_gb}`;
+  }
+
+  // Charts
+  const label = nowLabel();
+  [cpuChart, memChart].forEach(c => {
+    c.data.labels.push(label);
+    c.data.datasets[0].data.push(
+      c === cpuChart ? m.cpu : (m.memory?.percent ?? null)
+    );
+    if (c.data.labels.length > MAX_POINTS) {
+      c.data.labels.shift();
+      c.data.datasets[0].data.shift();
+    }
+  });
+  cpuChart.update('none');
+  memChart.update('none');
+
+  // Clock subtitle
+  document.getElementById('clock').textContent = new Date().toLocaleString();
+}
+
+/* ------------------------------------------------------------------ */
+/* GPU cards (dynamic creation)                                        */
+/* ------------------------------------------------------------------ */
+function updateGPUs(gpus) {
+  const container = document.getElementById('gpu-container');
+
+  for (const gpu of gpus) {
+    let card = document.getElementById(`gpu-${gpu.index}`);
+
+    /* Create card on first sight */
+    if (!card) {
+      card = document.createElement('div');
+      card.id = `gpu-${gpu.index}`;
+      card.className = 'gpu-card';
+
+      card.innerHTML = `
+        <div class="gpu-header">
+          <h3>GPU ${gpu.index}: ${gpu.name || `GPU ${gpu.index}`}</h3>
+          <div class="badges">
+            <span id="badge-hw-${gpu.index}" class="badge ok">HW Thermal</span>
+            <span id="badge-sw-${gpu.index}" class="badge ok">SW Thermal</span>
+          </div>
+        </div>
+        <div class="gauges" style="margin-bottom:12px;">
+          <div class="gauge">
+            <div class="gauge-value" id="gpu-util-${gpu.index}">–</div>
+            <div class="gauge-label">Util %</div>
+          </div>
+          <div class="gauge">
+            <div class="gauge-value" id="gpu-mem-${gpu.index}">–</div>
+            <div class="gauge-label">Mem %</div>
+          </div>
+          <div class="gauge">
+            <div class="gauge-value" id="gpu-temp-${gpu.index}">–</div>
+            <div class="gauge-label">Temp °C</div>
+          </div>
+          <div class="gauge">
+            <div class="gauge-value" id="gpu-clock-${gpu.index}">–</div>
+            <div class="gauge-label">Clock MHz</div>
+          </div>
+        </div>
+        <div class="gpu-charts-grid">
+          <div><canvas id="gpu-util-chart-${gpu.index}"></canvas></div>
+          <div><canvas id="gpu-temp-chart-${gpu.index}"></canvas></div>
+        </div>`;
+      container.appendChild(card);
+
+      /* Per-GPU charts */
+      gpuChartsUtil[gpu.index] = makeLineChart(
+        `gpu-util-chart-${gpu.index}`, 'GPU Util %', '#f97316'
+      );
+      gpuChartsTemp[gpu.index] = makeLineChart(
+        `gpu-temp-chart-${gpu.index}`, 'Temp °C', '#ef4444'
+      );
+    }
+
+    /* Update gauges */
+    const utilEl  = document.getElementById(`gpu-util-${gpu.index}`);
+    const memEl   = document.getElementById(`gpu-mem-${gpu.index}`);
+    const tempEl  = document.getElementById(`gpu-temp-${gpu.index}`);
+    const clockEl = document.getElementById(`gpu-clock-${gpu.index}`);
+
+    utilEl.textContent  = `${gpu.utilization_pct}%`;
+    utilEl.style.color  = colorFor(gpu.utilization_pct);
+
+    memEl.textContent   = `${gpu.memory_pct}%`;
+    memEl.style.color   = colorFor(gpu.memory_pct);
+
+    tempEl.textContent  = `${gpu.temperature_c}°C`;
+    tempEl.style.color  = gpu.temperature_c > 85 ? '#ef4444' : gpu.temperature_c > 70 ? '#eab308' : '#22c55e';
+
+    clockEl.textContent = gpu.graphics_clock_mhz != null ? `${gpu.graphics_clock_mhz}` : '–';
+
+    /* Throttle badges */
+    const hwBadge = document.getElementById(`badge-hw-${gpu.index}`);
+    const swBadge = document.getElementById(`badge-sw-${gpu.index}`);
+    hwBadge.className = `badge ${gpu.throttle?.hw_thermal_slowdown ? 'active' : 'ok'}`;
+    swBadge.className = `badge ${gpu.throttle?.sw_thermal_slowdown ? 'active' : 'ok'}`;
+
+    /* Per-GPU charts */
+    const label = nowLabel();
+    [gpuChartsUtil[gpu.index], gpuChartsTemp[gpu.index]].forEach(c => {
+      c.data.labels.push(label);
+      c.data.datasets[0].data.push(
+        c === gpuChartsUtil[gpu.index] ? gpu.utilization_pct : gpu.temperature_c
+      );
+      if (c.data.labels.length > MAX_POINTS) {
+        c.data.labels.shift();
+        c.data.datasets[0].data.shift();
+      }
+    });
+    // Temp chart y-axis: 0-120 °C
+    gpuChartsTemp[gpu.index].options.scales.y.max = 120;
+    gpuChartsUtil[gpu.index].update('none');
+    gpuChartsTemp[gpu.index].update('none');
+  }
+}
+</script>
+</body>
+</html>
