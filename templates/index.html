@@ -333,8 +333,74 @@ function makeLineChart(canvasId, label, color) {
   });
 }
 
-const cpuChart = makeLineChart('cpuChart', 'CPU %', '#6366f1');
 const memChart = makeLineChart('memChart', 'Memory %', '#22d3ee');
+
+/* CPU trend: one thin line per core + total CPU as a shaded area under a bold line.
+   Built lazily on the first SSE message so we know the core count. */
+let cpuChart = null;
+let cpuCoreCount = 0;
+
+function coreColor(i, total) {
+  const hue = Math.round((i * 360) / Math.max(total, 1)) % 360;
+  return `hsl(${hue}, 75%, 62%)`;
+}
+
+function buildCpuChart(cores) {
+  if (cpuChart) cpuChart.destroy();
+  cpuCoreCount = cores;
+
+  const datasets = [{
+    label: 'All CPUs',
+    data: [],
+    borderColor: '#6366f1',
+    borderWidth: 2.5,
+    pointRadius: 0,
+    tension: 0.35,
+    fill: { target: 'origin', above: hexToRgba('#6366f1', 0.25) },
+    order: 0,
+  }];
+  for (let i = 0; i < cores; i++) {
+    datasets.push({
+      label: `CPU ${i}`,
+      data: [],
+      borderColor: coreColor(i, cores),
+      borderWidth: 1,
+      pointRadius: 0,
+      tension: 0.35,
+      fill: false,
+      hidden: false,
+      order: 1,
+    });
+  }
+
+  const ctx = document.getElementById('cpuChart').getContext('2d');
+  cpuChart = new Chart(ctx, {
+    type: 'line',
+    data: { labels: [], datasets },
+    options: {
+      ...chartDefaults,
+      plugins: {
+        legend: {
+          display: true,
+          position: 'bottom',
+          labels: {
+            color: '#94a3b8',
+            boxWidth: 10,
+            boxHeight: 2,
+            font: { size: 10 },
+            padding: 8,
+            // Only show "All CPUs" – per-core lines appear in the hover tooltip
+            filter: (item) => item.datasetIndex === 0,
+          },
+        },
+        tooltip: {
+          // Sort entries by value so the hottest core is on top
+          itemSort: (a, b) => (b.parsed.y ?? -1) - (a.parsed.y ?? -1),
+        },
+      },
+    },
+  });
+}
 
 /* Combined per-GPU chart: utilization (filled, left axis) + temperature (plain line, right axis) */
 function makeGpuChart(canvasId) {
@@ -383,6 +449,7 @@ function makeGpuChart(canvasId) {
           position: 'left',
           min: 0,
           max: 100,
+          title: { display: true, text: 'Utilization %', color: '#f97316', font: { size: 11 } },
           ticks: { color: '#94a3b8' },
           grid: { color: 'rgba(255,255,255,.06)' },
         },
@@ -390,6 +457,7 @@ function makeGpuChart(canvasId) {
           position: 'right',
           min: 0,
           max: 120,
+          title: { display: true, text: 'Temp °C', color: '#ef4444', font: { size: 11 } },
           ticks: { color: '#94a3b8' },
           grid: { drawOnChartArea: false },
         },
@@ -444,17 +512,32 @@ function updateSystem(m) {
 
   // Charts
   const label = nowLabel();
-  [cpuChart, memChart].forEach(c => {
-    c.data.labels.push(label);
-    c.data.datasets[0].data.push(
-      c === cpuChart ? m.cpu : (m.memory?.percent ?? null)
-    );
-    if (c.data.labels.length > MAX_POINTS) {
-      c.data.labels.shift();
-      c.data.datasets[0].data.shift();
-    }
-  });
+
+  /* CPU chart – (re)build if core count is new/changed (e.g. CPU hotplug) */
+  const perCore = Array.isArray(m.cpu_per_core) && m.cpu_per_core.length > 0
+    ? m.cpu_per_core
+    : [0];
+  if (!cpuChart || perCore.length !== cpuCoreCount) {
+    buildCpuChart(perCore.length);
+  }
+  cpuChart.data.labels.push(label);
+  cpuChart.data.datasets[0].data.push(m.cpu);
+  for (let i = 0; i < perCore.length; i++) {
+    cpuChart.data.datasets[i + 1].data.push(perCore[i]);
+  }
+  if (cpuChart.data.labels.length > MAX_POINTS) {
+    cpuChart.data.labels.shift();
+    cpuChart.data.datasets.forEach(ds => ds.data.shift());
+  }
   cpuChart.update('none');
+
+  /* Memory chart */
+  memChart.data.labels.push(label);
+  memChart.data.datasets[0].data.push(m.memory?.percent ?? null);
+  if (memChart.data.labels.length > MAX_POINTS) {
+    memChart.data.labels.shift();
+    memChart.data.datasets[0].data.shift();
+  }
   memChart.update('none');
 
   // Clock subtitle
