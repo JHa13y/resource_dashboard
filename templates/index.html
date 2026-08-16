@@ -477,7 +477,8 @@ function updateGPUs(gpus) {
       card.className = 'gpu-card';
 
       const vendor = (typeof gpu.board_vendor === 'string' ? gpu.board_vendor : '').trim();
-      const title = (vendor && vendor.toLowerCase() !== 'unknown')
+      const isVendor = !!vendor && vendor.toLowerCase() !== 'unknown' && !/^0x[0-9a-f]+$/i.test(vendor);
+      const title = isVendor
         ? `GPU ${gpu.index} · ${vendor} · ${gpu.name || `GPU ${gpu.index}`}`
         : `GPU ${gpu.index}: ${gpu.name || `GPU ${gpu.index}`}`;
 
