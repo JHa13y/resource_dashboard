@@ -11,12 +11,14 @@ A lightweight, real-time web dashboard for monitoring CPU load, memory usage, an
   - Temperature in °C
   - Current graphics clock frequency (MHz)
   - Thermal throttle indicators (`hw_thermal_slowdown`, `sw_thermal_slowdown`) — pulsing red when active
+- **llama.cpp / local LLM** (when a `llama-server` is reachable): generation & prompt tokens/s, request queue (processing/deferred), context high-water mark, loaded model name, and per-slot context usage bars
 - **Real-time updates** via Server-Sent Events (SSE) — no page refreshes needed
 
 ## Prerequisites
 
 - Python 3.10+
 - NVIDIA GPU drivers with `nvidia-smi` available (for GPU metrics; dashboard works without GPUs)
+- (Optional) llama.cpp `llama-server` started with `--metrics` for the Local LLM section; `/props` and `/slots` are served by default
 
 ## Installation
 
@@ -36,9 +38,18 @@ The `nvidia-ml-py` package is included in `requirements.txt`. If installation fa
 ```bash
 python app.py                          # binds 0.0.0.0:5000
 python app.py --host 127.0.0.1 --port 8080
+python app.py --llama-url http://192.168.1.50:5001   # point at your llama-server
 ```
 
 Then open **http://localhost:5000** (or your chosen host/port) in your browser.
+
+### llama.cpp section
+
+`--llama-url` (default `http://127.0.0.1:5001`) is the base URL of your `llama-server`. The default is a local-dev convenience only — in production the dashboard usually runs on a **different host** than the llama-server, so pass the remote URL explicitly (e.g. `--llama-url http://<llama-host>:5001`). The card shows **unreachable** when the URL is wrong, unroutable, or the server was not started with `--metrics`.
+
+Notes:
+- Gen/prompt tokens/s are windowed rates over the 1 s scrape interval; token totals are cumulative since server start.
+- The model name and slot count come from `GET /props` (cached 30 s); per-slot context usage (`used / n_ctx`) comes from `GET /slots` and updates every second.
 
 ### One-shot API (for testing / scripting)
 
@@ -79,4 +90,5 @@ resource_dashboard/
 |-------|-----|
 | `nvidia-ml-py` install fails | Dashboard falls back to CLI parsing automatically. To fix: install NVIDIA driver development headers (`nvidia-driver-dev` on Ubuntu). |
 | No GPU data shown | Verify `nvidia-smi` works in terminal. If it errors, check NVIDIA drivers are installed and running. |
+| LLM card shows "unreachable" | Check `--llama-url` is reachable from the dashboard host (`curl <url>/metrics`), that `llama-server` was started with `--metrics`, and that any firewall allows the port. |
 | Charts not updating | Check browser console for SSE connection errors. The green "Live" dot in the top-right corner indicates a healthy connection. |

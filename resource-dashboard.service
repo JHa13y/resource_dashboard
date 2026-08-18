@@ -7,7 +7,10 @@ Wants=network-online.target
 Type=simple
 User=joshua
 WorkingDirectory=/home/joshua/resource_dashboard
-ExecStart=/home/joshua/resource_dashboard/.venv/bin/python /home/joshua/resource_dashboard/app.py --host 0.0.0.0 --port 5000
+# Replace LLAMA_HOST with the hostname/IP of the machine running llama-server
+# (dashboard and llama-server are on different hosts; drop the flag if the
+# Local LLM section is not needed).
+ExecStart=/home/joshua/resource_dashboard/.venv/bin/python /home/joshua/resource_dashboard/app.py --host 0.0.0.0 --port 5000 --llama-url http://LLAMA_HOST:5001
 Restart=on-failure
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
