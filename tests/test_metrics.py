@@ -277,3 +277,226 @@ def test_collect_gpu_prefers_pynvml():
         result = collect_gpu_metrics()
         assert len(result) == 1
         mock_cli.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# llama.cpp collector tests
+# ---------------------------------------------------------------------------
+
+LLAMA_METRICS_SAMPLE = (
+    "# HELP llamacpp:tokens_predicted_total Number of generation tokens processed\n"
+    "# TYPE llamacpp:tokens_predicted_total counter\n"
+    "llamacpp:tokens_predicted_total 123456\n"
+    "llamacpp:predicted_tokens_seconds 52.94\n"
+    "llamacpp:prompt_tokens_seconds 32.3\n"
+    "llamacpp:requests_processing 1\n"
+    "llamacpp:requests_deferred 0\n"
+    "llamacpp:n_tokens_max 4096\n"
+    "llamacpp:prompt_tokens_cached_total 2048\n"
+    'llamacpp:spec_decode_num_accepted_tokens_per_pos_total{position="0"} 5\n'
+)
+
+
+@pytest.fixture(autouse=True)
+def no_real_llama():
+    """Ensure llama-server HTTP endpoints are never actually reached."""
+    with patch(
+        "app.urllib.request.urlopen",
+        side_effect=ConnectionRefusedError("no llama-server in tests"),
+    ):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def reset_llama_props_cache():
+    """Reset the module-level /props cache around every test."""
+    import app as app_mod
+
+    original = app_mod._llama_props_cache
+    app_mod._llama_props_cache = None
+    yield
+    app_mod._llama_props_cache = original
+
+
+def _http_response(body: bytes):
+    """A context-manager mock standing in for urllib's response object."""
+    resp = MagicMock()
+    resp.read.return_value = body
+    resp.__enter__.return_value = resp
+    resp.__exit__.return_value = False
+    return resp
+
+
+def make_llama_server(routes: dict, calls: list | None = None):
+    """Build a side_effect for ``app.urllib.request.urlopen``.
+
+    *routes* maps a URL path suffix (e.g. ``"/metrics"``) to either a
+    bytes body or an exception instance to raise.
+    """
+    def fake_urlopen(url, timeout=None):
+        if calls is not None:
+            calls.append(url)
+        for suffix, body in routes.items():
+            if url.endswith(suffix):
+                if isinstance(body, Exception):
+                    raise body
+                return _http_response(body)
+        raise ConnectionRefusedError(f"no route for {url}")
+
+    return fake_urlopen
+
+
+def test_collect_llama_ok():
+    from app import collect_llama_metrics
+
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+        "/props": b'{"model_path": "/models/x.gguf", "total_slots": 1}',
+        "/slots": b"[]",
+    })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result is not None
+    assert result["status"] == "up"
+    assert result["gen_tokens_per_s"] == 52.9
+    assert result["prompt_tokens_per_s"] == 32.3
+    assert result["gen_tokens_total"] == 123456.0
+    assert result["prompt_tokens_cached_total"] == 2048.0
+    assert result["requests_processing"] == 1.0
+    assert result["requests_deferred"] == 0.0
+    assert result["context_tokens_max"] == 4096.0
+    assert result["model"] == "x.gguf"
+    assert result["slots"] == []
+    # labeled series must be dropped by the parser
+    assert "spec_decode" not in json.dumps(result)
+
+
+def test_collect_llama_unreachable():
+    from app import collect_llama_metrics
+
+    # no_real_llama fixture makes urlopen raise ConnectionRefusedError
+    assert collect_llama_metrics("http://127.0.0.1:9999") is None
+
+
+def test_collect_llama_json_escaped_body():
+    """2025 builds JSON-escaped the whole /metrics body (PR #17386)."""
+    from app import collect_llama_metrics
+
+    escaped = json.dumps(LLAMA_METRICS_SAMPLE)
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/metrics": escaped.encode(),
+        "/props": b"{}",
+        "/slots": b"[]",
+    })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result is not None
+    assert result["gen_tokens_per_s"] == 52.9
+    assert result["gen_tokens_total"] == 123456.0
+
+
+def test_collect_llama_no_llamacpp_metrics():
+    from app import collect_llama_metrics
+
+    for body in ("", "some:other_metric 1\n# HELP foo bar\n"):
+        with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+            "/metrics": body.encode(),
+            "/props": b"{}",
+            "/slots": b"[]",
+        })):
+            assert collect_llama_metrics("http://127.0.0.1:9999") is None
+
+
+def test_parse_prometheus_skips_labels_and_comments():
+    from app import _parse_prometheus
+
+    text = (
+        "# HELP llamacpp:tokens_predicted_total desc\n"
+        "# TYPE llamacpp:tokens_predicted_total counter\n"
+        'llamacpp:spec_decode_num_accepted_tokens_per_pos_total{position="0"} 5\n'
+        "llamacpp:tokens_predicted_total 42\n"
+    )
+    assert _parse_prometheus(text) == {"llamacpp:tokens_predicted_total": 42.0}
+
+
+def test_collect_llama_props_and_slots():
+    from app import collect_llama_metrics
+
+    props = {"model_path": "/models/qwen3.8-q6.gguf", "total_slots": 2,
+             "is_sleeping": False}
+    slots = [
+        {"id": 0, "n_ctx": 8192, "n_prompt_tokens": 4096, "is_processing": True,
+         "next_token": {"n_decoded": 512, "n_remain": 10}},
+        {"id": 1, "n_ctx": 8192, "n_prompt_tokens": 0, "is_processing": False,
+         "next_token": {"n_decoded": 0, "n_remain": 0}},
+    ]
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+        "/props": json.dumps(props).encode(),
+        "/slots": json.dumps(slots).encode(),
+    })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result is not None
+    assert result["model"] == "qwen3.8-q6.gguf"
+    assert result["model_path"] == "/models/qwen3.8-q6.gguf"
+    assert result["total_slots"] == 2
+    assert result["sleeping"] is False
+
+    s0, s1 = result["slots"]
+    assert s0["id"] == 0
+    assert s0["context_used"] == 4608
+    assert s0["context_pct"] == round(100 * 4608 / 8192, 1)
+    assert s0["is_processing"] is True
+    assert s1["id"] == 1
+    assert s1["context_used"] == 0
+    assert s1["context_pct"] == 0.0
+    assert s1["is_processing"] is False
+
+
+def test_collect_llama_slots_failure():
+    """/slots down must not break the metrics/props data."""
+    from app import collect_llama_metrics
+
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+        "/props": b'{"model_path": "/models/x.gguf"}',
+        "/slots": ConnectionRefusedError("nope"),
+    })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result is not None
+    assert result["status"] == "up"
+    assert result["gen_tokens_per_s"] == 52.9
+    assert result["model"] == "x.gguf"
+    assert result["slots"] == []
+
+
+def test_collect_llama_props_cached():
+    """/props is fetched once per 30 s TTL, then re-fetched when stale."""
+    import app as app_mod
+    from app import collect_llama_metrics
+
+    calls: list[str] = []
+    props_body = b'{"model_path": "/models/x.gguf"}'
+
+    def fake_urlopen(url, timeout=None):
+        calls.append(url)
+        if url.endswith("/metrics"):
+            return _http_response(b"llamacpp:tokens_predicted_total 1\n")
+        if url.endswith("/props"):
+            return _http_response(props_body)
+        return _http_response(b"[]")  # /slots
+
+    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen):
+        collect_llama_metrics("http://127.0.0.1:9999")
+        collect_llama_metrics("http://127.0.0.1:9999")
+    assert calls.count("http://127.0.0.1:9999/props") == 1
+
+    # Age the cache past the 30 s TTL -> must be re-fetched
+    app_mod._llama_props_cache = (
+        time.monotonic() - 31.0, {"model_path": "/models/x.gguf"}
+    )
+    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen):
+        collect_llama_metrics("http://127.0.0.1:9999")
+    assert calls.count("http://127.0.0.1:9999/props") == 2
