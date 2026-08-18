@@ -325,11 +325,14 @@ def reset_llama_prev():
 
     original_prev = app_mod._llama_prev
     original_last_good = app_mod._llama_last_good
+    original_slot_prev = app_mod._llama_slot_prev
     app_mod._llama_prev = None
     app_mod._llama_last_good = None
+    app_mod._llama_slot_prev = None
     yield
     app_mod._llama_prev = original_prev
     app_mod._llama_last_good = original_last_good
+    app_mod._llama_slot_prev = original_slot_prev
 
 
 class _FakeClock:
@@ -540,10 +543,117 @@ def test_collect_llama_props_and_slots():
     assert s0["context_used"] == 4608
     assert s0["context_pct"] == round(100 * 4608 / 8192, 1)
     assert s0["is_processing"] is True
+    assert s0["decoded"] == 512
+    # n_prompt_tokens_processed absent in the fixture -> 0
+    assert s0["prompt_processed"] == 0
     assert s1["id"] == 1
     assert s1["context_used"] == 0
     assert s1["context_pct"] == 0.0
     assert s1["is_processing"] is False
+
+
+def test_parse_llama_slots_next_token_shapes():
+    """next_token arrives as a dict (classic builds) or a LIST of dicts
+    (e.g. the LM Studio build); both must parse to a decoded total."""
+    from app import _parse_llama_slots
+
+    # dict shape
+    d = _parse_llama_slots([{
+        "id": 0, "n_ctx": 100, "n_prompt_tokens": 10,
+        "n_prompt_tokens_processed": 7,
+        "next_token": {"n_decoded": 512},
+    }])
+    assert d[0]["decoded"] == 512
+    assert d[0]["prompt_processed"] == 7
+
+    # list shape: total n_decoded, skip non-dict items
+    l = _parse_llama_slots([{
+        "id": 0, "n_ctx": 100, "n_prompt_tokens": 10,
+        "n_prompt_tokens_processed": 3,
+        "next_token": [
+            {"has_next_token": True, "has_new_line": False,
+             "n_remain": 16374, "n_decoded": 10},
+            {"n_decoded": 5},
+            "garbage",
+        ],
+    }])
+    assert l[0]["decoded"] == 15
+    assert l[0]["prompt_processed"] == 3
+    # context = prompt + decoded
+    assert l[0]["context_used"] == 25
+
+
+def test_collect_llama_live_rate_from_slots():
+    """Live tokens/s from per-slot decode counters: the /metrics counters
+    only advance on request completion on some builds (e.g. LM Studio),
+    while n_decoded / n_prompt_tokens_processed update per token."""
+    from app import collect_llama_metrics
+
+    state = {
+        "metrics": ("llamacpp:tokens_predicted_total 0\n"
+                    "llamacpp:prompt_tokens_total 0\n"),
+        "slots": [{"id": 0, "n_ctx": 8192, "n_prompt_tokens": 100,
+                   "n_prompt_tokens_processed": 0, "is_processing": True,
+                   "next_token": [{"n_decoded": 0}]}],
+    }
+
+    def fake_urlopen(url, timeout=None):
+        if url.endswith("/metrics"):
+            return _http_response(state["metrics"].encode())
+        if url.endswith("/props"):
+            return _http_response(b"{}")
+        return _http_response(json.dumps(state["slots"]).encode())
+
+    clock = _FakeClock()
+    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen), \
+         patch("app.time.monotonic", clock):
+        first = collect_llama_metrics("http://127.0.0.1:9999")
+        # No previous scrape yet -> counter-delta fallback (0 here)
+        assert first["gen_tokens_per_s"] == 0.0
+
+        # 67 tokens decoded + 67 prompt tokens processed over 2 s
+        clock.advance(2.0)
+        state["slots"][0]["n_prompt_tokens_processed"] = 67
+        state["slots"][0]["next_token"] = [{"n_decoded": 67}]
+        second = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert second["gen_tokens_per_s"] == 33.5
+    assert second["prompt_tokens_per_s"] == 33.5
+
+
+def test_collect_llama_live_rate_task_reset_clamp():
+    """n_decoded / n_prompt_tokens_processed reset per task: a drop between
+    scrapes must clamp to 0, never a negative rate."""
+    from app import collect_llama_metrics
+
+    state = {
+        "metrics": ("llamacpp:tokens_predicted_total 0\n"
+                    "llamacpp:prompt_tokens_total 0\n"),
+        "slots": [{"id": 0, "n_ctx": 8192, "n_prompt_tokens": 100,
+                   "n_prompt_tokens_processed": 500, "is_processing": True,
+                   "next_token": [{"n_decoded": 875}]}],
+    }
+
+    def fake_urlopen(url, timeout=None):
+        if url.endswith("/metrics"):
+            return _http_response(state["metrics"].encode())
+        if url.endswith("/props"):
+            return _http_response(b"{}")
+        return _http_response(json.dumps(state["slots"]).encode())
+
+    clock = _FakeClock()
+    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen), \
+         patch("app.time.monotonic", clock):
+        collect_llama_metrics("http://127.0.0.1:9999")
+
+        # A new task took the slot: counters dropped (875 -> 10, 500 -> 12)
+        clock.advance(2.0)
+        state["slots"][0]["n_prompt_tokens_processed"] = 12
+        state["slots"][0]["next_token"] = [{"n_decoded": 10}]
+        second = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert second["gen_tokens_per_s"] == 0.0
+    assert second["prompt_tokens_per_s"] == 0.0
 
 
 def test_collect_llama_slots_failure():

@@ -301,6 +301,13 @@ _llama_prev: dict[str, float] | None = None
 _LLAMA_STALE_MAX_AGE_S = 15.0
 _llama_last_good: tuple[float, dict[str, Any]] | None = None
 
+# Per-slot decode counters from the previous successful scrape, used for
+# LIVE tokens/s: on some builds (e.g. the llama.cpp bundled with LM Studio)
+# the /metrics counters only advance when a request COMPLETES, so counter
+# deltas read 0 during generation while the per-slot n_decoded /
+# n_prompt_tokens_processed update per token.
+_llama_slot_prev: dict[str, Any] | None = None
+
 # (dashboard key, Prometheus metric) pairs — verified against llama.cpp
 # ``to_metrics()`` (tools/server/server-task.cpp). Missing metrics are simply
 # omitted (older builds expose a shorter set).
@@ -381,11 +388,17 @@ def _parse_llama_slots(data: Any) -> list[dict[str, Any]]:
             n_ctx = int(slot.get("n_ctx", 0) or 0)
             prompt = int(slot.get("n_prompt_tokens", 0) or 0)
             next_tok = slot.get("next_token")
-            decoded = (
-                int(next_tok.get("n_decoded", 0) or 0)
-                if isinstance(next_tok, dict)
-                else 0
-            )
+            if isinstance(next_tok, dict):
+                decoded = int(next_tok.get("n_decoded", 0) or 0)
+            elif isinstance(next_tok, list):
+                # Some builds (e.g. LM Studio's) emit a LIST of per-token
+                # dicts; total their n_decoded values.
+                decoded = 0
+                for item in next_tok:
+                    if isinstance(item, dict):
+                        decoded += int(item.get("n_decoded", 0) or 0)
+            else:
+                decoded = 0
             used = prompt + decoded
             slots.append({
                 "id": slot.get("id"),
@@ -393,6 +406,10 @@ def _parse_llama_slots(data: Any) -> list[dict[str, Any]]:
                 "context_used": used,
                 "context_pct": round(100.0 * used / n_ctx, 1) if n_ctx else 0.0,
                 "is_processing": bool(slot.get("is_processing", False)),
+                "decoded": decoded,
+                "prompt_processed": int(
+                    slot.get("n_prompt_tokens_processed", 0) or 0
+                ),
             })
         except (TypeError, ValueError):
             continue
@@ -414,7 +431,7 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
     ``status: "stale"`` for up to ``_LLAMA_STALE_MAX_AGE_S`` seconds so a
     transient timeout doesn't flicker the UI to "unreachable".
     """
-    global _llama_prev, _llama_last_good
+    global _llama_prev, _llama_last_good, _llama_slot_prev
 
     def _stale_or_none() -> dict[str, Any] | None:
         """Hold last-good data during a transient scrape failure."""
@@ -503,7 +520,41 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
             out["total_slots"] = total_slots
         out["sleeping"] = bool(props.get("is_sleeping", False))
 
-    out["slots"] = _parse_llama_slots(_llama_get_json(base_url, "/slots"))
+    slots = _parse_llama_slots(_llama_get_json(base_url, "/slots"))
+    out["slots"] = slots
+
+    # Live tokens/s from per-slot decode counters (see _llama_slot_prev):
+    # they update per token, unlike the /metrics counters on some builds.
+    prev_slot = _llama_slot_prev
+    if slots and prev_slot is not None:
+        slot_elapsed = now - prev_slot["ts"]
+        if slot_elapsed > 0:
+            d_decoded = 0
+            d_prompt = 0
+            matched = False
+            for slot in slots:
+                p = prev_slot["slots"].get(slot["id"])
+                if p is None:
+                    continue
+                matched = True
+                # Per-task counters reset when a new request takes the slot:
+                # clamp negative deltas instead of reporting a nonsense rate.
+                d_decoded += max(0, slot["decoded"] - p["decoded"])
+                d_prompt += max(0, slot["prompt_processed"] - p["prompt"])
+            if matched:
+                out["gen_tokens_per_s"] = round(d_decoded / slot_elapsed, 1)
+                out["prompt_tokens_per_s"] = round(d_prompt / slot_elapsed, 1)
+    _llama_slot_prev = {
+        "ts": now,
+        "slots": {
+            s["id"]: {
+                "decoded": s["decoded"],
+                "prompt": s["prompt_processed"],
+            }
+            for s in slots
+        },
+    }
+
     _llama_last_good = (now, out)
     return out
 
