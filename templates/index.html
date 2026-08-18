@@ -294,37 +294,6 @@
   <h1>⚡ Resource Dashboard</h1>
   <p class="subtitle" id="clock"></p>
 
-  <!-- System row -->
-  <div class="grid">
-    <div class="card">
-      <h2>CPU &amp; Memory</h2>
-      <div class="gauges">
-        <div class="gauge">
-          <div class="gauge-value" id="cpu-val">–</div>
-          <div class="gauge-label">CPU %</div>
-        </div>
-        <div class="gauge">
-          <div class="gauge-value" id="mem-val">–</div>
-          <div class="gauge-label">Memory %</div>
-        </div>
-        <div class="gauge">
-          <div class="gauge-value" id="mem-detail">–</div>
-          <div class="gauge-label">Used / Total GB</div>
-        </div>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>CPU Trend (60 s)</h2>
-      <div class="chart-wrap"><canvas id="cpuChart"></canvas></div>
-    </div>
-
-    <div class="card">
-      <h2>Memory Trend (60 s)</h2>
-      <div class="chart-wrap"><canvas id="memChart"></canvas></div>
-    </div>
-  </div>
-
   <!-- GPU section -->
   <div class="gpu-section" style="margin-top:16px;">
     <div class="gpu-grid" id="gpu-container">
@@ -363,6 +332,37 @@
       </div>
       <div class="llama-slots-note" id="llama-slots-note" style="display:none;">no slot data (server started with --no-slots?)</div>
       <div class="chart-wrap" style="margin-top:16px;"><canvas id="llamaChart"></canvas></div>
+    </div>
+  </div>
+
+  <!-- System row -->
+  <div class="grid" style="margin-top:16px;">
+    <div class="card">
+      <h2>CPU &amp; Memory</h2>
+      <div class="gauges">
+        <div class="gauge">
+          <div class="gauge-value" id="cpu-val">–</div>
+          <div class="gauge-label">CPU %</div>
+        </div>
+        <div class="gauge">
+          <div class="gauge-value" id="mem-val">–</div>
+          <div class="gauge-label">Memory %</div>
+        </div>
+        <div class="gauge">
+          <div class="gauge-value" id="mem-detail">–</div>
+          <div class="gauge-label">Used / Total GB</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>CPU Trend (60 s)</h2>
+      <div class="chart-wrap"><canvas id="cpuChart"></canvas></div>
+    </div>
+
+    <div class="card">
+      <h2>Memory Trend (60 s)</h2>
+      <div class="chart-wrap"><canvas id="memChart"></canvas></div>
     </div>
   </div>
 
