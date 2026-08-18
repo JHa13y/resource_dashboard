@@ -43,7 +43,7 @@ def test_gpu_cli_parses_single_gpu(no_real_nvidia):
     from app import _gpu_cli, _lspci_vendor_map
 
     no_real_nvidia.return_value = MagicMock(
-        stdout="85, 4096, 8192, 72, 1410, Active, Not Active, 0000:01:00.0, NVIDIA A100-SXM4-80GB, 0x1EB810DE\n",
+        stdout="85, 4096, 8192, 72, 1410, Active, Not Active, 0000:01:00.0, NVIDIA A100-SXM4-80GB, 0x1EB810DE, 42.5, 400.00\n",
     )
     result = _gpu_cli()
 
@@ -62,6 +62,8 @@ def test_gpu_cli_parses_single_gpu(no_real_nvidia):
     assert gpu["pci_bus_id"] == "0000:01:00.0"
     # lspci not available in test → falls back to raw hex from device_id
     assert gpu["board_vendor"] is not None
+    assert gpu["power_w"] == 42.5
+    assert gpu["power_limit_w"] == 400.0
 
 
 def test_gpu_cli_parses_multiple_gpus(no_real_nvidia):
@@ -69,8 +71,8 @@ def test_gpu_cli_parses_multiple_gpus(no_real_nvidia):
 
     no_real_nvidia.return_value = MagicMock(
         stdout=(
-            "30, 2048, 8192, 55, 1200, Not Active, Not Active, 0000:01:00.0, NVIDIA A100-SXM4-80GB, 0x1EB810DE\n"
-            "92, 7000, 8192, 88, 1650, Active, Active, 0000:02:00.0, GeForce RTX 4090, 0x268410DE\n"
+            "30, 2048, 8192, 55, 1200, Not Active, Not Active, 0000:01:00.0, NVIDIA A100-SXM4-80GB, 0x1EB810DE, 120.3, 400.00\n"
+            "92, 7000, 8192, 88, 1650, Active, Active, 0000:02:00.0, GeForce RTX 4090, 0x268410DE, [Not Supported], [Not Supported]\n"
         ),
     )
     result = _gpu_cli()
@@ -84,6 +86,11 @@ def test_gpu_cli_parses_multiple_gpus(no_real_nvidia):
     assert result[1]["name"] == "GeForce RTX 4090"
     assert result[1]["pci_bus_id"] == "0000:02:00.0"
     assert result[1]["board_vendor"] is not None
+    assert result[0]["power_w"] == 120.3
+    assert result[0]["power_limit_w"] == 400.0
+    # "[Not Supported]" power columns → keys omitted entirely
+    assert "power_w" not in result[1]
+    assert "power_limit_w" not in result[1]
 
 
 def test_gpu_cli_empty_output(no_real_nvidia):

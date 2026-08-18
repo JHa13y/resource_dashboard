@@ -10,6 +10,7 @@ A lightweight, real-time web dashboard for monitoring CPU load, memory usage, an
   - Utilization % and Memory % gauges + trend charts
   - Temperature in °C
   - Current graphics clock frequency (MHz)
+  - Power draw (W), with the enforced power limit in the label when available (`nvmlDeviceGetPowerUsage` / `nvidia-smi power.draw`)
   - Thermal throttle indicators (`hw_thermal_slowdown`, `sw_thermal_slowdown`) — pulsing red when active
 - **llama.cpp / local LLM** (when a `llama-server` is reachable): generation & prompt tokens/s, request queue (processing/deferred), context high-water mark, loaded model name, and per-slot context usage bars
 - **Real-time updates** via Server-Sent Events (SSE) — no page refreshes needed

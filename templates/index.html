@@ -683,6 +683,10 @@ function updateGPUs(gpus) {
             <div class="gauge-value" id="gpu-clock-${gpu.index}">–</div>
             <div class="gauge-label">Clock MHz</div>
           </div>
+          <div class="gauge">
+            <div class="gauge-value" id="gpu-power-${gpu.index}">–</div>
+            <div class="gauge-label" id="gpu-power-label-${gpu.index}">Power W</div>
+          </div>
         </div>
         <div class="gpu-charts-grid">
           <div class="chart-wrap"><canvas id="gpu-util-chart-${gpu.index}"></canvas></div>
@@ -709,6 +713,23 @@ function updateGPUs(gpus) {
     tempEl.style.color  = gpu.temperature_c > 85 ? '#ef4444' : gpu.temperature_c > 70 ? '#eab308' : '#22c55e';
 
     clockEl.textContent = gpu.graphics_clock_mhz != null ? `${gpu.graphics_clock_mhz}` : '–';
+
+    const powerEl = document.getElementById(`gpu-power-${gpu.index}`);
+    const powerLabelEl = document.getElementById(`gpu-power-label-${gpu.index}`);
+    if (gpu.power_w != null) {
+      powerEl.textContent = `${gpu.power_w} W`;
+      if (gpu.power_limit_w) {
+        powerLabelEl.textContent = `Power / ${Math.round(gpu.power_limit_w)} W`;
+        powerEl.style.color = colorFor(gpu.power_w / gpu.power_limit_w * 100);
+      } else {
+        powerLabelEl.textContent = 'Power W';
+        powerEl.style.color = '';
+      }
+    } else {
+      powerEl.textContent = '–';
+      powerLabelEl.textContent = 'Power W';
+      powerEl.style.color = '';
+    }
 
     /* Throttle badges */
     const hwBadge = document.getElementById(`badge-hw-${gpu.index}`);

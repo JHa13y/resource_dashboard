@@ -185,7 +185,7 @@ def _gpu_pynvml() -> list[dict[str, Any]]:
             )
 
             mem_total = mem.total if mem.total else 1  # guard div-by-zero
-            gpus.append({
+            gpu: dict[str, Any] = {
                 "index": idx,
                 "utilization_pct": util.gpu,
                 "memory_used_gb": round(mem.used / (1024**3), 1),
@@ -200,7 +200,21 @@ def _gpu_pynvml() -> list[dict[str, Any]]:
                 "name": name,
                 "pci_bus_id": bus_id,
                 "board_vendor": board_vendor,
-            })
+            }
+            # Optional power fields (mW -> W). Some devices/VMs do not support
+            # power queries; omit the key entirely on failure so old and new
+            # clients both degrade gracefully.
+            try:
+                gpu["power_w"] = round(pynvml.nvmlDeviceGetPowerUsage(handle) / 1000, 1)
+            except Exception:  # noqa: BLE001 – per-field errors are non-fatal
+                pass
+            try:
+                gpu["power_limit_w"] = round(
+                    pynvml.nvmlDeviceGetEnforcedPowerLimit(handle) / 1000, 1
+                )
+            except Exception:  # noqa: BLE001 – per-field errors are non-fatal
+                pass
+            gpus.append(gpu)
         except Exception:  # noqa: BLE001 – per-device errors are non-fatal
             log.debug("Skipping GPU %d (pynvml error)", idx)
 
@@ -221,7 +235,7 @@ def _gpu_cli() -> list[dict[str, Any]]:
                 "temperature.gpu,clocks.current.graphics,"
                 "clocks_throttle_reasons.hw_thermal_slowdown,"
                 "clocks_throttle_reasons.sw_thermal_slowdown,"
-                "pci.bus_id,name,pci.device_id",
+                "pci.bus_id,name,pci.device_id,power.draw,power.limit",
                 "--format=csv,noheader,nounits",
             ],
             capture_output=True,
@@ -230,7 +244,7 @@ def _gpu_cli() -> list[dict[str, Any]]:
         )
         reader = csv.reader(io.StringIO(result.stdout))
         for idx, row in enumerate(reader):
-            if len(row) < 10:
+            if len(row) < 12:
                 continue
             mem_used_mb = int(row[1])
             mem_total_mb = max(int(row[2]), 1)
@@ -245,7 +259,20 @@ def _gpu_cli() -> list[dict[str, Any]]:
                 except ValueError:
                     board_vendor = "unknown"
 
-            gpus.append({
+            # Optional power fields – nvidia-smi reports "[Not Supported]"
+            # (or "[N/A]") when the query is unavailable on this GPU.
+            power_w: float | None = None
+            try:
+                power_w = round(float(row[10]), 1)
+            except ValueError:
+                pass
+            power_limit_w: float | None = None
+            try:
+                power_limit_w = round(float(row[11]), 1)
+            except ValueError:
+                pass
+
+            gpu: dict[str, Any] = {
                 "index": idx,
                 "utilization_pct": int(row[0]),
                 "memory_used_gb": round(mem_used_mb / 1024, 1),
@@ -260,7 +287,12 @@ def _gpu_cli() -> list[dict[str, Any]]:
                 "name": row[8].strip(),
                 "pci_bus_id": bus_id,
                 "board_vendor": board_vendor,
-            })
+            }
+            if power_w is not None:
+                gpu["power_w"] = power_w
+            if power_limit_w is not None:
+                gpu["power_limit_w"] = power_limit_w
+            gpus.append(gpu)
     except FileNotFoundError:
         log.info("nvidia-smi not found – no GPU metrics available")
     except subprocess.TimeoutExpired:
