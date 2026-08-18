@@ -565,6 +565,10 @@ def test_parse_llama_slots_next_token_shapes():
     }])
     assert d[0]["decoded"] == 512
     assert d[0]["prompt_processed"] == 7
+    # new keys: cache hits, total prompt size, task id (absent -> None)
+    assert d[0]["cached"] == 0
+    assert d[0]["prompt_total"] == 10
+    assert d[0]["id_task"] is None
 
     # list shape: total n_decoded, skip non-dict items
     l = _parse_llama_slots([{
@@ -654,6 +658,149 @@ def test_collect_llama_live_rate_task_reset_clamp():
 
     assert second["gen_tokens_per_s"] == 0.0
     assert second["prompt_tokens_per_s"] == 0.0
+
+
+def test_collect_llama_live_prompt_rate_includes_cached():
+    """The live prompt rate counts cached + uncached prompt tokens, matching
+    the server's own prompt t/s (a chat workload is mostly KV-cache hits)."""
+    from app import collect_llama_metrics
+
+    state = {
+        "metrics": ("llamacpp:tokens_predicted_total 0\n"
+                    "llamacpp:prompt_tokens_total 0\n"),
+        "slots": [{"id": 0, "n_ctx": 8192, "n_prompt_tokens": 800,
+                   "n_prompt_tokens_processed": 0,
+                   "n_prompt_tokens_cache": 0, "id_task": 100,
+                   "is_processing": True, "next_token": [{"n_decoded": 0}]}],
+    }
+
+    def fake_urlopen(url, timeout=None):
+        if url.endswith("/metrics"):
+            return _http_response(state["metrics"].encode())
+        if url.endswith("/props"):
+            return _http_response(b"{}")
+        return _http_response(json.dumps(state["slots"]).encode())
+
+    clock = _FakeClock()
+    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen), \
+         patch("app.time.monotonic", clock):
+        collect_llama_metrics("http://127.0.0.1:9999")
+
+        # 10 uncached + 790 cached prompt tokens over 2 s
+        clock.advance(2.0)
+        state["slots"][0]["n_prompt_tokens_processed"] = 10
+        state["slots"][0]["n_prompt_tokens_cache"] = 790
+        second = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert second["prompt_tokens_per_s"] == 400.0
+    assert second["gen_tokens_per_s"] == 0.0
+
+
+def test_collect_llama_live_rate_cached_reset_clamp():
+    """n_prompt_tokens_cache resets per task like n_decoded: a drop between
+    scrapes must clamp to 0, never a negative rate."""
+    from app import collect_llama_metrics
+
+    state = {
+        "metrics": ("llamacpp:tokens_predicted_total 0\n"
+                    "llamacpp:prompt_tokens_total 0\n"),
+        "slots": [{"id": 0, "n_ctx": 8192, "n_prompt_tokens": 800,
+                   "n_prompt_tokens_processed": 100,
+                   "n_prompt_tokens_cache": 790, "id_task": 100,
+                   "is_processing": True, "next_token": [{"n_decoded": 50}]}],
+    }
+
+    def fake_urlopen(url, timeout=None):
+        if url.endswith("/metrics"):
+            return _http_response(state["metrics"].encode())
+        if url.endswith("/props"):
+            return _http_response(b"{}")
+        return _http_response(json.dumps(state["slots"]).encode())
+
+    def set_task(task, processed, cached, decoded):
+        slot = state["slots"][0]
+        slot["id_task"] = task
+        slot["n_prompt_tokens_processed"] = processed
+        slot["n_prompt_tokens_cache"] = cached
+        slot["next_token"] = [{"n_decoded": decoded}]
+
+    clock = _FakeClock()
+    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen), \
+         patch("app.time.monotonic", clock):
+        collect_llama_metrics("http://127.0.0.1:9999")
+
+        # New task took the slot: cached dropped 790 -> 0 (clamped)
+        clock.advance(2.0)
+        set_task(101, 0, 0, 0)
+        second = collect_llama_metrics("http://127.0.0.1:9999")
+
+        # Same task: cached 0 -> 800, processed 0 -> 20 over 2 s
+        clock.advance(2.0)
+        set_task(101, 20, 800, 30)
+        third = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert second["prompt_tokens_per_s"] == 0.0
+    assert second["gen_tokens_per_s"] == 0.0
+    assert third["prompt_tokens_per_s"] == 410.0
+    assert third["gen_tokens_per_s"] == 15.0
+
+
+def test_collect_llama_prompt_last_new_task():
+    """A new id_task on a slot records that prompt's size + cache share;
+    the value is absent until a task has been seen, then persists."""
+    from app import collect_llama_metrics
+
+    state = {
+        "metrics": ("llamacpp:tokens_predicted_total 0\n"
+                    "llamacpp:prompt_tokens_total 0\n"),
+        "slots": [{"id": 0, "n_ctx": 8192, "n_prompt_tokens": 100,
+                   "n_prompt_tokens_processed": 100,
+                   "n_prompt_tokens_cache": 0, "id_task": 100,
+                   "is_processing": True, "next_token": [{"n_decoded": 0}]}],
+    }
+
+    def fake_urlopen(url, timeout=None):
+        if url.endswith("/metrics"):
+            return _http_response(state["metrics"].encode())
+        if url.endswith("/props"):
+            return _http_response(b"{}")
+        return _http_response(json.dumps(state["slots"]).encode())
+
+    def set_task(task, total, processed, cached, decoded):
+        slot = state["slots"][0]
+        slot["id_task"] = task
+        slot["n_prompt_tokens"] = total
+        slot["n_prompt_tokens_processed"] = processed
+        slot["n_prompt_tokens_cache"] = cached
+        slot["next_token"] = [{"n_decoded": decoded}]
+
+    clock = _FakeClock()
+    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen), \
+         patch("app.time.monotonic", clock):
+        first = collect_llama_metrics("http://127.0.0.1:9999")
+        assert "prompt_last" not in first  # no previous scrape to compare
+
+        # Same task continues: still no new task
+        clock.advance(1.0)
+        set_task(100, 100, 100, 0, 20)
+        second = collect_llama_metrics("http://127.0.0.1:9999")
+        assert "prompt_last" not in second
+
+        # New task: 800 prompt tokens, 790 of them cache hits
+        clock.advance(1.0)
+        set_task(101, 800, 10, 790, 0)
+        third = collect_llama_metrics("http://127.0.0.1:9999")
+        assert third["prompt_last"] == {
+            "total": 800, "cached": 790, "pct_cached": 98.8,
+        }
+
+        # No new task: the value persists and is re-emitted
+        clock.advance(1.0)
+        set_task(101, 800, 10, 790, 40)
+        fourth = collect_llama_metrics("http://127.0.0.1:9999")
+        assert fourth["prompt_last"] == {
+            "total": 800, "cached": 790, "pct_cached": 98.8,
+        }
 
 
 def test_collect_llama_slots_failure():

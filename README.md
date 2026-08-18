@@ -48,8 +48,8 @@ Then open **http://localhost:5000** (or your chosen host/port) in your browser.
 `--llama-url` (default `http://127.0.0.1:5001`) is the base URL of your `llama-server`. The default is a local-dev convenience only — in production the dashboard usually runs on a **different host** than the llama-server, so pass the remote URL explicitly (e.g. `--llama-url http://<llama-host>:5001`). The card shows **unreachable** when the URL is wrong, unroutable, or the server was not started with `--metrics`. If a scrape fails (e.g. a timeout under heavy server load), the last data is held for up to 15 s and shown as **stale**; the card only turns "unreachable" after that.
 
 Notes:
-- Gen/prompt tokens/s are computed by the dashboard from per-scrape counter deltas (this works on builds whose windowed `*_tokens_seconds` gauges stay at 0, e.g. some LM Studio builds); token totals are cumulative since server start.
-- The prompt rate counts only **newly processed** prompt tokens; the cached rate shown in its label (`… · cached N`) is the KV-cache-reuse rate from `prompt_tokens_cached_total`.
+- Gen/prompt tokens/s are computed by the dashboard from the per-slot live decode counters in `GET /slots` (the `/metrics` counters only advance on request completion on some builds, e.g. LM Studio's); token totals are cumulative since server start.
+- The prompt rate counts **cached + uncached** prompt tokens (matches the server's own prompt t/s and the CLI, which include KV-cache hits); the gauge label shows the last prompt's size and cache-hit percentage (e.g. `… · last 74.0k tok · 99.8% cached`), falling back to the `prompt_tokens_cached_total` rate on servers without `/slots` data.
 - The model name and slot count come from `GET /props` (cached 30 s); per-slot context usage (`used / n_ctx`) comes from `GET /slots` and updates every second.
 
 ### One-shot API (for testing / scripting)

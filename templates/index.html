@@ -847,10 +847,12 @@ function updateLlama(llama) {
 
   genEl.textContent = llama.gen_tokens_per_s != null ? llama.gen_tokens_per_s : '–';
   promptEl.textContent = llama.prompt_tokens_per_s != null ? llama.prompt_tokens_per_s : '–';
-  // The prompt counter excludes KV-cached tokens, so the new-prompt rate
-  // is 0 most of the time; show the cached rate in the label.
-  document.getElementById('llama-prompt-label').textContent =
-    `Prompt tokens/s · cached ${llama.prompt_cached_tokens_per_s != null ? llama.prompt_cached_tokens_per_s : '–'}`;
+  // The prompt rate counts cached + uncached tokens (server/CLI
+  // accounting); the label shows the last prompt's size and cache share.
+  const fmtTok = (n) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`;
+  document.getElementById('llama-prompt-label').textContent = llama.prompt_last
+    ? `Prompt tokens/s · last ${fmtTok(llama.prompt_last.total)} tok · ${llama.prompt_last.pct_cached}% cached`
+    : `Prompt tokens/s · cached ${llama.prompt_cached_tokens_per_s != null ? llama.prompt_cached_tokens_per_s : '–'}`;
   busyEl.textContent = `${llama.requests_processing ?? 0}/${llama.requests_deferred ?? 0}`;
   ctxEl.textContent = llama.context_tokens_max != null ? llama.context_tokens_max : '–';
 

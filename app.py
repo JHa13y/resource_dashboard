@@ -410,6 +410,13 @@ def _parse_llama_slots(data: Any) -> list[dict[str, Any]]:
                 "prompt_processed": int(
                     slot.get("n_prompt_tokens_processed", 0) or 0
                 ),
+                # KV-cache hits for this task (set in one go at task start,
+                # stable afterwards) and the task's total prompt size.
+                "cached": int(slot.get("n_prompt_tokens_cache", 0) or 0),
+                "prompt_total": prompt,
+                # Changes per new task on the slot; used for new-task
+                # detection (last-prompt cache stats).
+                "id_task": slot.get("id_task"),
             })
         except (TypeError, ValueError):
             continue
@@ -526,6 +533,7 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
     # Live tokens/s from per-slot decode counters (see _llama_slot_prev):
     # they update per token, unlike the /metrics counters on some builds.
     prev_slot = _llama_slot_prev
+    prompt_last = prev_slot.get("prompt_last") if prev_slot is not None else None
     if slots and prev_slot is not None:
         slot_elapsed = now - prev_slot["ts"]
         if slot_elapsed > 0:
@@ -540,19 +548,47 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
                 # Per-task counters reset when a new request takes the slot:
                 # clamp negative deltas instead of reporting a nonsense rate.
                 d_decoded += max(0, slot["decoded"] - p["decoded"])
-                d_prompt += max(0, slot["prompt_processed"] - p["prompt"])
+                # Count cached + uncached prompt tokens: the server's own
+                # prompt t/s includes cache hits, and a chat workload is
+                # mostly cache hits (the uncached tail prefills in <1 s and
+                # is aliased away by 1 s scrapes otherwise).
+                d_prompt += (
+                    max(0, slot["prompt_processed"] - p["prompt"])
+                    + max(0, slot["cached"] - p["cached"])
+                )
             if matched:
                 out["gen_tokens_per_s"] = round(d_decoded / slot_elapsed, 1)
                 out["prompt_tokens_per_s"] = round(d_prompt / slot_elapsed, 1)
+        # New-task detection: id_task changed (or first sight of a slot)
+        # with a non-empty prompt -> record that prompt's size and cache
+        # share. Most recent wins; the value persists across scrapes.
+        for slot in slots:
+            task_id = slot["id_task"]
+            if task_id is None or slot["prompt_total"] <= 0:
+                continue
+            p = prev_slot["slots"].get(slot["id"])
+            if p is None or p.get("id_task") != task_id:
+                prompt_last = {
+                    "total": slot["prompt_total"],
+                    "cached": slot["cached"],
+                    "pct_cached": round(
+                        100.0 * slot["cached"] / slot["prompt_total"], 1
+                    ),
+                }
+    if prompt_last is not None:
+        out["prompt_last"] = prompt_last
     _llama_slot_prev = {
         "ts": now,
         "slots": {
             s["id"]: {
                 "decoded": s["decoded"],
                 "prompt": s["prompt_processed"],
+                "cached": s["cached"],
+                "id_task": s["id_task"],
             }
             for s in slots
         },
+        "prompt_last": prompt_last,
     }
 
     _llama_last_good = (now, out)
