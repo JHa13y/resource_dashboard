@@ -824,8 +824,11 @@ function updateLlama(llama) {
     return; // keep gauges / chart history as-is
   }
 
-  /* Status + model */
-  if (llama.sleeping) {
+  /* Status + model ("stale" = last data held after a failed scrape) */
+  if (llama.status === 'stale') {
+    statusEl.textContent = 'stale';
+    statusEl.className = 'badge warn';
+  } else if (llama.sleeping) {
     statusEl.textContent = 'sleeping';
     statusEl.className = 'badge warn';
   } else {
@@ -854,15 +857,17 @@ function updateLlama(llama) {
   /* Per-slot context usage */
   updateLlamaSlots(Array.isArray(llama.slots) ? llama.slots : []);
 
-  /* Gen tokens/s trend */
-  const chart = ensureLlamaChart();
-  chart.data.labels.push(nowLabel());
-  chart.data.datasets[0].data.push(llama.gen_tokens_per_s ?? null);
-  if (chart.data.labels.length > MAX_POINTS) {
-    chart.data.labels.shift();
-    chart.data.datasets[0].data.shift();
+  /* Gen tokens/s trend (skip while stale: values are held, not new data) */
+  if (llama.status !== 'stale') {
+    const chart = ensureLlamaChart();
+    chart.data.labels.push(nowLabel());
+    chart.data.datasets[0].data.push(llama.gen_tokens_per_s ?? null);
+    if (chart.data.labels.length > MAX_POINTS) {
+      chart.data.labels.shift();
+      chart.data.datasets[0].data.shift();
+    }
+    chart.update('none');
   }
-  chart.update('none');
 }
 </script>
 </body>

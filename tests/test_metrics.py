@@ -320,13 +320,16 @@ def reset_llama_props_cache():
 
 @pytest.fixture(autouse=True)
 def reset_llama_prev():
-    """Reset the module-level previous-scrape counters around every test."""
+    """Reset module-level scrape history around every test."""
     import app as app_mod
 
-    original = app_mod._llama_prev
+    original_prev = app_mod._llama_prev
+    original_last_good = app_mod._llama_last_good
     app_mod._llama_prev = None
+    app_mod._llama_last_good = None
     yield
-    app_mod._llama_prev = original
+    app_mod._llama_prev = original_prev
+    app_mod._llama_last_good = original_last_good
 
 
 class _FakeClock:
@@ -429,6 +432,71 @@ def test_collect_llama_no_llamacpp_metrics():
             "/slots": b"[]",
         })):
             assert collect_llama_metrics("http://127.0.0.1:9999") is None
+
+
+def test_collect_llama_stale_hold():
+    """A failed scrape within the hold window returns last data as stale."""
+    from app import collect_llama_metrics
+
+    routes = {
+        "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+        "/props": b'{"model_path": "/models/x.gguf", "total_slots": 1}',
+        "/slots": b"[]",
+    }
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server(routes)):
+        first = collect_llama_metrics("http://127.0.0.1:9999")
+    assert first is not None and first["status"] == "up"
+
+    with patch("app.urllib.request.urlopen",
+               side_effect=ConnectionRefusedError("down")):
+        held = collect_llama_metrics("http://127.0.0.1:9999")
+        held_again = collect_llama_metrics("http://127.0.0.1:9999")
+    assert held is not None
+    assert held["status"] == "stale"
+    assert held["gen_tokens_total"] == 123456.0
+    assert held["model"] == "x.gguf"
+    # the held dict is copied, so repeated failures still report "stale"
+    assert held_again is not None and held_again["status"] == "stale"
+
+
+def test_collect_llama_stale_expiry():
+    """A failed scrape after the 15 s hold window returns None again."""
+    import app as app_mod
+    from app import collect_llama_metrics
+
+    clock = _FakeClock()
+    routes = {
+        "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+        "/props": b"{}",
+        "/slots": b"[]",
+    }
+    with patch.object(app_mod.time, "monotonic", clock), \
+         patch("app.urllib.request.urlopen", side_effect=make_llama_server(routes)):
+        assert collect_llama_metrics("http://127.0.0.1:9999")["status"] == "up"
+
+    clock.advance(16.0)
+    with patch.object(app_mod.time, "monotonic", clock), \
+         patch("app.urllib.request.urlopen",
+               side_effect=ConnectionRefusedError("down")):
+        assert collect_llama_metrics("http://127.0.0.1:9999") is None
+
+
+def test_collect_llama_recover_after_stale():
+    """A successful scrape after a stale period restores status "up"."""
+    from app import collect_llama_metrics
+
+    routes = {
+        "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+        "/props": b"{}",
+        "/slots": b"[]",
+    }
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server(routes)):
+        collect_llama_metrics("http://127.0.0.1:9999")
+    with patch("app.urllib.request.urlopen",
+               side_effect=ConnectionRefusedError("down")):
+        assert collect_llama_metrics("http://127.0.0.1:9999")["status"] == "stale"
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server(routes)):
+        assert collect_llama_metrics("http://127.0.0.1:9999")["status"] == "up"
 
 
 def test_parse_prometheus_skips_labels_and_comments():

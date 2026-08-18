@@ -45,7 +45,7 @@ Then open **http://localhost:5000** (or your chosen host/port) in your browser.
 
 ### llama.cpp section
 
-`--llama-url` (default `http://127.0.0.1:5001`) is the base URL of your `llama-server`. The default is a local-dev convenience only — in production the dashboard usually runs on a **different host** than the llama-server, so pass the remote URL explicitly (e.g. `--llama-url http://<llama-host>:5001`). The card shows **unreachable** when the URL is wrong, unroutable, or the server was not started with `--metrics`.
+`--llama-url` (default `http://127.0.0.1:5001`) is the base URL of your `llama-server`. The default is a local-dev convenience only — in production the dashboard usually runs on a **different host** than the llama-server, so pass the remote URL explicitly (e.g. `--llama-url http://<llama-host>:5001`). The card shows **unreachable** when the URL is wrong, unroutable, or the server was not started with `--metrics`. If a scrape fails (e.g. a timeout under heavy server load), the last data is held for up to 15 s and shown as **stale**; the card only turns "unreachable" after that.
 
 Notes:
 - Gen/prompt tokens/s are computed by the dashboard from per-scrape counter deltas (this works on builds whose windowed `*_tokens_seconds` gauges stay at 0, e.g. some LM Studio builds); token totals are cumulative since server start.

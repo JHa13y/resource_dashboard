@@ -294,6 +294,13 @@ _llama_props_cache: tuple[float, dict[str, Any]] | None = None
 # bundled with LM Studio) while the cumulative counters increment correctly.
 _llama_prev: dict[str, float] | None = None
 
+# Last successful snapshot (monotonic ts + dict). When a scrape fails
+# (e.g. the 2 s timeout under heavy llama-server load) the UI keeps showing
+# this data, flagged "stale", for up to this many seconds so a single bad
+# tick doesn't flicker the card to "unreachable".
+_LLAMA_STALE_MAX_AGE_S = 15.0
+_llama_last_good: tuple[float, dict[str, Any]] | None = None
+
 # (dashboard key, Prometheus metric) pairs — verified against llama.cpp
 # ``to_metrics()`` (tools/server/server-task.cpp). Missing metrics are simply
 # omitted (older builds expose a shorter set).
@@ -402,15 +409,30 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
     per-scrape deltas of the cumulative token counters; the server's
     windowed gauges are only a fallback for the first scrape (they read
     0 permanently on some builds, e.g. LM Studio's bundled llama.cpp).
+
+    On a failed scrape the last successful snapshot is returned with
+    ``status: "stale"`` for up to ``_LLAMA_STALE_MAX_AGE_S`` seconds so a
+    transient timeout doesn't flicker the UI to "unreachable".
     """
-    global _llama_prev
+    global _llama_prev, _llama_last_good
+
+    def _stale_or_none() -> dict[str, Any] | None:
+        """Hold last-good data during a transient scrape failure."""
+        if _llama_last_good is not None:
+            ts, held = _llama_last_good
+            if time.monotonic() - ts <= _LLAMA_STALE_MAX_AGE_S:
+                out = dict(held)
+                out["status"] = "stale"
+                return out
+        return None
+
     try:
         with urllib.request.urlopen(
             base_url.rstrip("/") + "/metrics", timeout=2
         ) as r:
             body = r.read().decode()
     except Exception:  # noqa: BLE001 – collector must never raise
-        return None
+        return _stale_or_none()
 
     # Some 2025 builds JSON-escape the whole body (fixed upstream 2025-11-28,
     # PR #17386): unwrap if it's a JSON string.
@@ -418,11 +440,11 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
         try:
             body = json.loads(body)
         except Exception:  # noqa: BLE001
-            return None
+            return _stale_or_none()
 
     raw = _parse_prometheus(body)
     if not raw:
-        return None  # endpoint up but no llamacpp: metrics
+        return _stale_or_none()  # endpoint up but no llamacpp: metrics
 
     out: dict[str, Any] = {"status": "up"}
     for key, metric in _LLAMA_METRIC_MAP:
@@ -482,6 +504,7 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
         out["sleeping"] = bool(props.get("is_sleeping", False))
 
     out["slots"] = _parse_llama_slots(_llama_get_json(base_url, "/slots"))
+    _llama_last_good = (now, out)
     return out
 
 
