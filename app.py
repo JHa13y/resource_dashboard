@@ -288,6 +288,12 @@ DEFAULT_LLAMA_URL = "http://127.0.0.1:5001"
 _LLAMA_PROPS_TTL = 30.0
 _llama_props_cache: tuple[float, dict[str, Any]] | None = None
 
+# Previous successful scrape's cumulative counters + timestamp, used to
+# compute tokens/s from per-scrape counter deltas. The windowed
+# ``*_tokens_seconds`` gauges read 0 on some builds (e.g. the llama.cpp
+# bundled with LM Studio) while the cumulative counters increment correctly.
+_llama_prev: dict[str, float] | None = None
+
 # (dashboard key, Prometheus metric) pairs — verified against llama.cpp
 # ``to_metrics()`` (tools/server/server-task.cpp). Missing metrics are simply
 # omitted (older builds expose a shorter set).
@@ -391,7 +397,13 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
 
     Returns ``None`` when the server is unreachable or not started with
     ``--metrics`` (UI shows "unreachable"). Never raises.
+
+    ``gen_tokens_per_s`` / ``prompt_tokens_per_s`` are computed from the
+    per-scrape deltas of the cumulative token counters; the server's
+    windowed gauges are only a fallback for the first scrape (they read
+    0 permanently on some builds, e.g. LM Studio's bundled llama.cpp).
     """
+    global _llama_prev
     try:
         with urllib.request.urlopen(
             base_url.rstrip("/") + "/metrics", timeout=2
@@ -416,6 +428,47 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
     for key, metric in _LLAMA_METRIC_MAP:
         if metric in raw:
             out[key] = round(raw[metric], 1)
+
+    # tokens/s from counter deltas (see _llama_prev).
+    gen_total = raw.get("llamacpp:tokens_predicted_total")
+    prompt_total = raw.get("llamacpp:prompt_tokens_total")
+    cached_total = raw.get("llamacpp:prompt_tokens_cached_total")
+    now = time.monotonic()
+    prev = _llama_prev
+    elapsed = now - prev["ts"] if prev is not None else 0.0
+    if (
+        prev is not None
+        and gen_total is not None
+        and prompt_total is not None
+        and elapsed > 0
+    ):
+        # A negative delta means the counters were reset (server restart);
+        # report 0 rather than a nonsense rate.
+        out["gen_tokens_per_s"] = round(
+            max(0.0, gen_total - prev["gen"]) / elapsed, 1
+        )
+        out["prompt_tokens_per_s"] = round(
+            max(0.0, prompt_total - prev["prompt"]) / elapsed, 1
+        )
+        # Older builds may not expose the cached counter: only emit the
+        # rate when both scrapes have it.
+        if cached_total is not None and prev.get("cached") is not None:
+            out["prompt_cached_tokens_per_s"] = round(
+                max(0.0, cached_total - prev["cached"]) / elapsed, 1
+            )
+    else:
+        # First scrape (or a counter missing): fall back to the server's
+        # windowed gauge if present, else 0.0.
+        out.setdefault("gen_tokens_per_s", 0.0)
+        out.setdefault("prompt_tokens_per_s", 0.0)
+    if gen_total is not None and prompt_total is not None:
+        _llama_prev = {
+            "ts": now,
+            "gen": gen_total,
+            "prompt": prompt_total,
+        }
+        if cached_total is not None:
+            _llama_prev["cached"] = cached_total
 
     props = _llama_props(base_url)
     if isinstance(props, dict):
@@ -575,9 +628,9 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=5000, help="Port number (default: 5000)")
     parser.add_argument("--llama-url", default=DEFAULT_LLAMA_URL,
                         help="Base URL of llama.cpp llama-server (expects /metrics enabled via --metrics). "
-                             "Default is a local-dev convenience; in production the dashboard usually "
-                             "runs on another host, so pass the remote URL explicitly, e.g. "
-                             "http://<llama-host>:5001")
+                             "The default http://127.0.0.1:5001 works when the dashboard and "
+                             "llama-server run on the same host; pass a remote URL otherwise, "
+                             "e.g. http://<llama-host>:5001")
     args = parser.parse_args()
 
     collector.llama_url = args.llama_url

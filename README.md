@@ -48,7 +48,8 @@ Then open **http://localhost:5000** (or your chosen host/port) in your browser.
 `--llama-url` (default `http://127.0.0.1:5001`) is the base URL of your `llama-server`. The default is a local-dev convenience only — in production the dashboard usually runs on a **different host** than the llama-server, so pass the remote URL explicitly (e.g. `--llama-url http://<llama-host>:5001`). The card shows **unreachable** when the URL is wrong, unroutable, or the server was not started with `--metrics`.
 
 Notes:
-- Gen/prompt tokens/s are windowed rates over the 1 s scrape interval; token totals are cumulative since server start.
+- Gen/prompt tokens/s are computed by the dashboard from per-scrape counter deltas (this works on builds whose windowed `*_tokens_seconds` gauges stay at 0, e.g. some LM Studio builds); token totals are cumulative since server start.
+- The prompt rate counts only **newly processed** prompt tokens; the cached rate shown in its label (`… · cached N`) is the KV-cache-reuse rate from `prompt_tokens_cached_total`.
 - The model name and slot count come from `GET /props` (cached 30 s); per-slot context usage (`used / n_ctx`) comes from `GET /slots` and updates every second.
 
 ### One-shot API (for testing / scripting)

@@ -318,6 +318,30 @@ def reset_llama_props_cache():
     app_mod._llama_props_cache = original
 
 
+@pytest.fixture(autouse=True)
+def reset_llama_prev():
+    """Reset the module-level previous-scrape counters around every test."""
+    import app as app_mod
+
+    original = app_mod._llama_prev
+    app_mod._llama_prev = None
+    yield
+    app_mod._llama_prev = original
+
+
+class _FakeClock:
+    """A manually advanced stand-in for time.monotonic."""
+
+    def __init__(self, start: float = 1000.0):
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
 def _http_response(body: bytes):
     """A context-manager mock standing in for urllib's response object."""
     resp = MagicMock()
@@ -500,3 +524,100 @@ def test_collect_llama_props_cached():
     with patch("app.urllib.request.urlopen", side_effect=fake_urlopen):
         collect_llama_metrics("http://127.0.0.1:9999")
     assert calls.count("http://127.0.0.1:9999/props") == 2
+
+
+def _llama_fake_server_with_body(state: dict):
+    """side_effect serving a mutable ``state["body"]`` on /metrics."""
+    def fake_urlopen(url, timeout=None):
+        if url.endswith("/metrics"):
+            return _http_response(state["body"].encode())
+        if url.endswith("/props"):
+            return _http_response(b"{}")
+        return _http_response(b"[]")  # /slots
+
+    return fake_urlopen
+
+
+def test_collect_llama_rate_from_counter_deltas():
+    """tokens/s must come from per-scrape counter deltas — the windowed
+    gauges read 0 permanently on some builds (e.g. LM Studio's)."""
+    from app import collect_llama_metrics
+
+    state = {"body": (
+        "llamacpp:tokens_predicted_total 100\n"
+        "llamacpp:prompt_tokens_total 50\n"
+        "llamacpp:prompt_tokens_cached_total 40\n"
+        "llamacpp:predicted_tokens_seconds 0\n"
+        "llamacpp:prompt_tokens_seconds 0\n"
+    )}
+    clock = _FakeClock()
+    with patch("app.urllib.request.urlopen",
+               side_effect=_llama_fake_server_with_body(state)), \
+         patch("app.time.monotonic", clock):
+        first = collect_llama_metrics("http://127.0.0.1:9999")
+        # First scrape has no previous state -> gauge fallback (0.0 here)
+        assert first["gen_tokens_per_s"] == 0.0
+        assert first["prompt_tokens_per_s"] == 0.0
+
+        state["body"] = (
+            "llamacpp:tokens_predicted_total 160\n"
+            "llamacpp:prompt_tokens_total 80\n"
+            "llamacpp:prompt_tokens_cached_total 70\n"
+            "llamacpp:predicted_tokens_seconds 0\n"
+            "llamacpp:prompt_tokens_seconds 0\n"
+        )
+        clock.advance(1.0)
+        second = collect_llama_metrics("http://127.0.0.1:9999")
+
+    # 60 gen tokens, 30 new prompt tokens and 30 cached prompt tokens over 1.0 s
+    assert second["gen_tokens_per_s"] == 60.0
+    assert second["prompt_tokens_per_s"] == 30.0
+    assert second["prompt_cached_tokens_per_s"] == 30.0
+
+
+def test_collect_llama_counter_reset():
+    """A decreasing counter (server restart) must yield 0, not a negative rate."""
+    import app as app_mod
+    from app import collect_llama_metrics
+
+    app_mod._llama_prev = {
+        "ts": time.monotonic(), "gen": 1000.0, "prompt": 1000.0,
+    }
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/metrics": ("llamacpp:tokens_predicted_total 100\n"
+                     "llamacpp:prompt_tokens_total 50\n").encode(),
+        "/props": b"{}",
+        "/slots": b"[]",
+    })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result is not None
+    assert result["gen_tokens_per_s"] == 0.0
+    assert result["prompt_tokens_per_s"] == 0.0
+
+
+def test_collect_llama_first_scrape_fallback_to_gauge():
+    """With no previous scrape, rates fall back to the server's windowed
+    gauges, or 0.0 when those are absent."""
+    from app import collect_llama_metrics
+
+    # LLAMA_METRICS_SAMPLE carries gauges 52.94 / 32.3 (and no
+    # prompt_tokens_total, so no previous state is recorded).
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+        "/props": b"{}",
+        "/slots": b"[]",
+    })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+    assert result["gen_tokens_per_s"] == 52.9
+    assert result["prompt_tokens_per_s"] == 32.3
+
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/metrics": ("llamacpp:tokens_predicted_total 10\n"
+                     "llamacpp:prompt_tokens_total 5\n").encode(),
+        "/props": b"{}",
+        "/slots": b"[]",
+    })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+    assert result["gen_tokens_per_s"] == 0.0
+    assert result["prompt_tokens_per_s"] == 0.0
