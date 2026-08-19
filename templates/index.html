@@ -231,6 +231,12 @@
       transition: width .4s;
     }
 
+    .llama-usage-line {
+      font-size: 0.9rem;
+      color: var(--text);
+      letter-spacing: 0.01em;
+    }
+
     .llama-slots-note {
       margin-top: 14px;
       font-size: 0.8rem;
@@ -369,6 +375,15 @@
     <div class="card">
       <h2>Memory Trend (60 s)</h2>
       <div class="chart-wrap"><canvas id="memChart"></canvas></div>
+    </div>
+  </div>
+
+  <!-- Extra cards at the bottom (after Memory Trend), in order:
+       LLM Usage → LLM Server Process → Swap → Host Health -->
+  <div class="grid" id="bottom-cards" style="margin-top:16px;">
+    <div class="card" id="llama-usage-card" style="display:none;">
+      <h2>LLM Usage (since server start)</h2>
+      <div class="llama-usage-line" id="llama-usage-line">–</div>
     </div>
   </div>
 
@@ -591,6 +606,7 @@ source.onmessage = (e) => {
   const llamaSec = document.getElementById('llama-section');
   if (llamaSec) llamaSec.style.display = m.llama_enabled === false ? 'none' : '';
   updateLlama(m.llama);
+  updateLlamaUsage(m);
 };
 
 /* ------------------------------------------------------------------ */
@@ -938,6 +954,42 @@ function updateLlama(llama) {
     }
     chart.update('none');
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* LLM usage summary card (bottom; hidden with --no-llama / no usage)  */
+/* ------------------------------------------------------------------ */
+function fmtUptime(s) {
+  if (s == null) return null;
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m`;
+}
+
+function updateLlamaUsage(m) {
+  const card = document.getElementById('llama-usage-card');
+  if (!card) return;
+  const usage = m.llama && m.llama.usage;
+  if (m.llama_enabled === false || !usage) {
+    card.style.display = 'none';
+    return;
+  }
+  const parts = [`${fmtTok(usage.total_tokens ?? 0)} tok total`];
+  if (usage.gen_avg_tps != null) {
+    parts.push(`${fmtTok(usage.gen_tokens ?? 0)} gen @ ${usage.gen_avg_tps} t/s avg (while generating)`);
+  } else {
+    parts.push(`${fmtTok(usage.gen_tokens ?? 0)} gen`);
+  }
+  if (usage.prompt_cached_pct != null) {
+    parts.push(`${usage.prompt_cached_pct}% prompt cached`);
+  }
+  const up = fmtUptime(usage.uptime_s);
+  if (up != null) parts.push(`up ${up}`);
+  document.getElementById('llama-usage-line').textContent = parts.join(' · ');
+  card.style.display = '';
 }
 </script>
 </body>

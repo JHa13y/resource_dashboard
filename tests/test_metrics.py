@@ -7,10 +7,12 @@ Run:
 from __future__ import annotations
 
 import json
+import os
 import queue
 import sys
 import threading
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import psutil
@@ -386,6 +388,19 @@ def reset_llama_prev():
     app_mod._llama_prev = original_prev
     app_mod._llama_last_good = original_last_good
     app_mod._llama_slot_prev = original_slot_prev
+
+
+@pytest.fixture(autouse=True)
+def isolate_llama_usage_state(tmp_path, monkeypatch):
+    """Point the T3 usage-state file at a per-test tmp path.
+
+    Without this, every llama scrape in the suite would write the default
+    ``<app dir>/.llama_usage_state.json`` into the repo.
+    """
+    monkeypatch.setenv(
+        "RD_LLAMA_USAGE_STATE", str(tmp_path / "llama_usage_state.json")
+    )
+    yield
 
 
 class _FakeClock:
@@ -1111,3 +1126,150 @@ def test_collect_llama_first_scrape_fallback_to_gauge():
         result = collect_llama_metrics("http://127.0.0.1:9999")
     assert result["gen_tokens_per_s"] == 0.0
     assert result["prompt_tokens_per_s"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# T3: cumulative usage summary + persistent server uptime
+# ---------------------------------------------------------------------------
+
+def _usage_metrics_body(predicted=1000, prompt=5000, cached=4000,
+                        predicted_s=40.0, prompt_s=10.0,
+                        include_cached=True, include_seconds=True):
+    lines = [
+        f"llamacpp:tokens_predicted_total {predicted}",
+        f"llamacpp:prompt_tokens_total {prompt}",
+    ]
+    if include_cached:
+        lines.append(f"llamacpp:prompt_tokens_cached_total {cached}")
+    if include_seconds:
+        lines.append(f"llamacpp:tokens_predicted_seconds_total {predicted_s}")
+        lines.append(f"llamacpp:prompt_seconds_total {prompt_s}")
+    return ("\n".join(lines) + "\n").encode()
+
+
+def _usage_routes(predicted=1000, prompt=5000, cached=4000,
+                  predicted_s=40.0, prompt_s=10.0, **kw):
+    return {
+        "/metrics": _usage_metrics_body(
+            predicted, prompt, cached, predicted_s, prompt_s, **kw
+        ),
+        "/props": b"{}",
+        "/slots": b"[]",
+    }
+
+
+def _usage_state_file() -> Path:
+    """The per-test state file installed by isolate_llama_usage_state."""
+    return Path(os.environ["RD_LLAMA_USAGE_STATE"])
+
+
+def test_llama_usage_summary_math_and_state_roundtrip(tmp_path):
+    from app import collect_llama_metrics, _llama_load_usage_state
+
+    # The autouse fixture points RD_LLAMA_USAGE_STATE at this test's tmp
+    # dir – which also exercises the env override (the default lives in
+    # the app dir).
+    state_file = _usage_state_file()
+    assert state_file.parent == tmp_path
+
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_llama_server(_usage_routes())):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    usage = result["usage"]
+    assert usage["total_tokens"] == 1000 + 5000 + 4000
+    assert usage["gen_tokens"] == 1000
+    # 1000 tokens / 40.0 s of generation time = 25.0 t/s avg (idle excluded)
+    assert usage["gen_avg_tps"] == 25.0
+    assert usage["prompt_cached_pct"] == 44.4  # 4000 / (4000 + 5000)
+    assert usage["uptime_s"] >= 0
+    # State persisted (survives dashboard restarts/deployments)
+    state = _llama_load_usage_state(str(state_file))
+    assert state is not None
+    assert state["first_seen"] == state["last_reset"]
+    # Second scrape: state re-read from file, no re-init
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_llama_server(_usage_routes())):
+        result2 = collect_llama_metrics("http://127.0.0.1:9999")
+    assert result2["usage"]["uptime_s"] >= usage["uptime_s"]
+
+
+def test_llama_usage_restart_detection_rebaselines_uptime():
+    """A cumulative counter decrease (server restart/reload) re-baselines
+    last_reset while keeping first_seen."""
+    from app import collect_llama_metrics, _llama_load_usage_state
+
+    state_file = _usage_state_file()
+    old = time.time() - 100_000
+    state_file.write_text(json.dumps({"first_seen": old, "last_reset": old}))
+
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_llama_server(
+                   _usage_routes(predicted=5000, prompt=9000, cached=8000)
+               )):
+        first = collect_llama_metrics("http://127.0.0.1:9999")
+    assert first["usage"]["uptime_s"] >= 99_000  # long-running server
+
+    # Server restarts/reloads: cumulative counters drop.
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_llama_server(
+                   _usage_routes(predicted=10, prompt=100, cached=50)
+               )):
+        second = collect_llama_metrics("http://127.0.0.1:9999")
+    assert second["usage"]["uptime_s"] < 5  # re-baselined at restart
+
+    state = _llama_load_usage_state(str(state_file))
+    assert state is not None
+    assert state["last_reset"] > state["first_seen"]
+
+
+def test_llama_usage_corrupt_state_file_reinitializes():
+    from app import collect_llama_metrics, _llama_load_usage_state
+
+    state_file = _usage_state_file()
+    state_file.write_text("not-json{{{")
+
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_llama_server(_usage_routes())):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result["usage"]["uptime_s"] >= 0
+    # Corrupt file was rewritten with valid stamps
+    state = _llama_load_usage_state(str(state_file))
+    assert state is not None
+    assert state["first_seen"] == state["last_reset"]
+
+
+def test_llama_usage_missing_counters_yield_none():
+    """No generation seconds yet → gen_avg_tps None; no cached counter →
+    prompt_cached_pct None and total excludes it."""
+    from app import collect_llama_metrics
+
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_llama_server(
+                   _usage_routes(predicted_s=0.0)
+               )):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+    assert result["usage"]["gen_avg_tps"] is None
+
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_llama_server(
+                   _usage_routes(include_cached=False)
+               )):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+    assert result["usage"]["prompt_cached_pct"] is None
+    assert result["usage"]["total_tokens"] == 1000 + 5000
+
+
+def test_llama_usage_state_path_default_and_env_override(tmp_path, monkeypatch):
+    import app as app_mod
+
+    monkeypatch.delenv("RD_LLAMA_USAGE_STATE", raising=False)
+    default = app_mod._llama_usage_state_path()
+    assert default.endswith(".llama_usage_state.json")
+    assert os.path.dirname(default) == os.path.dirname(
+        os.path.abspath(app_mod.__file__)
+    )
+    override = str(tmp_path / "custom_state.json")
+    monkeypatch.setenv("RD_LLAMA_USAGE_STATE", override)
+    assert app_mod._llama_usage_state_path() == override

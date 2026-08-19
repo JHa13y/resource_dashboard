@@ -356,6 +356,9 @@ _LLAMA_METRIC_MAP = (
      "llamacpp:spec_decode_num_draft_tokens_total"),
     ("spec_decode_accepted_tokens_total",
      "llamacpp:spec_decode_num_accepted_tokens_total"),
+    ("prompt_seconds_total", "llamacpp:prompt_seconds_total"),
+    ("tokens_predicted_seconds_total",
+     "llamacpp:tokens_predicted_seconds_total"),
 )
 
 
@@ -404,6 +407,46 @@ def _llama_props(base_url: str) -> dict[str, Any] | None:
     if isinstance(data, dict):
         _llama_props_cache = (now, data)
     return data
+
+
+# ---------------------------------------------------------------------------
+# Cumulative usage state (persistent server uptime, T3)
+# ---------------------------------------------------------------------------
+
+def _llama_usage_state_path() -> str:
+    """State-file location; RD_LLAMA_USAGE_STATE overrides the default."""
+    return os.environ.get("RD_LLAMA_USAGE_STATE") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), ".llama_usage_state.json"
+    )
+
+
+def _llama_load_usage_state(path: str) -> dict[str, float] | None:
+    """Load ``{first_seen, last_reset}`` epoch stamps.
+
+    ``None`` when the file is missing or corrupt (caller reinitializes).
+    """
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return None
+        return {
+            "first_seen": float(data["first_seen"]),
+            "last_reset": float(data["last_reset"]),
+        }
+    except Exception:  # noqa: BLE001 – missing/corrupt → reinitialize
+        return None
+
+
+def _llama_save_usage_state(path: str, state: dict[str, float]) -> None:
+    """Atomic write (tmp + rename); never raises (uptime is best-effort)."""
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _parse_llama_slots(data: Any) -> list[dict[str, Any]]:
@@ -598,6 +641,57 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
     spec_accepted = out.get("spec_decode_accepted_tokens_total")
     if spec_draft is not None and spec_accepted is not None and spec_draft > 0:
         out["spec_accept_pct"] = round(100.0 * spec_accepted / spec_draft, 1)
+
+    # Cumulative usage summary + persistent server uptime. Uptime survives
+    # dashboard deploys (state file) and is re-baselined only when the
+    # llama-server itself restarts/reloads, detected as a cumulative
+    # counter decrease versus the previous successful scrape.
+    gen_seconds_total = out.get("tokens_predicted_seconds_total")
+    if (
+        gen_total is not None
+        or prompt_total is not None
+        or cached_total is not None
+    ):
+        usage: dict[str, Any] = {
+            "total_tokens": int(round(
+                (prompt_total or 0) + (cached_total or 0) + (gen_total or 0)
+            )),
+            "gen_tokens": int(round(gen_total or 0)),
+            # Average t/s WHILE GENERATING (idle time excluded by
+            # construction: the server only accumulates predicted seconds
+            # while producing tokens).
+            "gen_avg_tps": (
+                round(gen_total / gen_seconds_total, 1)
+                if gen_total is not None and gen_seconds_total else None
+            ),
+            "prompt_cached_pct": (
+                round(100.0 * cached_total / (cached_total + prompt_total), 1)
+                if cached_total is not None and prompt_total is not None
+                and cached_total + prompt_total > 0
+                else None
+            ),
+        }
+        now_wall = time.time()
+        state_path = _llama_usage_state_path()
+        state = _llama_load_usage_state(state_path)
+        if state is None:
+            state = {"first_seen": now_wall, "last_reset": now_wall}
+            _llama_save_usage_state(state_path, state)
+        elif prev is not None and (
+            (gen_total is not None and prev.get("gen") is not None
+             and gen_total < prev["gen"])
+            or (prompt_total is not None and prev.get("prompt") is not None
+                and prompt_total < prev["prompt"])
+            or (cached_total is not None and prev.get("cached") is not None
+                and cached_total < prev["cached"])
+        ):
+            # Server restart/reload: re-baseline uptime, keep first_seen.
+            state["last_reset"] = now_wall
+            _llama_save_usage_state(state_path, state)
+        usage["uptime_s"] = max(
+            0, int(now_wall - max(state["first_seen"], state["last_reset"]))
+        )
+        out["usage"] = usage
 
     slots = _parse_llama_slots(_llama_get_json(base_url, "/slots"))
     out["slots"] = slots
