@@ -398,6 +398,16 @@
       <h2>LLM Server Process</h2>
       <div class="llama-usage-line" id="llama-proc-line">–</div>
     </div>
+    <div class="card" id="swap-card" style="display:none;">
+      <h2>Swap</h2>
+      <div class="gauges">
+        <div class="gauge">
+          <div class="gauge-value" id="swap-val">–</div>
+          <div class="gauge-label" id="swap-label">Swap used</div>
+        </div>
+      </div>
+      <div class="llama-usage-line" id="swap-io" style="margin-top:8px;">–</div>
+    </div>
   </div>
 
 <script>
@@ -621,6 +631,7 @@ source.onmessage = (e) => {
   updateLlama(m.llama);
   updateLlamaUsage(m);
   updateLlamaProcess(m);
+  updateSwap(m);
 };
 
 /* ------------------------------------------------------------------ */
@@ -1028,6 +1039,33 @@ function updateLlamaProcess(m) {
     parts.push(`model ${llama.model_size_gb} GB`);
   }
   document.getElementById('llama-proc-line').textContent = parts.join(' · ');
+  card.style.display = '';
+}
+
+/* ------------------------------------------------------------------ */
+/* Swap usage + I/O rate card (bottom; hidden when the host has none)  */
+/* ------------------------------------------------------------------ */
+function updateSwap(m) {
+  const card = document.getElementById('swap-card');
+  if (!card) return;
+  const swap = m.swap;
+  if (!swap) {
+    card.style.display = 'none';
+    return;
+  }
+  const valEl = document.getElementById('swap-val');
+  valEl.textContent = `${swap.used_gb} GB`;
+  valEl.style.color = colorFor(swap.pct);
+  document.getElementById('swap-label').textContent =
+    `Swap used of ${swap.total_gb} GB · ${swap.pct}%`;
+  // First scrape has no previous counters: rate keys are absent.
+  const io = swap.in_kb_s != null && swap.out_kb_s != null;
+  const ioEl = document.getElementById('swap-io');
+  ioEl.textContent = io
+    ? `I/O: ${swap.in_kb_s} in · ${swap.out_kb_s} out kB/s`
+    : 'I/O: – in · – out kB/s (measuring…)';
+  ioEl.style.color = (io && (swap.in_kb_s > 0 || swap.out_kb_s > 0))
+    ? '#ef4444' : '';
   card.style.display = '';
 }
 

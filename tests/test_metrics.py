@@ -1656,3 +1656,134 @@ def test_llama_process_model_size(tmp_path):
         result = collect_llama_metrics("http://127.0.0.1:9999")
 
     assert result["model_size_gb"] == 19.8
+
+
+# ---------------------------------------------------------------------------
+# T6: swap usage + swap I/O rate card
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def reset_swap_prev():
+    """Reset the module-level swap I/O history around every test."""
+    import app as app_mod
+
+    original = app_mod._swap_prev
+    app_mod._swap_prev = None
+    yield
+    app_mod._swap_prev = original
+
+
+def _fake_swap(used_gb=1.5, total_gb=4.0, percent=37.5, sin=0, sout=0):
+    """A MagicMock standing in for psutil's swap_memory result."""
+    return MagicMock(
+        used=int(used_gb * 2**30),
+        total=int(total_gb * 2**30),
+        percent=percent,
+        sin=sin,
+        sout=sout,
+    )
+
+
+def test_swap_basic_fields_and_first_scrape():
+    """Usage fields map straight through; rate keys are omitted on the
+    first scrape (no previous counters) and the counters are retained."""
+    import app as app_mod
+    from app import collect_swap_metrics
+
+    with patch("app.psutil.swap_memory",
+               return_value=_fake_swap(sin=1024, sout=2048)):
+        result = collect_swap_metrics()
+
+    assert result is not None
+    assert result["used_gb"] == 1.5
+    assert result["total_gb"] == 4.0
+    assert result["pct"] == 37.5
+    assert "in_kb_s" not in result
+    assert "out_kb_s" not in result
+    assert app_mod._swap_prev == {"ts": app_mod._swap_prev["ts"],
+                                   "sin": 1024, "sout": 2048}
+
+
+def test_swap_rates_from_counter_deltas():
+    """in/out kB/s = cumulative delta / elapsed, over a 2 s scrape gap."""
+    from app import collect_swap_metrics
+
+    clock = _FakeClock()
+    with patch("app.psutil.swap_memory", side_effect=[
+        _fake_swap(sin=0, sout=0),
+        _fake_swap(sin=1_048_576, sout=524_288),  # +1 MiB in, +0.5 MiB out
+    ]), patch("app.time.monotonic", clock):
+        first = collect_swap_metrics()
+        assert "in_kb_s" not in first
+        clock.advance(2.0)
+        second = collect_swap_metrics()
+
+    assert second["in_kb_s"] == 512.0   # 1 MiB / 2 s
+    assert second["out_kb_s"] == 256.0  # 0.5 MiB / 2 s
+    assert second["used_gb"] == 1.5
+    assert second["pct"] == 37.5
+
+
+def test_swap_rate_clamped_on_counter_reset():
+    """A counter decrease (swapon/off, reboot) clamps the rate to 0."""
+    from app import collect_swap_metrics
+
+    clock = _FakeClock()
+    with patch("app.psutil.swap_memory", side_effect=[
+        _fake_swap(sin=10_000_000, sout=10_000_000),
+        _fake_swap(sin=100, sout=0),
+    ]), patch("app.time.monotonic", clock):
+        collect_swap_metrics()
+        clock.advance(1.0)
+        second = collect_swap_metrics()
+
+    assert second["in_kb_s"] == 0.0
+    assert second["out_kb_s"] == 0.0
+
+
+def test_swap_none_when_total_zero():
+    """No swap on the host (total == 0) -> None; no history retained."""
+    import app as app_mod
+    from app import collect_swap_metrics
+
+    with patch("app.psutil.swap_memory",
+               return_value=_fake_swap(used_gb=0.0, total_gb=0.0,
+                                       percent=0.0)):
+        result = collect_swap_metrics()
+
+    assert result is None
+    assert app_mod._swap_prev is None
+
+
+def test_swap_collector_error_returns_none():
+    """psutil.swap_memory raising (host without counters) -> None."""
+    import app as app_mod
+    from app import collect_swap_metrics
+
+    with patch("app.psutil.swap_memory", side_effect=OSError("no swap")):
+        result = collect_swap_metrics()
+
+    assert result is None
+    assert app_mod._swap_prev is None
+
+
+def test_collector_snapshot_includes_swap():
+    """The collector's per-tick snapshot carries the top-level swap key."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1, llama_enabled=False)
+    collector._queue = queue.Queue(maxsize=3)
+    with patch("app.psutil.swap_memory",
+               return_value=_fake_swap(sin=1024, sout=2048)):
+        collector.start()
+        try:
+            data = collector.get_latest(timeout=3.0)
+            assert data is not None
+            metrics = json.loads(data)
+            assert metrics["swap"]["used_gb"] == 1.5
+            assert metrics["swap"]["total_gb"] == 4.0
+            assert metrics["swap"]["pct"] == 37.5
+            assert "in_kb_s" not in metrics["swap"]
+        finally:
+            collector.running = False
+            collector.join(timeout=2)

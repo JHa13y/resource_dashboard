@@ -934,6 +934,52 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
 
 
 # ---------------------------------------------------------------------------
+# Swap usage + I/O rate (T6)
+# ---------------------------------------------------------------------------
+
+# Previous swap I/O counters (cumulative bytes) + monotonic ts, used to
+# compute swap in/out rates from per-scrape deltas.
+_swap_prev: dict[str, float] | None = None
+
+
+def collect_swap_metrics() -> dict[str, Any] | None:
+    """Collect swap usage and I/O rates. Never raises.
+
+    Returns ``None`` only when the host has no swap (total == 0) — the
+    sole platform guard; psutil's sin/sout counters are present on both
+    Linux and macOS. ``in_kb_s`` / ``out_kb_s`` are per-scrape deltas of
+    the cumulative sin/sout counters (omitted on the first scrape, when
+    there is no previous reading) and clamped to >= 0 so a counter reset
+    (swapon/off, reboot) never yields a negative rate.
+    """
+    global _swap_prev
+    try:
+        sw = psutil.swap_memory()
+    except Exception:  # noqa: BLE001 – collector must never raise
+        return None
+    if not sw.total:
+        return None
+    out: dict[str, Any] = {
+        "used_gb": round(sw.used / 2**30, 1),
+        "total_gb": round(sw.total / 2**30, 1),
+        "pct": round(sw.percent, 1),
+    }
+    now = time.monotonic()
+    prev = _swap_prev
+    if prev is not None:
+        elapsed = now - prev["ts"]
+        if elapsed > 0:
+            out["in_kb_s"] = round(
+                max(0.0, sw.sin - prev["sin"]) / elapsed / 1024.0, 1
+            )
+            out["out_kb_s"] = round(
+                max(0.0, sw.sout - prev["sout"]) / elapsed / 1024.0, 1
+            )
+    _swap_prev = {"ts": now, "sin": sw.sin, "sout": sw.sout}
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Metrics Collector Thread
 # ---------------------------------------------------------------------------
 
@@ -999,6 +1045,7 @@ class MetricsCollector(threading.Thread):
                 "available_gb": round(vm.available / (1024**3), 1),
             },
             "gpus": collect_gpu_metrics(),
+            "swap": collect_swap_metrics(),
             # Stable signal for the frontend: the llama.cpp section is on by
             # default; --no-llama skips scraping entirely and hides the card.
             "llama_enabled": self.llama_enabled,
