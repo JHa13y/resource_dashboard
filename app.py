@@ -22,6 +22,7 @@ import queue
 import subprocess
 import threading
 import time
+import urllib.error
 import urllib.request
 from collections import deque
 from typing import Any, Generator
@@ -340,6 +341,14 @@ _llama_last_good: tuple[float, dict[str, Any]] | None = None
 # n_prompt_tokens_processed update per token.
 _llama_slot_prev: dict[str, Any] | None = None
 
+# (monotonic ts, n_decode_total) pairs from the last successful scrapes.
+# n_decode_total ticks per llama_decode() call; frozen across 10 consecutive
+# successful scrapes while a slot is mid-generation means the server is
+# hung (stuck decode / GPU wedged). Long prefills call no llama_decode, so
+# slots with decoded == 0 are excluded (see the stall check below).
+_LLAMA_DECODE_HISTORY_LEN = 10
+_llama_decode_history: list[tuple[float, float]] = []
+
 # (dashboard key, Prometheus metric) pairs — verified against llama.cpp
 # ``to_metrics()`` (tools/server/server-task.cpp). Missing metrics are simply
 # omitted (older builds expose a shorter set).
@@ -359,6 +368,7 @@ _LLAMA_METRIC_MAP = (
     ("prompt_seconds_total", "llamacpp:prompt_seconds_total"),
     ("tokens_predicted_seconds_total",
      "llamacpp:tokens_predicted_seconds_total"),
+    ("n_decode_total", "llamacpp:n_decode_total"),
 )
 
 
@@ -391,6 +401,54 @@ def _llama_get_json(base_url: str, path: str, timeout: float = 2.0) -> Any:
             base_url.rstrip("/") + path, timeout=timeout
         ) as r:
             return json.loads(r.read().decode())
+    except Exception:  # noqa: BLE001 – collector must never raise
+        return None
+
+
+def _llama_health_detail(body: str) -> str | None:
+    """Short human-readable detail from a /health body.
+
+    Parsed generically (JSON ``status`` field, else trimmed text) — never
+    matched against a specific build's exact wording.
+    """
+    body = (body or "").strip()
+    if not body:
+        return None
+    try:
+        data = json.loads(body)
+        if isinstance(data, dict):
+            s = data.get("status")
+            if isinstance(s, str) and s.strip():
+                return s.strip()[:60]
+    except Exception:  # noqa: BLE001 – not JSON; fall back to raw text
+        pass
+    text = " ".join(body.split())
+    return text[:60] or None
+
+
+def _llama_health(base_url: str) -> dict[str, Any] | None:
+    """GET /health (2 s timeout); ``None`` on any failure.
+
+    llama-server answers HTTP 200 once it can serve and HTTP 503 while a
+    model is still loading, so this distinguishes "loading (be patient)"
+    from "down". Returns ``{"state": "ok", ...}`` on 200 and
+    ``{"state": "loading", "detail": <body>}`` on 503. Never raises.
+    """
+    try:
+        with urllib.request.urlopen(
+            base_url.rstrip("/") + "/health", timeout=2
+        ) as r:
+            return {"state": "ok", "detail": _llama_health_detail(
+                r.read().decode(errors="replace")
+            )}
+    except urllib.error.HTTPError as e:
+        if e.code == 503:
+            try:
+                body = e.read().decode(errors="replace")
+            except Exception:  # noqa: BLE001
+                body = ""
+            return {"state": "loading", "detail": _llama_health_detail(body)}
+        return None
     except Exception:  # noqa: BLE001 – collector must never raise
         return None
 
@@ -537,7 +595,7 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
     ``status: "stale"`` for up to ``_LLAMA_STALE_MAX_AGE_S`` seconds so a
     transient timeout doesn't flicker the UI to "unreachable".
     """
-    global _llama_prev, _llama_last_good, _llama_slot_prev
+    global _llama_prev, _llama_last_good, _llama_slot_prev, _llama_decode_history
 
     def _stale_or_none() -> dict[str, Any] | None:
         """Hold last-good data during a transient scrape failure."""
@@ -548,6 +606,17 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
                 out["status"] = "stale"
                 return out
         return None
+
+    # /health first: while a model is loading the server answers 503 on
+    # every endpoint (including /metrics), so the loading state is only
+    # observable via /health. On 200 the /metrics up/stale/unreachable
+    # logic below is unchanged.
+    health = _llama_health(base_url)
+    if health is not None and health["state"] == "loading":
+        out_loading: dict[str, Any] = {"status": "loading"}
+        if health.get("detail"):
+            out_loading["health_detail"] = health["detail"]
+        return out_loading
 
     try:
         with urllib.request.urlopen(
@@ -625,6 +694,9 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
         if isinstance(total_slots, int):
             out["total_slots"] = total_slots
         out["sleeping"] = bool(props.get("is_sleeping", False))
+        build_info = props.get("build_info")
+        if isinstance(build_info, str) and build_info:
+            out["build_info"] = build_info
 
     # Free slots: total (props) minus in-flight requests (/metrics).
     # Omitted when either side is unknown (older builds).
@@ -695,6 +767,23 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
 
     slots = _parse_llama_slots(_llama_get_json(base_url, "/slots"))
     out["slots"] = slots
+
+    # Decode-stall flag: n_decode_total is the only live /metrics counter
+    # (it ticks per llama_decode() call). Frozen across 10 consecutive
+    # successful scrapes while a slot is mid-generation (decoded > 0 —
+    # long prefills call no llama_decode and must not trigger this) means
+    # the server stopped advancing: hang / GPU wedged.
+    decode_total = raw.get("llamacpp:n_decode_total")
+    if decode_total is not None:
+        _llama_decode_history.append((now, decode_total))
+        if len(_llama_decode_history) > _LLAMA_DECODE_HISTORY_LEN:
+            _llama_decode_history.pop(0)
+    if len(_llama_decode_history) >= _LLAMA_DECODE_HISTORY_LEN:
+        if len({v for _, v in _llama_decode_history}) == 1:
+            for slot in slots:
+                if slot["is_processing"] and slot["decoded"] > 0:
+                    out["stalled"] = True
+                    break
 
     # Live tokens/s from per-slot decode counters (see _llama_slot_prev):
     # they update per token, unlike the /metrics counters on some builds.

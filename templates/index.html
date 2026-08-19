@@ -197,6 +197,13 @@
       max-width: 320px;
       overflow: hidden;
       text-overflow: ellipsis;
+    }
+
+    .llama-sub {
+      margin-top: 2px;
+      font-size: 0.75rem;
+      color: var(--muted);
+    }
       white-space: nowrap;
     }
 
@@ -314,8 +321,10 @@
         <h2>Local LLM · llama.cpp</h2>
         <span class="llama-model" id="llama-model">–</span>
         <span id="llama-status" class="badge down">unreachable</span>
+        <span id="llama-stalled" class="badge down" style="display:none;">stalled</span>
         <span class="llama-model" id="llama-slots-free" style="display:none;"></span>
       </div>
+      <div class="llama-sub" id="llama-build" style="display:none;"></div>
       <div class="gauges">
         <div class="gauge">
           <div class="gauge-value" id="llama-gen-tokens-s">–</div>
@@ -362,7 +371,7 @@
         </div>
         <div class="gauge">
           <div class="gauge-value" id="mem-detail">–</div>
-          <div class="gauge-label">Used / Total GB</div>
+          <div class="gauge-label">Available RAM (of total)</div>
         </div>
       </div>
     </div>
@@ -625,7 +634,7 @@ function updateSystem(m) {
   memEl.style.color = colorFor(m.memory?.percent);
 
   if (m.memory) {
-    detailEl.textContent = `${m.memory.used_gb} / ${m.memory.total_gb}`;
+    detailEl.textContent = `${m.memory.available_gb} GB available of ${m.memory.total_gb} GB`;
   }
 
   // Charts
@@ -874,8 +883,11 @@ function updateLlama(llama) {
   if (llama == null) {
     statusEl.textContent = 'unreachable';
     statusEl.className = 'badge down';
+    statusEl.removeAttribute('title');
     modelEl.textContent = '–';
     modelEl.removeAttribute('title');
+    document.getElementById('llama-stalled').style.display = 'none';
+    document.getElementById('llama-build').style.display = 'none';
     document.getElementById('llama-slots-free').style.display = 'none';
     document.getElementById('llama-peak-ctx').style.display = 'none';
     document.getElementById('llama-spec-gauge').style.display = 'none';
@@ -883,20 +895,42 @@ function updateLlama(llama) {
     return; // keep gauges / chart history as-is
   }
 
-  /* Status + model ("stale" = last data held after a failed scrape) */
-  if (llama.status === 'stale') {
+  /* Status + model ("stale" = last data held after a failed scrape;
+     "loading" = /health answered 503, model still loading) */
+  if (llama.status === 'loading') {
+    statusEl.textContent = 'loading model';
+    statusEl.className = 'badge warn';
+    if (llama.health_detail) statusEl.title = llama.health_detail;
+    else statusEl.removeAttribute('title');
+  } else if (llama.status === 'stale') {
     statusEl.textContent = 'stale';
     statusEl.className = 'badge warn';
+    statusEl.removeAttribute('title');
   } else if (llama.sleeping) {
     statusEl.textContent = 'sleeping';
     statusEl.className = 'badge warn';
+    statusEl.removeAttribute('title');
   } else {
     statusEl.textContent = 'up';
     statusEl.className = 'badge ok';
+    statusEl.removeAttribute('title');
   }
   modelEl.textContent = llama.model != null ? llama.model : '–';
   if (llama.model_path) modelEl.title = llama.model_path;
   else modelEl.removeAttribute('title');
+
+  /* Build info (sub-text under the model name; hidden on older builds) */
+  const buildEl = document.getElementById('llama-build');
+  if (llama.build_info) {
+    buildEl.textContent = `build ${llama.build_info}`;
+    buildEl.style.display = '';
+  } else {
+    buildEl.style.display = 'none';
+  }
+
+  /* Decode-stall flag (n_decode_total frozen while a slot is generating) */
+  document.getElementById('llama-stalled').style.display =
+    llama.stalled === true ? '' : 'none';
 
   /* Gauges (older builds may omit keys – show '–') */
   const genEl = document.getElementById('llama-gen-tokens-s');

@@ -6,12 +6,14 @@ Run:
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import queue
 import sys
 import threading
 import time
+import urllib.error
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -381,13 +383,16 @@ def reset_llama_prev():
     original_prev = app_mod._llama_prev
     original_last_good = app_mod._llama_last_good
     original_slot_prev = app_mod._llama_slot_prev
+    original_decode_history = app_mod._llama_decode_history
     app_mod._llama_prev = None
     app_mod._llama_last_good = None
     app_mod._llama_slot_prev = None
+    app_mod._llama_decode_history = []
     yield
     app_mod._llama_prev = original_prev
     app_mod._llama_last_good = original_last_good
     app_mod._llama_slot_prev = original_slot_prev
+    app_mod._llama_decode_history = original_decode_history
 
 
 @pytest.fixture(autouse=True)
@@ -1273,3 +1278,220 @@ def test_llama_usage_state_path_default_and_env_override(tmp_path, monkeypatch):
     override = str(tmp_path / "custom_state.json")
     monkeypatch.setenv("RD_LLAMA_USAGE_STATE", override)
     assert app_mod._llama_usage_state_path() == override
+
+
+# ---------------------------------------------------------------------------
+# T4: /health loading status, build_info, decode-stall flag
+# ---------------------------------------------------------------------------
+
+def _http_error_503(body: bytes) -> urllib.error.HTTPError:
+    """A urllib HTTPError(503) carrying *body*, as llama-server sends it
+    while a model is loading."""
+    return urllib.error.HTTPError(
+        "http://127.0.0.1:9999/health", 503, "Service Unavailable",
+        {}, io.BytesIO(body),
+    )
+
+
+def test_collect_llama_health_loading():
+    """/health 503 (model loading) -> status "loading"; /metrics is not
+    even consulted while the model loads."""
+    from app import collect_llama_metrics
+
+    calls: list = []
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/health": _http_error_503(b'{"status":"loading model"}'),
+        "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+    }, calls=calls)):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result is not None
+    assert result["status"] == "loading"
+    # Body parsed generically (JSON "status" field), not matched exactly.
+    assert result["health_detail"] == "loading model"
+    # Early return: only /health was fetched.
+    assert all("/health" in c for c in calls)
+    assert result.get("gen_tokens_per_s") is None
+
+
+def test_collect_llama_health_loading_plain_text_body():
+    """A non-JSON 503 body is still surfaced (trimmed raw text)."""
+    from app import collect_llama_metrics
+
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/health": _http_error_503(b"  Loading model \n"),
+    })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result["status"] == "loading"
+    assert result["health_detail"] == "Loading model"
+
+
+def test_collect_llama_health_ok_keeps_metrics_logic():
+    """/health 200 -> normal /metrics flow, status stays "up"."""
+    from app import collect_llama_metrics
+
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/health": b'{"status":"ok"}',
+        "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+        "/props": b'{"model_path": "/models/x.gguf", "total_slots": 1}',
+        "/slots": b"[]",
+    })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result is not None
+    assert result["status"] == "up"
+    assert "health_detail" not in result
+
+
+def test_collect_llama_health_unreachable_keeps_metrics_logic():
+    """The /health fetch itself failing (timeout/down) must not disturb
+    the existing up/stale/unreachable /metrics logic."""
+    from app import collect_llama_metrics
+
+    # no /health route -> health fetch raises -> /metrics decides
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+        "/props": b"{}",
+        "/slots": b"[]",
+    })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result is not None
+    assert result["status"] == "up"
+
+
+def test_collect_llama_build_info():
+    """/props build_info passes through; omitted when absent."""
+    import app as app_mod
+    from app import collect_llama_metrics
+
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+        "/props": (b'{"model_path": "/models/x.gguf", '
+                   b'"build_info": "b10450-ece963f41"}'),
+        "/slots": b"[]",
+    })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result["build_info"] == "b10450-ece963f41"
+
+    # Drop the 30 s /props cache so the second scrape re-fetches props.
+    app_mod._llama_props_cache = None
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+        "/props": b'{"model_path": "/models/x.gguf"}',
+        "/slots": b"[]",
+    })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert "build_info" not in result
+
+
+# --- decode-stall flag ------------------------------------------------------
+
+def _decode_metrics_body(n_decode: int) -> bytes:
+    return (
+        f"llamacpp:n_decode_total {n_decode}\n"
+        f"llamacpp:tokens_predicted_total 100\n"
+    ).encode()
+
+
+# Slot mid-generation: is_processing with tokens already decoded.
+_ACTIVE_SLOT = (b'[{"id": 0, "n_ctx": 1000, "n_prompt_tokens": 10, '
+                b'"is_processing": true, '
+                b'"next_token": {"n_decoded": 5, "n_remain": 50}}]')
+# Slot in a long prefill: is_processing but nothing decoded yet (no
+# llama_decode calls -> n_decode_total legitimately frozen).
+_PREFILL_SLOT = (b'[{"id": 0, "n_ctx": 1000, "n_prompt_tokens": 500, '
+                 b'"is_processing": true, '
+                 b'"next_token": {"n_decoded": 0, "n_remain": -1}}]')
+
+
+def _seed_decode_history(app_mod, value: float, n: int = 9):
+    app_mod._llama_decode_history = [
+        (1000.0 + i, value) for i in range(n)
+    ]
+
+
+def test_collect_llama_stall_flag_when_decode_frozen():
+    """n_decode_total frozen across 10 consecutive successful scrapes
+    while a slot is mid-generation -> stalled."""
+    import app as app_mod
+    from app import collect_llama_metrics
+
+    _seed_decode_history(app_mod, 5000.0)
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/metrics": _decode_metrics_body(5000),
+        "/props": b"{}",
+        "/slots": _ACTIVE_SLOT,
+    })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result["stalled"] is True
+    assert len(app_mod._llama_decode_history) == 10
+
+
+def test_collect_llama_no_stall_during_prefill():
+    """Frozen counter while a slot is still in prefill (decoded == 0) is
+    NOT a stall: long prefills call no llama_decode."""
+    import app as app_mod
+    from app import collect_llama_metrics
+
+    _seed_decode_history(app_mod, 5000.0)
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/metrics": _decode_metrics_body(5000),
+        "/props": b"{}",
+        "/slots": _PREFILL_SLOT,
+    })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert "stalled" not in result
+
+
+def test_collect_llama_no_stall_when_decode_advances():
+    """Any movement of n_decode_total in the 10-scrape window clears the
+    stall condition."""
+    import app as app_mod
+    from app import collect_llama_metrics
+
+    _seed_decode_history(app_mod, 5000.0)
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/metrics": _decode_metrics_body(5001),
+        "/props": b"{}",
+        "/slots": _ACTIVE_SLOT,
+    })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert "stalled" not in result
+
+
+def test_collect_llama_no_stall_before_history_full():
+    """The flag needs 10 consecutive scrapes; a fresh history never fires
+    (avoids a false flag right after startup)."""
+    from app import collect_llama_metrics
+
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/metrics": _decode_metrics_body(5000),
+        "/props": b"{}",
+        "/slots": _ACTIVE_SLOT,
+    })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert "stalled" not in result
+
+
+def test_collect_llama_stall_history_window_bounded():
+    """History never grows past 10 entries."""
+    import app as app_mod
+    from app import collect_llama_metrics
+
+    _seed_decode_history(app_mod, 5000.0, n=10)
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/metrics": _decode_metrics_body(5001),
+        "/props": b"{}",
+        "/slots": b"[]",
+    })):
+        collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert len(app_mod._llama_decode_history) == 10
