@@ -603,6 +603,8 @@ def test_collect_llama_props_and_slots():
     assert s1["context_used"] == 0
     assert s1["context_pct"] == 0.0
     assert s1["is_processing"] is False
+    # free_slots = total_slots (props: 2) - requests_processing (sample: 1)
+    assert result["free_slots"] == 1
 
 
 def test_parse_llama_slots_next_token_shapes():
@@ -638,6 +640,80 @@ def test_parse_llama_slots_next_token_shapes():
     assert l[0]["prompt_processed"] == 3
     # context = prompt + decoded
     assert l[0]["context_used"] == 25
+
+
+def test_parse_llama_slots_remain():
+    """n_remain (tokens left to generate) is summed over the next_token
+    items; -1 (idle) or absent -> None."""
+    from app import _parse_llama_slots
+
+    # list shape: sum positive n_remain over the items
+    l = _parse_llama_slots([{
+        "id": 0, "n_ctx": 100, "n_prompt_tokens": 10,
+        "next_token": [
+            {"n_decoded": 10, "n_remain": 16000},
+            {"n_decoded": 5, "n_remain": 374},
+        ],
+    }])
+    assert l[0]["remain"] == 16374
+    assert l[0]["decoded"] == 15
+
+    # dict shape (classic builds)
+    d = _parse_llama_slots([{
+        "id": 0, "n_ctx": 100, "n_prompt_tokens": 10,
+        "next_token": {"n_decoded": 512, "n_remain": 10},
+    }])
+    assert d[0]["remain"] == 10
+
+    # idle marker: -1 wins -> None
+    i = _parse_llama_slots([{
+        "id": 0, "n_ctx": 100, "n_prompt_tokens": 10,
+        "next_token": [{"n_decoded": 0, "n_remain": -1}],
+    }])
+    assert i[0]["remain"] is None
+
+    # absent next_token / empty list / no n_remain field -> None
+    a = _parse_llama_slots([{"id": 0, "n_ctx": 100, "n_prompt_tokens": 10}])
+    assert a[0]["remain"] is None
+    b = _parse_llama_slots([{
+        "id": 0, "n_ctx": 100, "n_prompt_tokens": 10, "next_token": [],
+    }])
+    assert b[0]["remain"] is None
+    c = _parse_llama_slots([{
+        "id": 0, "n_ctx": 100, "n_prompt_tokens": 10,
+        "next_token": [{"n_decoded": 42}],
+    }])
+    assert c[0]["remain"] is None
+    assert c[0]["decoded"] == 42
+
+
+def test_collect_llama_free_slots():
+    """free_slots = total_slots (props) - requests_processing (metrics);
+    the key is omitted when either side is unknown."""
+    from app import collect_llama_metrics
+
+    def run(props: str, metrics: str):
+        # Bypass the 30 s /props cache so each run sees its own props body.
+        import app as app_mod
+        app_mod._llama_props_cache = None
+        with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+            "/metrics": metrics.encode(),
+            "/props": props.encode(),
+            "/slots": b"[]",
+        })):
+            return collect_llama_metrics("http://127.0.0.1:9999")
+
+    # known: 3 slots, 1 processing -> 2 free
+    r = run('{"total_slots": 3}', "llamacpp:requests_processing 1\n")
+    assert r["free_slots"] == 2
+
+    # props without total_slots -> key omitted
+    r = run('{}', "llamacpp:requests_processing 1\n")
+    assert "free_slots" not in r
+
+    # metrics without requests_processing -> key omitted
+    r = run('{"total_slots": 3}', "llamacpp:n_tokens_max 100\n")
+    assert "free_slots" not in r
 
 
 def test_collect_llama_live_rate_from_slots():

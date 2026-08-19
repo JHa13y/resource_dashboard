@@ -420,15 +420,34 @@ def _parse_llama_slots(data: Any) -> list[dict[str, Any]]:
             n_ctx = int(slot.get("n_ctx", 0) or 0)
             prompt = int(slot.get("n_prompt_tokens", 0) or 0)
             next_tok = slot.get("next_token")
+            # Tokens left to generate; None when the slot is idle or the
+            # field is absent (idle is marked n_remain = -1).
+            remain = None
             if isinstance(next_tok, dict):
                 decoded = int(next_tok.get("n_decoded", 0) or 0)
+                r = next_tok.get("n_remain")
+                if r is not None and int(r) >= 0:
+                    remain = int(r)
             elif isinstance(next_tok, list):
                 # Some builds (e.g. LM Studio's) emit a LIST of per-token
-                # dicts; total their n_decoded values.
+                # dicts; total their n_decoded / n_remain values.
                 decoded = 0
+                remain_sum = None
                 for item in next_tok:
-                    if isinstance(item, dict):
-                        decoded += int(item.get("n_decoded", 0) or 0)
+                    if not isinstance(item, dict):
+                        continue
+                    decoded += int(item.get("n_decoded", 0) or 0)
+                    r = item.get("n_remain")
+                    if r is None:
+                        continue
+                    rv = int(r)
+                    if rv < 0:
+                        remain_sum = None  # idle marker wins
+                    elif remain_sum is not None:
+                        remain_sum += rv
+                    else:
+                        remain_sum = rv
+                remain = remain_sum
             else:
                 decoded = 0
             used = prompt + decoded
@@ -439,6 +458,7 @@ def _parse_llama_slots(data: Any) -> list[dict[str, Any]]:
                 "context_pct": round(100.0 * used / n_ctx, 1) if n_ctx else 0.0,
                 "is_processing": bool(slot.get("is_processing", False)),
                 "decoded": decoded,
+                "remain": remain,
                 "prompt_processed": int(
                     slot.get("n_prompt_tokens_processed", 0) or 0
                 ),
@@ -558,6 +578,13 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
         if isinstance(total_slots, int):
             out["total_slots"] = total_slots
         out["sleeping"] = bool(props.get("is_sleeping", False))
+
+    # Free slots: total (props) minus in-flight requests (/metrics).
+    # Omitted when either side is unknown (older builds).
+    total_slots = out.get("total_slots")
+    requests_processing = out.get("requests_processing")
+    if isinstance(total_slots, int) and requests_processing is not None:
+        out["free_slots"] = max(0, total_slots - int(requests_processing))
 
     slots = _parse_llama_slots(_llama_get_json(base_url, "/slots"))
     out["slots"] = slots
