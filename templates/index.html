@@ -408,6 +408,10 @@
       </div>
       <div class="llama-usage-line" id="swap-io" style="margin-top:8px;">–</div>
     </div>
+    <div class="card" id="host-health-card">
+      <h2>Host Health</h2>
+      <div class="llama-usage-line" id="host-health-line">–</div>
+    </div>
   </div>
 
 <script>
@@ -632,6 +636,7 @@ source.onmessage = (e) => {
   updateLlamaUsage(m);
   updateLlamaProcess(m);
   updateSwap(m);
+  updateHostHealth(m);
 };
 
 /* ------------------------------------------------------------------ */
@@ -1066,6 +1071,31 @@ function updateSwap(m) {
     : 'I/O: – in · – out kB/s (measuring…)';
   ioEl.style.color = (io && (swap.in_kb_s > 0 || swap.out_kb_s > 0))
     ? '#ef4444' : '';
+  card.style.display = '';
+}
+
+/* ------------------------------------------------------------------ */
+/* Host health card (bottom; PSI mem pressure + D-state processes)     */
+/* ------------------------------------------------------------------ */
+function updateHostHealth(m) {
+  const card = document.getElementById('host-health-card');
+  if (!card) return;
+  const hh = m.host_health;
+  if (!hh) {
+    card.style.display = 'none';
+    return;
+  }
+  const el = document.getElementById('host-health-line');
+  el.textContent = '';
+  // Pressure part omitted on hosts without /proc/pressure/memory (macOS).
+  if (hh.psi_mem_avg10 != null) {
+    el.textContent = `mem pressure ${hh.psi_mem_avg10}% (10s) · `;
+  }
+  const d = hh.d_state_procs != null ? hh.d_state_procs : 0;
+  const span = document.createElement('span');
+  span.textContent = `D-state procs: ${d}`;
+  span.style.color = d > 0 ? '#ef4444' : '';
+  el.appendChild(span);
   card.style.display = '';
 }
 

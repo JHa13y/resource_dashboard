@@ -980,6 +980,68 @@ def collect_swap_metrics() -> dict[str, Any] | None:
 
 
 # ---------------------------------------------------------------------------
+# Host health: PSI memory pressure + D-state processes (T7)
+# ---------------------------------------------------------------------------
+
+# Linux Pressure Stall Information file for memory. Absent on macOS and on
+# Linux kernels without CONFIG_PSI — the metric is simply None there.
+_PSI_MEMORY_PATH = "/proc/pressure/memory"
+
+
+def _read_psi_mem_avg10(path: str = _PSI_MEMORY_PATH) -> float | None:
+    """Parse the ``some avg10=`` value (percent) from a PSI pressure file.
+
+    The file format is::
+
+        some avg10=0.05 avg60=0.02 avg300=0.01 total=123456789
+        full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+
+    Only the ``some`` line's avg10 is used (10 s window, any stall). Returns
+    ``None`` when the file is missing (non-Linux host) or unparseable.
+    """
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError:  # no /proc (macOS), PSI disabled, or permission error
+        return None
+    for line in text.splitlines():
+        parts = line.split()
+        if not parts or parts[0] != "some":
+            continue
+        for tok in parts[1:]:
+            if tok.startswith("avg10="):
+                try:
+                    return round(float(tok[len("avg10="):]), 2)
+                except ValueError:
+                    return None
+    return None
+
+
+def collect_host_health_metrics(
+    psi_mem_path: str = _PSI_MEMORY_PATH,
+) -> dict[str, Any]:
+    """Collect host health: PSI memory pressure + D-state process count.
+
+    Never raises. ``psi_mem_avg10`` is None on hosts without
+    ``/proc/pressure/memory`` (macOS, kernels without CONFIG_PSI); the
+    D-state count degrades to 0 if the process table cannot be read.
+    ``psi_mem_path`` is injectable for tests.
+    """
+    try:
+        d_state = sum(
+            1
+            for p in psutil.process_iter(["status"])
+            if p.info.get("status") == psutil.STATUS_DISK_SLEEP
+        )
+    except Exception:  # noqa: BLE001 – collector must never raise
+        d_state = 0
+    return {
+        "psi_mem_avg10": _read_psi_mem_avg10(psi_mem_path),
+        "d_state_procs": d_state,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Metrics Collector Thread
 # ---------------------------------------------------------------------------
 
@@ -1046,6 +1108,7 @@ class MetricsCollector(threading.Thread):
             },
             "gpus": collect_gpu_metrics(),
             "swap": collect_swap_metrics(),
+            "host_health": collect_host_health_metrics(),
             # Stable signal for the frontend: the llama.cpp section is on by
             # default; --no-llama skips scraping entirely and hides the card.
             "llama_enabled": self.llama_enabled,

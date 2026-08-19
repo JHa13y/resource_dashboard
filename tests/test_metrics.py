@@ -1787,3 +1787,114 @@ def test_collector_snapshot_includes_swap():
         finally:
             collector.running = False
             collector.join(timeout=2)
+
+
+# ---------------------------------------------------------------------------
+# T7: host health card (PSI memory pressure, D-state processes)
+# ---------------------------------------------------------------------------
+
+_PSI_MEMORY_BODY = (
+    "some avg10=0.05 avg60=0.02 avg300=0.01 total=123456789\n"
+    "full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+)
+
+
+def _fake_status_proc(status: str) -> MagicMock:
+    """A MagicMock process exposing only the 'status' info field."""
+    p = MagicMock()
+    p.info = {"status": status}
+    return p
+
+
+def test_host_health_psi_parse_and_d_state_count(tmp_path):
+    """PSI 'some avg10=' is parsed from a real file; D-state procs are
+    counted via the (fake) process table."""
+    from app import collect_host_health_metrics
+
+    psi_file = tmp_path / "memory"
+    psi_file.write_text(_PSI_MEMORY_BODY)
+    procs = [
+        _fake_status_proc(psutil.STATUS_DISK_SLEEP),
+        _fake_status_proc(psutil.STATUS_DISK_SLEEP),
+        _fake_status_proc(psutil.STATUS_RUNNING),
+        _fake_status_proc(psutil.STATUS_SLEEPING),
+        _fake_status_proc(psutil.STATUS_ZOMBIE),
+    ]
+    with patch("app.psutil.process_iter", return_value=procs):
+        result = collect_host_health_metrics(psi_mem_path=str(psi_file))
+
+    assert result["psi_mem_avg10"] == 0.05
+    assert result["d_state_procs"] == 2
+
+
+def test_host_health_psi_missing_file_returns_none(tmp_path):
+    """No /proc/pressure/memory (macOS) -> psi None; D-state still counted."""
+    from app import collect_host_health_metrics
+
+    procs = [_fake_status_proc(psutil.STATUS_DISK_SLEEP)]
+    with patch("app.psutil.process_iter", return_value=procs):
+        result = collect_host_health_metrics(
+            psi_mem_path=str(tmp_path / "does-not-exist")
+        )
+
+    assert result["psi_mem_avg10"] is None
+    assert result["d_state_procs"] == 1
+
+
+def test_host_health_psi_unparseable_returns_none(tmp_path):
+    """A 'some' line with a malformed avg10, or no 'some' line at all,
+    both yield None (the 'full' line's avg10 must not be used)."""
+    from app import collect_host_health_metrics
+
+    bad = tmp_path / "bad"
+    bad.write_text("some avg10=garbage avg60=0.02 total=1\nfull avg10=9.99 total=0\n")
+    with patch("app.psutil.process_iter", return_value=[]):
+        assert (
+            collect_host_health_metrics(psi_mem_path=str(bad))["psi_mem_avg10"]
+            is None
+        )
+
+    no_some = tmp_path / "no_some"
+    no_some.write_text("full avg10=9.99 avg60=0.1 avg300=0.0 total=1\n")
+    with patch("app.psutil.process_iter", return_value=[]):
+        assert (
+            collect_host_health_metrics(psi_mem_path=str(no_some))["psi_mem_avg10"]
+            is None
+        )
+
+
+def test_host_health_process_iter_error_degrades_to_zero(tmp_path):
+    """A process-table failure degrades D-state to 0 (never raises)."""
+    from app import collect_host_health_metrics
+
+    with patch("app.psutil.process_iter", side_effect=OSError("boom")):
+        result = collect_host_health_metrics(psi_mem_path=str(tmp_path / "x"))
+
+    assert result["d_state_procs"] == 0
+    assert result["psi_mem_avg10"] is None
+
+
+def test_collector_snapshot_includes_host_health():
+    """The collector's per-tick snapshot carries the top-level key with the
+    spec'd shape (psi float|None, d_state int)."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1, llama_enabled=False)
+    collector._queue = queue.Queue(maxsize=3)
+    procs = [
+        _fake_status_proc(psutil.STATUS_DISK_SLEEP),
+        _fake_status_proc(psutil.STATUS_RUNNING),
+    ]
+    with patch("app.psutil.process_iter", return_value=procs):
+        collector.start()
+        try:
+            data = collector.get_latest(timeout=3.0)
+            assert data is not None
+            metrics = json.loads(data)
+        finally:
+            collector.running = False
+            collector.join(timeout=2)
+
+    hh = metrics["host_health"]
+    assert hh["d_state_procs"] == 1
+    assert hh["psi_mem_avg10"] is None or isinstance(hh["psi_mem_avg10"], float)
