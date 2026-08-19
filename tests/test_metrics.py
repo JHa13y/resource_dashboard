@@ -408,6 +408,41 @@ def isolate_llama_usage_state(tmp_path, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def reset_llama_proc():
+    """Reset the T5 process handle; default: no local llama-server.
+
+    ``psutil.process_iter`` is patched to return no processes by default so
+    tests never depend on (or slow down on) the host's real process table.
+    Tests that need a fake server re-patch it.
+    """
+    import app as app_mod
+
+    original = app_mod._llama_proc
+    app_mod._llama_proc = None
+    with patch("app.psutil.process_iter", return_value=[]):
+        yield
+    app_mod._llama_proc = original
+
+
+def _fake_llama_proc(name="llama-server", rss_gb=21.0, cpu=340.0,
+                     threads=64, cmdline=None):
+    """A MagicMock standing in for the local llama-server process."""
+    rss = int(rss_gb * 2**30)
+    p = MagicMock()
+    p.info = {
+        "name": name,
+        "cmdline": (cmdline if cmdline is not None
+                    else ["/home/joshua/llama.cpp/build/bin/llama-server",
+                          "--model", "x.gguf"]),
+        "memory_info": MagicMock(rss=rss),
+    }
+    p.memory_info.return_value = MagicMock(rss=rss)
+    p.cpu_percent.return_value = cpu
+    p.num_threads.return_value = threads
+    return p
+
+
 class _FakeClock:
     """A manually advanced stand-in for time.monotonic."""
 
@@ -1495,3 +1530,129 @@ def test_collect_llama_stall_history_window_bounded():
         collect_llama_metrics("http://127.0.0.1:9999")
 
     assert len(app_mod._llama_decode_history) == 10
+
+
+# ---------------------------------------------------------------------------
+# T5: llama-server process card
+# ---------------------------------------------------------------------------
+
+def test_llama_process_name_match():
+    """psutil name match is identified; model_size_gb guarded (no file)."""
+    import app as app_mod
+    from app import collect_llama_metrics
+
+    proc = _fake_llama_proc(rss_gb=21.0, cpu=340.0, threads=64)
+    with patch("app.psutil.process_iter", return_value=[proc]), \
+         patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+            "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+            "/props": b'{"model_path": "/models/x.gguf", "total_slots": 1}',
+            "/slots": b"[]",
+        })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result["process"] == {"rss_gb": 21.0, "cpu_pct": 340.0,
+                                 "threads": 64}
+    assert app_mod._llama_proc is proc
+    proc.cpu_percent.assert_called_with(None)  # primed on identification
+    # /models/x.gguf does not exist on this host -> key omitted
+    assert "model_size_gb" not in result
+
+
+def test_llama_process_multiple_matches_largest_rss_wins():
+    import app as app_mod
+    from app import collect_llama_metrics
+
+    small = _fake_llama_proc(rss_gb=5.0)
+    big = _fake_llama_proc(rss_gb=30.0)
+    with patch("app.psutil.process_iter", return_value=[small, big]), \
+         patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+            "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+            "/props": b"{}",
+            "/slots": b"[]",
+        })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result["process"]["rss_gb"] == 30.0
+    assert app_mod._llama_proc is big
+    small.cpu_percent.assert_not_called()
+
+
+def test_llama_process_cmdline_fallback():
+    """No exact name match: a cmdline argument containing llama-server."""
+    import app as app_mod
+    from app import collect_llama_metrics
+
+    other = _fake_llama_proc(name="python3", rss_gb=1.0,
+                             cmdline=["python3", "-c", "pass"])
+    server = _fake_llama_proc(
+        name="llama-server-bin", rss_gb=21.0,
+        cmdline=["/opt/llama/build/bin/llama-server", "--model", "x.gguf"],
+    )
+    with patch("app.psutil.process_iter", return_value=[other, server]), \
+         patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+            "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+            "/props": b"{}",
+            "/slots": b"[]",
+        })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result["process"]["rss_gb"] == 21.0
+    assert app_mod._llama_proc is server
+
+
+def test_llama_process_reidentify_after_death():
+    """A dead retained handle (model reload = new PID) is re-found."""
+    import psutil
+    import app as app_mod
+    from app import collect_llama_metrics
+
+    dead = _fake_llama_proc(rss_gb=21.0)
+    dead.memory_info.side_effect = psutil.NoSuchProcess(0, "")
+    fresh = _fake_llama_proc(rss_gb=22.0)
+    with patch("app.psutil.process_iter", return_value=[fresh]), \
+         patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+            "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+            "/props": b"{}",
+            "/slots": b"[]",
+        })):
+        app_mod._llama_proc = dead
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result["process"]["rss_gb"] == 22.0
+    assert app_mod._llama_proc is fresh
+
+
+def test_llama_process_none_when_absent():
+    """No local llama-server (remote/dev mode) -> process null, no red."""
+    from app import collect_llama_metrics
+
+    # reset_llama_proc fixture: process_iter yields no processes
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+        "/props": b'{"model_path": "/models/x.gguf", "total_slots": 1}',
+        "/slots": b"[]",
+    })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result["process"] is None
+
+
+def test_llama_process_model_size(tmp_path):
+    """model_size_gb from os.path.getsize on the co-located host."""
+    from app import collect_llama_metrics
+
+    model = tmp_path / "x.gguf"
+    with open(model, "wb") as f:  # sparse: 19.8 GB without writing it
+        f.seek(int(19.8 * 2**30))
+        f.write(b"\0")
+    with patch("app.psutil.process_iter",
+               return_value=[_fake_llama_proc()]), \
+         patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+            "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+            "/props": json.dumps(
+                {"model_path": str(model), "total_slots": 1}).encode(),
+            "/slots": b"[]",
+        })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result["model_size_gb"] == 19.8

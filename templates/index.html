@@ -394,6 +394,10 @@
       <h2>LLM Usage (since server start)</h2>
       <div class="llama-usage-line" id="llama-usage-line">–</div>
     </div>
+    <div class="card" id="llama-proc-card" style="display:none;">
+      <h2>LLM Server Process</h2>
+      <div class="llama-usage-line" id="llama-proc-line">–</div>
+    </div>
   </div>
 
 <script>
@@ -616,6 +620,7 @@ source.onmessage = (e) => {
   if (llamaSec) llamaSec.style.display = m.llama_enabled === false ? 'none' : '';
   updateLlama(m.llama);
   updateLlamaUsage(m);
+  updateLlamaProcess(m);
 };
 
 /* ------------------------------------------------------------------ */
@@ -1001,6 +1006,29 @@ function fmtUptime(s) {
   if (d > 0) return `${d}d ${h}h`;
   if (h > 0) return `${h}h ${m}m`;
   return `${m}m`;
+}
+
+function updateLlamaProcess(m) {
+  const card = document.getElementById('llama-proc-card');
+  if (!card) return;
+  const llama = m.llama;
+  const proc = llama && llama.process;
+  // Hidden with --no-llama, and when the dashboard runs on a different
+  // host than llama-server (process null) — silent, no red state.
+  if (m.llama_enabled === false || !proc) {
+    card.style.display = 'none';
+    return;
+  }
+  const parts = [
+    `${proc.rss_gb} GB RSS`,
+    `${proc.cpu_pct}% CPU (all cores)`,
+    `${proc.threads} thr`,
+  ];
+  if (llama.model_size_gb != null) {
+    parts.push(`model ${llama.model_size_gb} GB`);
+  }
+  document.getElementById('llama-proc-line').textContent = parts.join(' · ');
+  card.style.display = '';
 }
 
 function updateLlamaUsage(m) {

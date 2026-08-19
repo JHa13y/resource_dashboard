@@ -349,6 +349,12 @@ _llama_slot_prev: dict[str, Any] | None = None
 _LLAMA_DECODE_HISTORY_LEN = 10
 _llama_decode_history: list[tuple[float, float]] = []
 
+# Local llama-server process handle (T5): retained across scrapes so
+# cpu_percent(None) measures against the previous tick. A dead handle
+# (NoSuchProcess) is dropped and re-identified on the next scrape — a
+# model reload spawns a new PID.
+_llama_proc: psutil.Process | None = None
+
 # (dashboard key, Prometheus metric) pairs — verified against llama.cpp
 # ``to_metrics()`` (tools/server/server-task.cpp). Missing metrics are simply
 # omitted (older builds expose a shorter set).
@@ -449,6 +455,55 @@ def _llama_health(base_url: str) -> dict[str, Any] | None:
                 body = ""
             return {"state": "loading", "detail": _llama_health_detail(body)}
         return None
+    except Exception:  # noqa: BLE001 – collector must never raise
+        return None
+
+
+def _llama_find_process() -> psutil.Process | None:
+    """Find the local llama-server process. Never raises.
+
+    Name match first (the confirmed host binary is
+    ``/home/joshua/llama.cpp/build/bin/llama-server``, psutil name
+    ``llama-server``), then a cmdline-argument fallback; multiple matches
+    resolve to the largest RSS. Returns ``None`` when no local process
+    exists (remote/dev mode). A retained live handle is reused so
+    ``cpu_percent(None)`` keeps measuring; it was primed (first real
+    value on the scrape after identification).
+    """
+    global _llama_proc
+    if _llama_proc is not None:
+        try:
+            _llama_proc.memory_info().rss
+            return _llama_proc
+        except (psutil.NoSuchProcess, psutil.AccessDenied,
+                psutil.ZombieProcess):
+            _llama_proc = None
+    try:
+        by_name: list[psutil.Process] = []
+        by_cmdline: list[psutil.Process] = []
+        for p in psutil.process_iter(["name", "cmdline", "memory_info"]):
+            try:
+                if p.info["name"] == "llama-server":
+                    by_name.append(p)
+                    continue
+                if any("llama-server" in arg
+                       for arg in (p.info["cmdline"] or [])):
+                    by_cmdline.append(p)
+            except (psutil.NoSuchProcess, psutil.AccessDenied,
+                    psutil.ZombieProcess):
+                continue
+        matches = by_name or by_cmdline
+        if not matches:
+            return None
+
+        def _rss(p: psutil.Process) -> int:
+            mi = p.info["memory_info"]
+            return mi.rss if mi is not None else 0
+
+        proc = max(matches, key=_rss)
+        proc.cpu_percent(None)  # prime; first real value on next scrape
+        _llama_proc = proc
+        return proc
     except Exception:  # noqa: BLE001 – collector must never raise
         return None
 
@@ -697,6 +752,34 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
         build_info = props.get("build_info")
         if isinstance(build_info, str) and build_info:
             out["build_info"] = build_info
+
+    # Local llama-server process (co-located deployments only): None when
+    # the dashboard runs on a different host — the UI hides the card
+    # silently, no red state.
+    proc = _llama_find_process()
+    process_info: dict[str, Any] | None = None
+    if proc is not None:
+        try:
+            process_info = {
+                "rss_gb": round(proc.memory_info().rss / 2**30, 1),
+                "cpu_pct": round(proc.cpu_percent(None), 1),
+                "threads": proc.num_threads(),
+            }
+        except (psutil.NoSuchProcess, psutil.AccessDenied,
+                psutil.ZombieProcess):
+            process_info = None  # died mid-scrape; re-identify next tick
+    out["process"] = process_info
+
+    # Model file size on THIS host (co-located only; the path comes from
+    # /props and points at the llama host's filesystem).
+    model_path = out.get("model_path")
+    if isinstance(model_path, str) and model_path:
+        try:
+            out["model_size_gb"] = round(
+                os.path.getsize(model_path) / 2**30, 1
+            )
+        except OSError:  # file not local (remote mode) or removed
+            pass
 
     # Free slots: total (props) minus in-flight requests (/metrics).
     # Omitted when either side is unknown (older builds).
