@@ -22,6 +22,7 @@ import queue
 import subprocess
 import threading
 import time
+import urllib.error
 import urllib.request
 from collections import deque
 from typing import Any, Generator
@@ -340,6 +341,20 @@ _llama_last_good: tuple[float, dict[str, Any]] | None = None
 # n_prompt_tokens_processed update per token.
 _llama_slot_prev: dict[str, Any] | None = None
 
+# (monotonic ts, n_decode_total) pairs from the last successful scrapes.
+# n_decode_total ticks per llama_decode() call; frozen across 10 consecutive
+# successful scrapes while a slot is mid-generation means the server is
+# hung (stuck decode / GPU wedged). Long prefills call no llama_decode, so
+# slots with decoded == 0 are excluded (see the stall check below).
+_LLAMA_DECODE_HISTORY_LEN = 10
+_llama_decode_history: list[tuple[float, float]] = []
+
+# Local llama-server process handle (T5): retained across scrapes so
+# cpu_percent(None) measures against the previous tick. A dead handle
+# (NoSuchProcess) is dropped and re-identified on the next scrape — a
+# model reload spawns a new PID.
+_llama_proc: psutil.Process | None = None
+
 # (dashboard key, Prometheus metric) pairs — verified against llama.cpp
 # ``to_metrics()`` (tools/server/server-task.cpp). Missing metrics are simply
 # omitted (older builds expose a shorter set).
@@ -352,6 +367,14 @@ _LLAMA_METRIC_MAP = (
     ("requests_processing", "llamacpp:requests_processing"),
     ("requests_deferred", "llamacpp:requests_deferred"),
     ("context_tokens_max", "llamacpp:n_tokens_max"),
+    ("spec_decode_draft_tokens_total",
+     "llamacpp:spec_decode_num_draft_tokens_total"),
+    ("spec_decode_accepted_tokens_total",
+     "llamacpp:spec_decode_num_accepted_tokens_total"),
+    ("prompt_seconds_total", "llamacpp:prompt_seconds_total"),
+    ("tokens_predicted_seconds_total",
+     "llamacpp:tokens_predicted_seconds_total"),
+    ("n_decode_total", "llamacpp:n_decode_total"),
 )
 
 
@@ -388,6 +411,103 @@ def _llama_get_json(base_url: str, path: str, timeout: float = 2.0) -> Any:
         return None
 
 
+def _llama_health_detail(body: str) -> str | None:
+    """Short human-readable detail from a /health body.
+
+    Parsed generically (JSON ``status`` field, else trimmed text) — never
+    matched against a specific build's exact wording.
+    """
+    body = (body or "").strip()
+    if not body:
+        return None
+    try:
+        data = json.loads(body)
+        if isinstance(data, dict):
+            s = data.get("status")
+            if isinstance(s, str) and s.strip():
+                return s.strip()[:60]
+    except Exception:  # noqa: BLE001 – not JSON; fall back to raw text
+        pass
+    text = " ".join(body.split())
+    return text[:60] or None
+
+
+def _llama_health(base_url: str) -> dict[str, Any] | None:
+    """GET /health (2 s timeout); ``None`` on any failure.
+
+    llama-server answers HTTP 200 once it can serve and HTTP 503 while a
+    model is still loading, so this distinguishes "loading (be patient)"
+    from "down". Returns ``{"state": "ok", ...}`` on 200 and
+    ``{"state": "loading", "detail": <body>}`` on 503. Never raises.
+    """
+    try:
+        with urllib.request.urlopen(
+            base_url.rstrip("/") + "/health", timeout=2
+        ) as r:
+            return {"state": "ok", "detail": _llama_health_detail(
+                r.read().decode(errors="replace")
+            )}
+    except urllib.error.HTTPError as e:
+        if e.code == 503:
+            try:
+                body = e.read().decode(errors="replace")
+            except Exception:  # noqa: BLE001
+                body = ""
+            return {"state": "loading", "detail": _llama_health_detail(body)}
+        return None
+    except Exception:  # noqa: BLE001 – collector must never raise
+        return None
+
+
+def _llama_find_process() -> psutil.Process | None:
+    """Find the local llama-server process. Never raises.
+
+    Name match first (the confirmed host binary is
+    ``/home/joshua/llama.cpp/build/bin/llama-server``, psutil name
+    ``llama-server``), then a cmdline-argument fallback; multiple matches
+    resolve to the largest RSS. Returns ``None`` when no local process
+    exists (remote/dev mode). A retained live handle is reused so
+    ``cpu_percent(None)`` keeps measuring; it was primed (first real
+    value on the scrape after identification).
+    """
+    global _llama_proc
+    if _llama_proc is not None:
+        try:
+            _llama_proc.memory_info().rss
+            return _llama_proc
+        except (psutil.NoSuchProcess, psutil.AccessDenied,
+                psutil.ZombieProcess):
+            _llama_proc = None
+    try:
+        by_name: list[psutil.Process] = []
+        by_cmdline: list[psutil.Process] = []
+        for p in psutil.process_iter(["name", "cmdline", "memory_info"]):
+            try:
+                if p.info["name"] == "llama-server":
+                    by_name.append(p)
+                    continue
+                if any("llama-server" in arg
+                       for arg in (p.info["cmdline"] or [])):
+                    by_cmdline.append(p)
+            except (psutil.NoSuchProcess, psutil.AccessDenied,
+                    psutil.ZombieProcess):
+                continue
+        matches = by_name or by_cmdline
+        if not matches:
+            return None
+
+        def _rss(p: psutil.Process) -> int:
+            mi = p.info["memory_info"]
+            return mi.rss if mi is not None else 0
+
+        proc = max(matches, key=_rss)
+        proc.cpu_percent(None)  # prime; first real value on next scrape
+        _llama_proc = proc
+        return proc
+    except Exception:  # noqa: BLE001 – collector must never raise
+        return None
+
+
 def _llama_props(base_url: str) -> dict[str, Any] | None:
     """Fetch /props with a 30 s cache (model info only changes on reload)."""
     global _llama_props_cache
@@ -400,6 +520,46 @@ def _llama_props(base_url: str) -> dict[str, Any] | None:
     if isinstance(data, dict):
         _llama_props_cache = (now, data)
     return data
+
+
+# ---------------------------------------------------------------------------
+# Cumulative usage state (persistent server uptime, T3)
+# ---------------------------------------------------------------------------
+
+def _llama_usage_state_path() -> str:
+    """State-file location; RD_LLAMA_USAGE_STATE overrides the default."""
+    return os.environ.get("RD_LLAMA_USAGE_STATE") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), ".llama_usage_state.json"
+    )
+
+
+def _llama_load_usage_state(path: str) -> dict[str, float] | None:
+    """Load ``{first_seen, last_reset}`` epoch stamps.
+
+    ``None`` when the file is missing or corrupt (caller reinitializes).
+    """
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return None
+        return {
+            "first_seen": float(data["first_seen"]),
+            "last_reset": float(data["last_reset"]),
+        }
+    except Exception:  # noqa: BLE001 – missing/corrupt → reinitialize
+        return None
+
+
+def _llama_save_usage_state(path: str, state: dict[str, float]) -> None:
+    """Atomic write (tmp + rename); never raises (uptime is best-effort)."""
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _parse_llama_slots(data: Any) -> list[dict[str, Any]]:
@@ -420,15 +580,34 @@ def _parse_llama_slots(data: Any) -> list[dict[str, Any]]:
             n_ctx = int(slot.get("n_ctx", 0) or 0)
             prompt = int(slot.get("n_prompt_tokens", 0) or 0)
             next_tok = slot.get("next_token")
+            # Tokens left to generate; None when the slot is idle or the
+            # field is absent (idle is marked n_remain = -1).
+            remain = None
             if isinstance(next_tok, dict):
                 decoded = int(next_tok.get("n_decoded", 0) or 0)
+                r = next_tok.get("n_remain")
+                if r is not None and int(r) >= 0:
+                    remain = int(r)
             elif isinstance(next_tok, list):
                 # Some builds (e.g. LM Studio's) emit a LIST of per-token
-                # dicts; total their n_decoded values.
+                # dicts; total their n_decoded / n_remain values.
                 decoded = 0
+                remain_sum = None
                 for item in next_tok:
-                    if isinstance(item, dict):
-                        decoded += int(item.get("n_decoded", 0) or 0)
+                    if not isinstance(item, dict):
+                        continue
+                    decoded += int(item.get("n_decoded", 0) or 0)
+                    r = item.get("n_remain")
+                    if r is None:
+                        continue
+                    rv = int(r)
+                    if rv < 0:
+                        remain_sum = None  # idle marker wins
+                    elif remain_sum is not None:
+                        remain_sum += rv
+                    else:
+                        remain_sum = rv
+                remain = remain_sum
             else:
                 decoded = 0
             used = prompt + decoded
@@ -439,6 +618,7 @@ def _parse_llama_slots(data: Any) -> list[dict[str, Any]]:
                 "context_pct": round(100.0 * used / n_ctx, 1) if n_ctx else 0.0,
                 "is_processing": bool(slot.get("is_processing", False)),
                 "decoded": decoded,
+                "remain": remain,
                 "prompt_processed": int(
                     slot.get("n_prompt_tokens_processed", 0) or 0
                 ),
@@ -470,7 +650,7 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
     ``status: "stale"`` for up to ``_LLAMA_STALE_MAX_AGE_S`` seconds so a
     transient timeout doesn't flicker the UI to "unreachable".
     """
-    global _llama_prev, _llama_last_good, _llama_slot_prev
+    global _llama_prev, _llama_last_good, _llama_slot_prev, _llama_decode_history
 
     def _stale_or_none() -> dict[str, Any] | None:
         """Hold last-good data during a transient scrape failure."""
@@ -481,6 +661,17 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
                 out["status"] = "stale"
                 return out
         return None
+
+    # /health first: while a model is loading the server answers 503 on
+    # every endpoint (including /metrics), so the loading state is only
+    # observable via /health. On 200 the /metrics up/stale/unreachable
+    # logic below is unchanged.
+    health = _llama_health(base_url)
+    if health is not None and health["state"] == "loading":
+        out_loading: dict[str, Any] = {"status": "loading"}
+        if health.get("detail"):
+            out_loading["health_detail"] = health["detail"]
+        return out_loading
 
     try:
         with urllib.request.urlopen(
@@ -558,9 +749,124 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
         if isinstance(total_slots, int):
             out["total_slots"] = total_slots
         out["sleeping"] = bool(props.get("is_sleeping", False))
+        build_info = props.get("build_info")
+        if isinstance(build_info, str) and build_info:
+            out["build_info"] = build_info
+
+    # Local llama-server process (co-located deployments only): None when
+    # the dashboard runs on a different host — the UI hides the card
+    # silently, no red state.
+    proc = _llama_find_process()
+    process_info: dict[str, Any] | None = None
+    if proc is not None:
+        try:
+            process_info = {
+                "rss_gb": round(proc.memory_info().rss / 2**30, 1),
+                "cpu_pct": round(proc.cpu_percent(None), 1),
+                "threads": proc.num_threads(),
+            }
+        except (psutil.NoSuchProcess, psutil.AccessDenied,
+                psutil.ZombieProcess):
+            process_info = None  # died mid-scrape; re-identify next tick
+    out["process"] = process_info
+
+    # Model file size on THIS host (co-located only; the path comes from
+    # /props and points at the llama host's filesystem).
+    model_path = out.get("model_path")
+    if isinstance(model_path, str) and model_path:
+        try:
+            out["model_size_gb"] = round(
+                os.path.getsize(model_path) / 2**30, 1
+            )
+        except OSError:  # file not local (remote mode) or removed
+            pass
+
+    # Free slots: total (props) minus in-flight requests (/metrics).
+    # Omitted when either side is unknown (older builds).
+    total_slots = out.get("total_slots")
+    requests_processing = out.get("requests_processing")
+    if isinstance(total_slots, int) and requests_processing is not None:
+        out["free_slots"] = max(0, total_slots - int(requests_processing))
+
+    # Lifetime spec-decode accept rate. Key omitted when spec decode is off
+    # (counters absent) or no drafts yet (draft == 0). Lifetime only: on the
+    # reference build these counters tick per completion step, so a windowed
+    # ratio would flicker between 0 and bursty values.
+    spec_draft = out.get("spec_decode_draft_tokens_total")
+    spec_accepted = out.get("spec_decode_accepted_tokens_total")
+    if spec_draft is not None and spec_accepted is not None and spec_draft > 0:
+        out["spec_accept_pct"] = round(100.0 * spec_accepted / spec_draft, 1)
+
+    # Cumulative usage summary + persistent server uptime. Uptime survives
+    # dashboard deploys (state file) and is re-baselined only when the
+    # llama-server itself restarts/reloads, detected as a cumulative
+    # counter decrease versus the previous successful scrape.
+    gen_seconds_total = out.get("tokens_predicted_seconds_total")
+    if (
+        gen_total is not None
+        or prompt_total is not None
+        or cached_total is not None
+    ):
+        usage: dict[str, Any] = {
+            "total_tokens": int(round(
+                (prompt_total or 0) + (cached_total or 0) + (gen_total or 0)
+            )),
+            "gen_tokens": int(round(gen_total or 0)),
+            # Average t/s WHILE GENERATING (idle time excluded by
+            # construction: the server only accumulates predicted seconds
+            # while producing tokens).
+            "gen_avg_tps": (
+                round(gen_total / gen_seconds_total, 1)
+                if gen_total is not None and gen_seconds_total else None
+            ),
+            "prompt_cached_pct": (
+                round(100.0 * cached_total / (cached_total + prompt_total), 1)
+                if cached_total is not None and prompt_total is not None
+                and cached_total + prompt_total > 0
+                else None
+            ),
+        }
+        now_wall = time.time()
+        state_path = _llama_usage_state_path()
+        state = _llama_load_usage_state(state_path)
+        if state is None:
+            state = {"first_seen": now_wall, "last_reset": now_wall}
+            _llama_save_usage_state(state_path, state)
+        elif prev is not None and (
+            (gen_total is not None and prev.get("gen") is not None
+             and gen_total < prev["gen"])
+            or (prompt_total is not None and prev.get("prompt") is not None
+                and prompt_total < prev["prompt"])
+            or (cached_total is not None and prev.get("cached") is not None
+                and cached_total < prev["cached"])
+        ):
+            # Server restart/reload: re-baseline uptime, keep first_seen.
+            state["last_reset"] = now_wall
+            _llama_save_usage_state(state_path, state)
+        usage["uptime_s"] = max(
+            0, int(now_wall - max(state["first_seen"], state["last_reset"]))
+        )
+        out["usage"] = usage
 
     slots = _parse_llama_slots(_llama_get_json(base_url, "/slots"))
     out["slots"] = slots
+
+    # Decode-stall flag: n_decode_total is the only live /metrics counter
+    # (it ticks per llama_decode() call). Frozen across 10 consecutive
+    # successful scrapes while a slot is mid-generation (decoded > 0 —
+    # long prefills call no llama_decode and must not trigger this) means
+    # the server stopped advancing: hang / GPU wedged.
+    decode_total = raw.get("llamacpp:n_decode_total")
+    if decode_total is not None:
+        _llama_decode_history.append((now, decode_total))
+        if len(_llama_decode_history) > _LLAMA_DECODE_HISTORY_LEN:
+            _llama_decode_history.pop(0)
+    if len(_llama_decode_history) >= _LLAMA_DECODE_HISTORY_LEN:
+        if len({v for _, v in _llama_decode_history}) == 1:
+            for slot in slots:
+                if slot["is_processing"] and slot["decoded"] > 0:
+                    out["stalled"] = True
+                    break
 
     # Live tokens/s from per-slot decode counters (see _llama_slot_prev):
     # they update per token, unlike the /metrics counters on some builds.
@@ -625,6 +931,114 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
 
     _llama_last_good = (now, out)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Swap usage + I/O rate (T6)
+# ---------------------------------------------------------------------------
+
+# Previous swap I/O counters (cumulative bytes) + monotonic ts, used to
+# compute swap in/out rates from per-scrape deltas.
+_swap_prev: dict[str, float] | None = None
+
+
+def collect_swap_metrics() -> dict[str, Any] | None:
+    """Collect swap usage and I/O rates. Never raises.
+
+    Returns ``None`` only when the host has no swap (total == 0) — the
+    sole platform guard; psutil's sin/sout counters are present on both
+    Linux and macOS. ``in_kb_s`` / ``out_kb_s`` are per-scrape deltas of
+    the cumulative sin/sout counters (omitted on the first scrape, when
+    there is no previous reading) and clamped to >= 0 so a counter reset
+    (swapon/off, reboot) never yields a negative rate.
+    """
+    global _swap_prev
+    try:
+        sw = psutil.swap_memory()
+    except Exception:  # noqa: BLE001 – collector must never raise
+        return None
+    if not sw.total:
+        return None
+    out: dict[str, Any] = {
+        "used_gb": round(sw.used / 2**30, 1),
+        "total_gb": round(sw.total / 2**30, 1),
+        "pct": round(sw.percent, 1),
+    }
+    now = time.monotonic()
+    prev = _swap_prev
+    if prev is not None:
+        elapsed = now - prev["ts"]
+        if elapsed > 0:
+            out["in_kb_s"] = round(
+                max(0.0, sw.sin - prev["sin"]) / elapsed / 1024.0, 1
+            )
+            out["out_kb_s"] = round(
+                max(0.0, sw.sout - prev["sout"]) / elapsed / 1024.0, 1
+            )
+    _swap_prev = {"ts": now, "sin": sw.sin, "sout": sw.sout}
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Host health: PSI memory pressure + D-state processes (T7)
+# ---------------------------------------------------------------------------
+
+# Linux Pressure Stall Information file for memory. Absent on macOS and on
+# Linux kernels without CONFIG_PSI — the metric is simply None there.
+_PSI_MEMORY_PATH = "/proc/pressure/memory"
+
+
+def _read_psi_mem_avg10(path: str = _PSI_MEMORY_PATH) -> float | None:
+    """Parse the ``some avg10=`` value (percent) from a PSI pressure file.
+
+    The file format is::
+
+        some avg10=0.05 avg60=0.02 avg300=0.01 total=123456789
+        full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+
+    Only the ``some`` line's avg10 is used (10 s window, any stall). Returns
+    ``None`` when the file is missing (non-Linux host) or unparseable.
+    """
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError:  # no /proc (macOS), PSI disabled, or permission error
+        return None
+    for line in text.splitlines():
+        parts = line.split()
+        if not parts or parts[0] != "some":
+            continue
+        for tok in parts[1:]:
+            if tok.startswith("avg10="):
+                try:
+                    return round(float(tok[len("avg10="):]), 2)
+                except ValueError:
+                    return None
+    return None
+
+
+def collect_host_health_metrics(
+    psi_mem_path: str = _PSI_MEMORY_PATH,
+) -> dict[str, Any]:
+    """Collect host health: PSI memory pressure + D-state process count.
+
+    Never raises. ``psi_mem_avg10`` is None on hosts without
+    ``/proc/pressure/memory`` (macOS, kernels without CONFIG_PSI); the
+    D-state count degrades to 0 if the process table cannot be read.
+    ``psi_mem_path`` is injectable for tests.
+    """
+    try:
+        d_state = sum(
+            1
+            for p in psutil.process_iter(["status"])
+            if p.info.get("status") == psutil.STATUS_DISK_SLEEP
+        )
+    except Exception:  # noqa: BLE001 – collector must never raise
+        d_state = 0
+    return {
+        "psi_mem_avg10": _read_psi_mem_avg10(psi_mem_path),
+        "d_state_procs": d_state,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -693,6 +1107,8 @@ class MetricsCollector(threading.Thread):
                 "available_gb": round(vm.available / (1024**3), 1),
             },
             "gpus": collect_gpu_metrics(),
+            "swap": collect_swap_metrics(),
+            "host_health": collect_host_health_metrics(),
             # Stable signal for the frontend: the llama.cpp section is on by
             # default; --no-llama skips scraping entirely and hides the card.
             "llama_enabled": self.llama_enabled,

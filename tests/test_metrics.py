@@ -6,11 +6,15 @@ Run:
 
 from __future__ import annotations
 
+import io
 import json
+import os
 import queue
 import sys
 import threading
 import time
+import urllib.error
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import psutil
@@ -379,13 +383,64 @@ def reset_llama_prev():
     original_prev = app_mod._llama_prev
     original_last_good = app_mod._llama_last_good
     original_slot_prev = app_mod._llama_slot_prev
+    original_decode_history = app_mod._llama_decode_history
     app_mod._llama_prev = None
     app_mod._llama_last_good = None
     app_mod._llama_slot_prev = None
+    app_mod._llama_decode_history = []
     yield
     app_mod._llama_prev = original_prev
     app_mod._llama_last_good = original_last_good
     app_mod._llama_slot_prev = original_slot_prev
+    app_mod._llama_decode_history = original_decode_history
+
+
+@pytest.fixture(autouse=True)
+def isolate_llama_usage_state(tmp_path, monkeypatch):
+    """Point the T3 usage-state file at a per-test tmp path.
+
+    Without this, every llama scrape in the suite would write the default
+    ``<app dir>/.llama_usage_state.json`` into the repo.
+    """
+    monkeypatch.setenv(
+        "RD_LLAMA_USAGE_STATE", str(tmp_path / "llama_usage_state.json")
+    )
+    yield
+
+
+@pytest.fixture(autouse=True)
+def reset_llama_proc():
+    """Reset the T5 process handle; default: no local llama-server.
+
+    ``psutil.process_iter`` is patched to return no processes by default so
+    tests never depend on (or slow down on) the host's real process table.
+    Tests that need a fake server re-patch it.
+    """
+    import app as app_mod
+
+    original = app_mod._llama_proc
+    app_mod._llama_proc = None
+    with patch("app.psutil.process_iter", return_value=[]):
+        yield
+    app_mod._llama_proc = original
+
+
+def _fake_llama_proc(name="llama-server", rss_gb=21.0, cpu=340.0,
+                     threads=64, cmdline=None):
+    """A MagicMock standing in for the local llama-server process."""
+    rss = int(rss_gb * 2**30)
+    p = MagicMock()
+    p.info = {
+        "name": name,
+        "cmdline": (cmdline if cmdline is not None
+                    else ["/home/joshua/llama.cpp/build/bin/llama-server",
+                          "--model", "x.gguf"]),
+        "memory_info": MagicMock(rss=rss),
+    }
+    p.memory_info.return_value = MagicMock(rss=rss)
+    p.cpu_percent.return_value = cpu
+    p.num_threads.return_value = threads
+    return p
 
 
 class _FakeClock:
@@ -603,6 +658,8 @@ def test_collect_llama_props_and_slots():
     assert s1["context_used"] == 0
     assert s1["context_pct"] == 0.0
     assert s1["is_processing"] is False
+    # free_slots = total_slots (props: 2) - requests_processing (sample: 1)
+    assert result["free_slots"] == 1
 
 
 def test_parse_llama_slots_next_token_shapes():
@@ -638,6 +695,116 @@ def test_parse_llama_slots_next_token_shapes():
     assert l[0]["prompt_processed"] == 3
     # context = prompt + decoded
     assert l[0]["context_used"] == 25
+
+
+def test_parse_llama_slots_remain():
+    """n_remain (tokens left to generate) is summed over the next_token
+    items; -1 (idle) or absent -> None."""
+    from app import _parse_llama_slots
+
+    # list shape: sum positive n_remain over the items
+    l = _parse_llama_slots([{
+        "id": 0, "n_ctx": 100, "n_prompt_tokens": 10,
+        "next_token": [
+            {"n_decoded": 10, "n_remain": 16000},
+            {"n_decoded": 5, "n_remain": 374},
+        ],
+    }])
+    assert l[0]["remain"] == 16374
+    assert l[0]["decoded"] == 15
+
+    # dict shape (classic builds)
+    d = _parse_llama_slots([{
+        "id": 0, "n_ctx": 100, "n_prompt_tokens": 10,
+        "next_token": {"n_decoded": 512, "n_remain": 10},
+    }])
+    assert d[0]["remain"] == 10
+
+    # idle marker: -1 wins -> None
+    i = _parse_llama_slots([{
+        "id": 0, "n_ctx": 100, "n_prompt_tokens": 10,
+        "next_token": [{"n_decoded": 0, "n_remain": -1}],
+    }])
+    assert i[0]["remain"] is None
+
+    # absent next_token / empty list / no n_remain field -> None
+    a = _parse_llama_slots([{"id": 0, "n_ctx": 100, "n_prompt_tokens": 10}])
+    assert a[0]["remain"] is None
+    b = _parse_llama_slots([{
+        "id": 0, "n_ctx": 100, "n_prompt_tokens": 10, "next_token": [],
+    }])
+    assert b[0]["remain"] is None
+    c = _parse_llama_slots([{
+        "id": 0, "n_ctx": 100, "n_prompt_tokens": 10,
+        "next_token": [{"n_decoded": 42}],
+    }])
+    assert c[0]["remain"] is None
+    assert c[0]["decoded"] == 42
+
+
+def test_collect_llama_free_slots():
+    """free_slots = total_slots (props) - requests_processing (metrics);
+    the key is omitted when either side is unknown."""
+    from app import collect_llama_metrics
+
+    def run(props: str, metrics: str):
+        # Bypass the 30 s /props cache so each run sees its own props body.
+        import app as app_mod
+        app_mod._llama_props_cache = None
+        with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+            "/metrics": metrics.encode(),
+            "/props": props.encode(),
+            "/slots": b"[]",
+        })):
+            return collect_llama_metrics("http://127.0.0.1:9999")
+
+    # known: 3 slots, 1 processing -> 2 free
+    r = run('{"total_slots": 3}', "llamacpp:requests_processing 1\n")
+    assert r["free_slots"] == 2
+
+    # props without total_slots -> key omitted
+    r = run('{}', "llamacpp:requests_processing 1\n")
+    assert "free_slots" not in r
+
+    # metrics without requests_processing -> key omitted
+    r = run('{"total_slots": 3}', "llamacpp:n_tokens_max 100\n")
+    assert "free_slots" not in r
+
+
+def test_collect_llama_spec_accept_rate():
+    """spec_accept_pct = 100 * accepted / draft (lifetime), rounded to 0.1;
+    omitted when spec decode is off (counters absent) or draft == 0."""
+    from app import collect_llama_metrics
+
+    def run(metrics: str):
+        with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+            "/metrics": metrics.encode(),
+            "/props": b'{"total_slots": 1}',
+            "/slots": b"[]",
+        })):
+            return collect_llama_metrics("http://127.0.0.1:9999")
+
+    # both counters present (live reference-server values: 6050/7717)
+    r = run(
+        "llamacpp:spec_decode_num_draft_tokens_total 7717\n"
+        "llamacpp:spec_decode_num_accepted_tokens_total 6050\n"
+    )
+    assert r["spec_decode_draft_tokens_total"] == 7717.0
+    assert r["spec_decode_accepted_tokens_total"] == 6050.0
+    assert r["spec_accept_pct"] == 78.4
+
+    # draft == 0 -> key omitted (no division by zero)
+    r = run(
+        "llamacpp:spec_decode_num_draft_tokens_total 0\n"
+        "llamacpp:spec_decode_num_accepted_tokens_total 0\n"
+    )
+    assert "spec_accept_pct" not in r
+
+    # counters absent (spec decode off) -> rate key omitted
+    r = run("llamacpp:requests_processing 0\n")
+    assert "spec_decode_draft_tokens_total" not in r
+    assert "spec_decode_accepted_tokens_total" not in r
+    assert "spec_accept_pct" not in r
 
 
 def test_collect_llama_live_rate_from_slots():
@@ -999,3 +1166,735 @@ def test_collect_llama_first_scrape_fallback_to_gauge():
         result = collect_llama_metrics("http://127.0.0.1:9999")
     assert result["gen_tokens_per_s"] == 0.0
     assert result["prompt_tokens_per_s"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# T3: cumulative usage summary + persistent server uptime
+# ---------------------------------------------------------------------------
+
+def _usage_metrics_body(predicted=1000, prompt=5000, cached=4000,
+                        predicted_s=40.0, prompt_s=10.0,
+                        include_cached=True, include_seconds=True):
+    lines = [
+        f"llamacpp:tokens_predicted_total {predicted}",
+        f"llamacpp:prompt_tokens_total {prompt}",
+    ]
+    if include_cached:
+        lines.append(f"llamacpp:prompt_tokens_cached_total {cached}")
+    if include_seconds:
+        lines.append(f"llamacpp:tokens_predicted_seconds_total {predicted_s}")
+        lines.append(f"llamacpp:prompt_seconds_total {prompt_s}")
+    return ("\n".join(lines) + "\n").encode()
+
+
+def _usage_routes(predicted=1000, prompt=5000, cached=4000,
+                  predicted_s=40.0, prompt_s=10.0, **kw):
+    return {
+        "/metrics": _usage_metrics_body(
+            predicted, prompt, cached, predicted_s, prompt_s, **kw
+        ),
+        "/props": b"{}",
+        "/slots": b"[]",
+    }
+
+
+def _usage_state_file() -> Path:
+    """The per-test state file installed by isolate_llama_usage_state."""
+    return Path(os.environ["RD_LLAMA_USAGE_STATE"])
+
+
+def test_llama_usage_summary_math_and_state_roundtrip(tmp_path):
+    from app import collect_llama_metrics, _llama_load_usage_state
+
+    # The autouse fixture points RD_LLAMA_USAGE_STATE at this test's tmp
+    # dir – which also exercises the env override (the default lives in
+    # the app dir).
+    state_file = _usage_state_file()
+    assert state_file.parent == tmp_path
+
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_llama_server(_usage_routes())):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    usage = result["usage"]
+    assert usage["total_tokens"] == 1000 + 5000 + 4000
+    assert usage["gen_tokens"] == 1000
+    # 1000 tokens / 40.0 s of generation time = 25.0 t/s avg (idle excluded)
+    assert usage["gen_avg_tps"] == 25.0
+    assert usage["prompt_cached_pct"] == 44.4  # 4000 / (4000 + 5000)
+    assert usage["uptime_s"] >= 0
+    # State persisted (survives dashboard restarts/deployments)
+    state = _llama_load_usage_state(str(state_file))
+    assert state is not None
+    assert state["first_seen"] == state["last_reset"]
+    # Second scrape: state re-read from file, no re-init
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_llama_server(_usage_routes())):
+        result2 = collect_llama_metrics("http://127.0.0.1:9999")
+    assert result2["usage"]["uptime_s"] >= usage["uptime_s"]
+
+
+def test_llama_usage_restart_detection_rebaselines_uptime():
+    """A cumulative counter decrease (server restart/reload) re-baselines
+    last_reset while keeping first_seen."""
+    from app import collect_llama_metrics, _llama_load_usage_state
+
+    state_file = _usage_state_file()
+    old = time.time() - 100_000
+    state_file.write_text(json.dumps({"first_seen": old, "last_reset": old}))
+
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_llama_server(
+                   _usage_routes(predicted=5000, prompt=9000, cached=8000)
+               )):
+        first = collect_llama_metrics("http://127.0.0.1:9999")
+    assert first["usage"]["uptime_s"] >= 99_000  # long-running server
+
+    # Server restarts/reloads: cumulative counters drop.
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_llama_server(
+                   _usage_routes(predicted=10, prompt=100, cached=50)
+               )):
+        second = collect_llama_metrics("http://127.0.0.1:9999")
+    assert second["usage"]["uptime_s"] < 5  # re-baselined at restart
+
+    state = _llama_load_usage_state(str(state_file))
+    assert state is not None
+    assert state["last_reset"] > state["first_seen"]
+
+
+def test_llama_usage_corrupt_state_file_reinitializes():
+    from app import collect_llama_metrics, _llama_load_usage_state
+
+    state_file = _usage_state_file()
+    state_file.write_text("not-json{{{")
+
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_llama_server(_usage_routes())):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result["usage"]["uptime_s"] >= 0
+    # Corrupt file was rewritten with valid stamps
+    state = _llama_load_usage_state(str(state_file))
+    assert state is not None
+    assert state["first_seen"] == state["last_reset"]
+
+
+def test_llama_usage_missing_counters_yield_none():
+    """No generation seconds yet → gen_avg_tps None; no cached counter →
+    prompt_cached_pct None and total excludes it."""
+    from app import collect_llama_metrics
+
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_llama_server(
+                   _usage_routes(predicted_s=0.0)
+               )):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+    assert result["usage"]["gen_avg_tps"] is None
+
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_llama_server(
+                   _usage_routes(include_cached=False)
+               )):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+    assert result["usage"]["prompt_cached_pct"] is None
+    assert result["usage"]["total_tokens"] == 1000 + 5000
+
+
+def test_llama_usage_state_path_default_and_env_override(tmp_path, monkeypatch):
+    import app as app_mod
+
+    monkeypatch.delenv("RD_LLAMA_USAGE_STATE", raising=False)
+    default = app_mod._llama_usage_state_path()
+    assert default.endswith(".llama_usage_state.json")
+    assert os.path.dirname(default) == os.path.dirname(
+        os.path.abspath(app_mod.__file__)
+    )
+    override = str(tmp_path / "custom_state.json")
+    monkeypatch.setenv("RD_LLAMA_USAGE_STATE", override)
+    assert app_mod._llama_usage_state_path() == override
+
+
+# ---------------------------------------------------------------------------
+# T4: /health loading status, build_info, decode-stall flag
+# ---------------------------------------------------------------------------
+
+def _http_error_503(body: bytes) -> urllib.error.HTTPError:
+    """A urllib HTTPError(503) carrying *body*, as llama-server sends it
+    while a model is loading."""
+    return urllib.error.HTTPError(
+        "http://127.0.0.1:9999/health", 503, "Service Unavailable",
+        {}, io.BytesIO(body),
+    )
+
+
+def test_collect_llama_health_loading():
+    """/health 503 (model loading) -> status "loading"; /metrics is not
+    even consulted while the model loads."""
+    from app import collect_llama_metrics
+
+    calls: list = []
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/health": _http_error_503(b'{"status":"loading model"}'),
+        "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+    }, calls=calls)):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result is not None
+    assert result["status"] == "loading"
+    # Body parsed generically (JSON "status" field), not matched exactly.
+    assert result["health_detail"] == "loading model"
+    # Early return: only /health was fetched.
+    assert all("/health" in c for c in calls)
+    assert result.get("gen_tokens_per_s") is None
+
+
+def test_collect_llama_health_loading_plain_text_body():
+    """A non-JSON 503 body is still surfaced (trimmed raw text)."""
+    from app import collect_llama_metrics
+
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/health": _http_error_503(b"  Loading model \n"),
+    })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result["status"] == "loading"
+    assert result["health_detail"] == "Loading model"
+
+
+def test_collect_llama_health_ok_keeps_metrics_logic():
+    """/health 200 -> normal /metrics flow, status stays "up"."""
+    from app import collect_llama_metrics
+
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/health": b'{"status":"ok"}',
+        "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+        "/props": b'{"model_path": "/models/x.gguf", "total_slots": 1}',
+        "/slots": b"[]",
+    })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result is not None
+    assert result["status"] == "up"
+    assert "health_detail" not in result
+
+
+def test_collect_llama_health_unreachable_keeps_metrics_logic():
+    """The /health fetch itself failing (timeout/down) must not disturb
+    the existing up/stale/unreachable /metrics logic."""
+    from app import collect_llama_metrics
+
+    # no /health route -> health fetch raises -> /metrics decides
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+        "/props": b"{}",
+        "/slots": b"[]",
+    })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result is not None
+    assert result["status"] == "up"
+
+
+def test_collect_llama_build_info():
+    """/props build_info passes through; omitted when absent."""
+    import app as app_mod
+    from app import collect_llama_metrics
+
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+        "/props": (b'{"model_path": "/models/x.gguf", '
+                   b'"build_info": "b10450-ece963f41"}'),
+        "/slots": b"[]",
+    })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result["build_info"] == "b10450-ece963f41"
+
+    # Drop the 30 s /props cache so the second scrape re-fetches props.
+    app_mod._llama_props_cache = None
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+        "/props": b'{"model_path": "/models/x.gguf"}',
+        "/slots": b"[]",
+    })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert "build_info" not in result
+
+
+# --- decode-stall flag ------------------------------------------------------
+
+def _decode_metrics_body(n_decode: int) -> bytes:
+    return (
+        f"llamacpp:n_decode_total {n_decode}\n"
+        f"llamacpp:tokens_predicted_total 100\n"
+    ).encode()
+
+
+# Slot mid-generation: is_processing with tokens already decoded.
+_ACTIVE_SLOT = (b'[{"id": 0, "n_ctx": 1000, "n_prompt_tokens": 10, '
+                b'"is_processing": true, '
+                b'"next_token": {"n_decoded": 5, "n_remain": 50}}]')
+# Slot in a long prefill: is_processing but nothing decoded yet (no
+# llama_decode calls -> n_decode_total legitimately frozen).
+_PREFILL_SLOT = (b'[{"id": 0, "n_ctx": 1000, "n_prompt_tokens": 500, '
+                 b'"is_processing": true, '
+                 b'"next_token": {"n_decoded": 0, "n_remain": -1}}]')
+
+
+def _seed_decode_history(app_mod, value: float, n: int = 9):
+    app_mod._llama_decode_history = [
+        (1000.0 + i, value) for i in range(n)
+    ]
+
+
+def test_collect_llama_stall_flag_when_decode_frozen():
+    """n_decode_total frozen across 10 consecutive successful scrapes
+    while a slot is mid-generation -> stalled."""
+    import app as app_mod
+    from app import collect_llama_metrics
+
+    _seed_decode_history(app_mod, 5000.0)
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/metrics": _decode_metrics_body(5000),
+        "/props": b"{}",
+        "/slots": _ACTIVE_SLOT,
+    })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result["stalled"] is True
+    assert len(app_mod._llama_decode_history) == 10
+
+
+def test_collect_llama_no_stall_during_prefill():
+    """Frozen counter while a slot is still in prefill (decoded == 0) is
+    NOT a stall: long prefills call no llama_decode."""
+    import app as app_mod
+    from app import collect_llama_metrics
+
+    _seed_decode_history(app_mod, 5000.0)
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/metrics": _decode_metrics_body(5000),
+        "/props": b"{}",
+        "/slots": _PREFILL_SLOT,
+    })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert "stalled" not in result
+
+
+def test_collect_llama_no_stall_when_decode_advances():
+    """Any movement of n_decode_total in the 10-scrape window clears the
+    stall condition."""
+    import app as app_mod
+    from app import collect_llama_metrics
+
+    _seed_decode_history(app_mod, 5000.0)
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/metrics": _decode_metrics_body(5001),
+        "/props": b"{}",
+        "/slots": _ACTIVE_SLOT,
+    })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert "stalled" not in result
+
+
+def test_collect_llama_no_stall_before_history_full():
+    """The flag needs 10 consecutive scrapes; a fresh history never fires
+    (avoids a false flag right after startup)."""
+    from app import collect_llama_metrics
+
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/metrics": _decode_metrics_body(5000),
+        "/props": b"{}",
+        "/slots": _ACTIVE_SLOT,
+    })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert "stalled" not in result
+
+
+def test_collect_llama_stall_history_window_bounded():
+    """History never grows past 10 entries."""
+    import app as app_mod
+    from app import collect_llama_metrics
+
+    _seed_decode_history(app_mod, 5000.0, n=10)
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/metrics": _decode_metrics_body(5001),
+        "/props": b"{}",
+        "/slots": b"[]",
+    })):
+        collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert len(app_mod._llama_decode_history) == 10
+
+
+# ---------------------------------------------------------------------------
+# T5: llama-server process card
+# ---------------------------------------------------------------------------
+
+def test_llama_process_name_match():
+    """psutil name match is identified; model_size_gb guarded (no file)."""
+    import app as app_mod
+    from app import collect_llama_metrics
+
+    proc = _fake_llama_proc(rss_gb=21.0, cpu=340.0, threads=64)
+    with patch("app.psutil.process_iter", return_value=[proc]), \
+         patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+            "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+            "/props": b'{"model_path": "/models/x.gguf", "total_slots": 1}',
+            "/slots": b"[]",
+        })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result["process"] == {"rss_gb": 21.0, "cpu_pct": 340.0,
+                                 "threads": 64}
+    assert app_mod._llama_proc is proc
+    proc.cpu_percent.assert_called_with(None)  # primed on identification
+    # /models/x.gguf does not exist on this host -> key omitted
+    assert "model_size_gb" not in result
+
+
+def test_llama_process_multiple_matches_largest_rss_wins():
+    import app as app_mod
+    from app import collect_llama_metrics
+
+    small = _fake_llama_proc(rss_gb=5.0)
+    big = _fake_llama_proc(rss_gb=30.0)
+    with patch("app.psutil.process_iter", return_value=[small, big]), \
+         patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+            "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+            "/props": b"{}",
+            "/slots": b"[]",
+        })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result["process"]["rss_gb"] == 30.0
+    assert app_mod._llama_proc is big
+    small.cpu_percent.assert_not_called()
+
+
+def test_llama_process_cmdline_fallback():
+    """No exact name match: a cmdline argument containing llama-server."""
+    import app as app_mod
+    from app import collect_llama_metrics
+
+    other = _fake_llama_proc(name="python3", rss_gb=1.0,
+                             cmdline=["python3", "-c", "pass"])
+    server = _fake_llama_proc(
+        name="llama-server-bin", rss_gb=21.0,
+        cmdline=["/opt/llama/build/bin/llama-server", "--model", "x.gguf"],
+    )
+    with patch("app.psutil.process_iter", return_value=[other, server]), \
+         patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+            "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+            "/props": b"{}",
+            "/slots": b"[]",
+        })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result["process"]["rss_gb"] == 21.0
+    assert app_mod._llama_proc is server
+
+
+def test_llama_process_reidentify_after_death():
+    """A dead retained handle (model reload = new PID) is re-found."""
+    import psutil
+    import app as app_mod
+    from app import collect_llama_metrics
+
+    dead = _fake_llama_proc(rss_gb=21.0)
+    dead.memory_info.side_effect = psutil.NoSuchProcess(0, "")
+    fresh = _fake_llama_proc(rss_gb=22.0)
+    with patch("app.psutil.process_iter", return_value=[fresh]), \
+         patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+            "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+            "/props": b"{}",
+            "/slots": b"[]",
+        })):
+        app_mod._llama_proc = dead
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result["process"]["rss_gb"] == 22.0
+    assert app_mod._llama_proc is fresh
+
+
+def test_llama_process_none_when_absent():
+    """No local llama-server (remote/dev mode) -> process null, no red."""
+    from app import collect_llama_metrics
+
+    # reset_llama_proc fixture: process_iter yields no processes
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+        "/props": b'{"model_path": "/models/x.gguf", "total_slots": 1}',
+        "/slots": b"[]",
+    })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result["process"] is None
+
+
+def test_llama_process_model_size(tmp_path):
+    """model_size_gb from os.path.getsize on the co-located host."""
+    from app import collect_llama_metrics
+
+    model = tmp_path / "x.gguf"
+    with open(model, "wb") as f:  # sparse: 19.8 GB without writing it
+        f.seek(int(19.8 * 2**30))
+        f.write(b"\0")
+    with patch("app.psutil.process_iter",
+               return_value=[_fake_llama_proc()]), \
+         patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+            "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+            "/props": json.dumps(
+                {"model_path": str(model), "total_slots": 1}).encode(),
+            "/slots": b"[]",
+        })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert result["model_size_gb"] == 19.8
+
+
+# ---------------------------------------------------------------------------
+# T6: swap usage + swap I/O rate card
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def reset_swap_prev():
+    """Reset the module-level swap I/O history around every test."""
+    import app as app_mod
+
+    original = app_mod._swap_prev
+    app_mod._swap_prev = None
+    yield
+    app_mod._swap_prev = original
+
+
+def _fake_swap(used_gb=1.5, total_gb=4.0, percent=37.5, sin=0, sout=0):
+    """A MagicMock standing in for psutil's swap_memory result."""
+    return MagicMock(
+        used=int(used_gb * 2**30),
+        total=int(total_gb * 2**30),
+        percent=percent,
+        sin=sin,
+        sout=sout,
+    )
+
+
+def test_swap_basic_fields_and_first_scrape():
+    """Usage fields map straight through; rate keys are omitted on the
+    first scrape (no previous counters) and the counters are retained."""
+    import app as app_mod
+    from app import collect_swap_metrics
+
+    with patch("app.psutil.swap_memory",
+               return_value=_fake_swap(sin=1024, sout=2048)):
+        result = collect_swap_metrics()
+
+    assert result is not None
+    assert result["used_gb"] == 1.5
+    assert result["total_gb"] == 4.0
+    assert result["pct"] == 37.5
+    assert "in_kb_s" not in result
+    assert "out_kb_s" not in result
+    assert app_mod._swap_prev == {"ts": app_mod._swap_prev["ts"],
+                                   "sin": 1024, "sout": 2048}
+
+
+def test_swap_rates_from_counter_deltas():
+    """in/out kB/s = cumulative delta / elapsed, over a 2 s scrape gap."""
+    from app import collect_swap_metrics
+
+    clock = _FakeClock()
+    with patch("app.psutil.swap_memory", side_effect=[
+        _fake_swap(sin=0, sout=0),
+        _fake_swap(sin=1_048_576, sout=524_288),  # +1 MiB in, +0.5 MiB out
+    ]), patch("app.time.monotonic", clock):
+        first = collect_swap_metrics()
+        assert "in_kb_s" not in first
+        clock.advance(2.0)
+        second = collect_swap_metrics()
+
+    assert second["in_kb_s"] == 512.0   # 1 MiB / 2 s
+    assert second["out_kb_s"] == 256.0  # 0.5 MiB / 2 s
+    assert second["used_gb"] == 1.5
+    assert second["pct"] == 37.5
+
+
+def test_swap_rate_clamped_on_counter_reset():
+    """A counter decrease (swapon/off, reboot) clamps the rate to 0."""
+    from app import collect_swap_metrics
+
+    clock = _FakeClock()
+    with patch("app.psutil.swap_memory", side_effect=[
+        _fake_swap(sin=10_000_000, sout=10_000_000),
+        _fake_swap(sin=100, sout=0),
+    ]), patch("app.time.monotonic", clock):
+        collect_swap_metrics()
+        clock.advance(1.0)
+        second = collect_swap_metrics()
+
+    assert second["in_kb_s"] == 0.0
+    assert second["out_kb_s"] == 0.0
+
+
+def test_swap_none_when_total_zero():
+    """No swap on the host (total == 0) -> None; no history retained."""
+    import app as app_mod
+    from app import collect_swap_metrics
+
+    with patch("app.psutil.swap_memory",
+               return_value=_fake_swap(used_gb=0.0, total_gb=0.0,
+                                       percent=0.0)):
+        result = collect_swap_metrics()
+
+    assert result is None
+    assert app_mod._swap_prev is None
+
+
+def test_swap_collector_error_returns_none():
+    """psutil.swap_memory raising (host without counters) -> None."""
+    import app as app_mod
+    from app import collect_swap_metrics
+
+    with patch("app.psutil.swap_memory", side_effect=OSError("no swap")):
+        result = collect_swap_metrics()
+
+    assert result is None
+    assert app_mod._swap_prev is None
+
+
+def test_collector_snapshot_includes_swap():
+    """The collector's per-tick snapshot carries the top-level swap key."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1, llama_enabled=False)
+    collector._queue = queue.Queue(maxsize=3)
+    with patch("app.psutil.swap_memory",
+               return_value=_fake_swap(sin=1024, sout=2048)):
+        collector.start()
+        try:
+            data = collector.get_latest(timeout=3.0)
+            assert data is not None
+            metrics = json.loads(data)
+            assert metrics["swap"]["used_gb"] == 1.5
+            assert metrics["swap"]["total_gb"] == 4.0
+            assert metrics["swap"]["pct"] == 37.5
+            assert "in_kb_s" not in metrics["swap"]
+        finally:
+            collector.running = False
+            collector.join(timeout=2)
+
+
+# ---------------------------------------------------------------------------
+# T7: host health card (PSI memory pressure, D-state processes)
+# ---------------------------------------------------------------------------
+
+_PSI_MEMORY_BODY = (
+    "some avg10=0.05 avg60=0.02 avg300=0.01 total=123456789\n"
+    "full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+)
+
+
+def _fake_status_proc(status: str) -> MagicMock:
+    """A MagicMock process exposing only the 'status' info field."""
+    p = MagicMock()
+    p.info = {"status": status}
+    return p
+
+
+def test_host_health_psi_parse_and_d_state_count(tmp_path):
+    """PSI 'some avg10=' is parsed from a real file; D-state procs are
+    counted via the (fake) process table."""
+    from app import collect_host_health_metrics
+
+    psi_file = tmp_path / "memory"
+    psi_file.write_text(_PSI_MEMORY_BODY)
+    procs = [
+        _fake_status_proc(psutil.STATUS_DISK_SLEEP),
+        _fake_status_proc(psutil.STATUS_DISK_SLEEP),
+        _fake_status_proc(psutil.STATUS_RUNNING),
+        _fake_status_proc(psutil.STATUS_SLEEPING),
+        _fake_status_proc(psutil.STATUS_ZOMBIE),
+    ]
+    with patch("app.psutil.process_iter", return_value=procs):
+        result = collect_host_health_metrics(psi_mem_path=str(psi_file))
+
+    assert result["psi_mem_avg10"] == 0.05
+    assert result["d_state_procs"] == 2
+
+
+def test_host_health_psi_missing_file_returns_none(tmp_path):
+    """No /proc/pressure/memory (macOS) -> psi None; D-state still counted."""
+    from app import collect_host_health_metrics
+
+    procs = [_fake_status_proc(psutil.STATUS_DISK_SLEEP)]
+    with patch("app.psutil.process_iter", return_value=procs):
+        result = collect_host_health_metrics(
+            psi_mem_path=str(tmp_path / "does-not-exist")
+        )
+
+    assert result["psi_mem_avg10"] is None
+    assert result["d_state_procs"] == 1
+
+
+def test_host_health_psi_unparseable_returns_none(tmp_path):
+    """A 'some' line with a malformed avg10, or no 'some' line at all,
+    both yield None (the 'full' line's avg10 must not be used)."""
+    from app import collect_host_health_metrics
+
+    bad = tmp_path / "bad"
+    bad.write_text("some avg10=garbage avg60=0.02 total=1\nfull avg10=9.99 total=0\n")
+    with patch("app.psutil.process_iter", return_value=[]):
+        assert (
+            collect_host_health_metrics(psi_mem_path=str(bad))["psi_mem_avg10"]
+            is None
+        )
+
+    no_some = tmp_path / "no_some"
+    no_some.write_text("full avg10=9.99 avg60=0.1 avg300=0.0 total=1\n")
+    with patch("app.psutil.process_iter", return_value=[]):
+        assert (
+            collect_host_health_metrics(psi_mem_path=str(no_some))["psi_mem_avg10"]
+            is None
+        )
+
+
+def test_host_health_process_iter_error_degrades_to_zero(tmp_path):
+    """A process-table failure degrades D-state to 0 (never raises)."""
+    from app import collect_host_health_metrics
+
+    with patch("app.psutil.process_iter", side_effect=OSError("boom")):
+        result = collect_host_health_metrics(psi_mem_path=str(tmp_path / "x"))
+
+    assert result["d_state_procs"] == 0
+    assert result["psi_mem_avg10"] is None
+
+
+def test_collector_snapshot_includes_host_health():
+    """The collector's per-tick snapshot carries the top-level key with the
+    spec'd shape (psi float|None, d_state int)."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1, llama_enabled=False)
+    collector._queue = queue.Queue(maxsize=3)
+    procs = [
+        _fake_status_proc(psutil.STATUS_DISK_SLEEP),
+        _fake_status_proc(psutil.STATUS_RUNNING),
+    ]
+    with patch("app.psutil.process_iter", return_value=procs):
+        collector.start()
+        try:
+            data = collector.get_latest(timeout=3.0)
+            assert data is not None
+            metrics = json.loads(data)
+        finally:
+            collector.running = False
+            collector.join(timeout=2)
+
+    hh = metrics["host_health"]
+    assert hh["d_state_procs"] == 1
+    assert hh["psi_mem_avg10"] is None or isinstance(hh["psi_mem_avg10"], float)
