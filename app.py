@@ -352,6 +352,10 @@ _LLAMA_METRIC_MAP = (
     ("requests_processing", "llamacpp:requests_processing"),
     ("requests_deferred", "llamacpp:requests_deferred"),
     ("context_tokens_max", "llamacpp:n_tokens_max"),
+    ("spec_decode_draft_tokens_total",
+     "llamacpp:spec_decode_num_draft_tokens_total"),
+    ("spec_decode_accepted_tokens_total",
+     "llamacpp:spec_decode_num_accepted_tokens_total"),
 )
 
 
@@ -585,6 +589,15 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
     requests_processing = out.get("requests_processing")
     if isinstance(total_slots, int) and requests_processing is not None:
         out["free_slots"] = max(0, total_slots - int(requests_processing))
+
+    # Lifetime spec-decode accept rate. Key omitted when spec decode is off
+    # (counters absent) or no drafts yet (draft == 0). Lifetime only: on the
+    # reference build these counters tick per completion step, so a windowed
+    # ratio would flicker between 0 and bursty values.
+    spec_draft = out.get("spec_decode_draft_tokens_total")
+    spec_accepted = out.get("spec_decode_accepted_tokens_total")
+    if spec_draft is not None and spec_accepted is not None and spec_draft > 0:
+        out["spec_accept_pct"] = round(100.0 * spec_accepted / spec_draft, 1)
 
     slots = _parse_llama_slots(_llama_get_json(base_url, "/slots"))
     out["slots"] = slots

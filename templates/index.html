@@ -327,6 +327,10 @@
           <div class="gauge-value" id="llama-context-max">–</div>
           <div class="gauge-label">Context high-water (tokens)</div>
         </div>
+        <div class="gauge" id="llama-spec-gauge" style="display:none;">
+          <div class="gauge-value" id="llama-spec-accept">–</div>
+          <div class="gauge-label">spec accept (lifetime)</div>
+        </div>
       </div>
       <div class="llama-slots" id="llama-slots-container">
         <!-- Slot bars injected by JS -->
@@ -858,6 +862,7 @@ function updateLlama(llama) {
     modelEl.removeAttribute('title');
     document.getElementById('llama-slots-free').style.display = 'none';
     document.getElementById('llama-peak-ctx').style.display = 'none';
+    document.getElementById('llama-spec-gauge').style.display = 'none';
     updateLlamaSlots([]);
     return; // keep gauges / chart history as-is
   }
@@ -892,6 +897,14 @@ function updateLlama(llama) {
     : `Prompt tokens/s · cached ${llama.prompt_cached_tokens_per_s != null ? llama.prompt_cached_tokens_per_s : '–'}`;
   busyEl.textContent = `${llama.requests_processing ?? 0}/${llama.requests_deferred ?? 0}`;
   ctxEl.textContent = llama.context_tokens_max != null ? llama.context_tokens_max : '–';
+  /* Spec-decode accept rate (lifetime); hidden when spec decode is off */
+  const specGaugeEl = document.getElementById('llama-spec-gauge');
+  if (llama.spec_accept_pct != null) {
+    document.getElementById('llama-spec-accept').textContent = `${llama.spec_accept_pct}%`;
+    specGaugeEl.style.display = '';
+  } else {
+    specGaugeEl.style.display = 'none';
+  }
 
   /* Free slots + peak context (older builds may omit keys – hide) */
   const freeEl = document.getElementById('llama-slots-free');

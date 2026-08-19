@@ -716,6 +716,42 @@ def test_collect_llama_free_slots():
     assert "free_slots" not in r
 
 
+def test_collect_llama_spec_accept_rate():
+    """spec_accept_pct = 100 * accepted / draft (lifetime), rounded to 0.1;
+    omitted when spec decode is off (counters absent) or draft == 0."""
+    from app import collect_llama_metrics
+
+    def run(metrics: str):
+        with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+            "/metrics": metrics.encode(),
+            "/props": b'{"total_slots": 1}',
+            "/slots": b"[]",
+        })):
+            return collect_llama_metrics("http://127.0.0.1:9999")
+
+    # both counters present (live reference-server values: 6050/7717)
+    r = run(
+        "llamacpp:spec_decode_num_draft_tokens_total 7717\n"
+        "llamacpp:spec_decode_num_accepted_tokens_total 6050\n"
+    )
+    assert r["spec_decode_draft_tokens_total"] == 7717.0
+    assert r["spec_decode_accepted_tokens_total"] == 6050.0
+    assert r["spec_accept_pct"] == 78.4
+
+    # draft == 0 -> key omitted (no division by zero)
+    r = run(
+        "llamacpp:spec_decode_num_draft_tokens_total 0\n"
+        "llamacpp:spec_decode_num_accepted_tokens_total 0\n"
+    )
+    assert "spec_accept_pct" not in r
+
+    # counters absent (spec decode off) -> rate key omitted
+    r = run("llamacpp:requests_processing 0\n")
+    assert "spec_decode_draft_tokens_total" not in r
+    assert "spec_decode_accepted_tokens_total" not in r
+    assert "spec_accept_pct" not in r
+
+
 def test_collect_llama_live_rate_from_slots():
     """Live tokens/s from per-slot decode counters: the /metrics counters
     only advance on request completion on some builds (e.g. LM Studio),
