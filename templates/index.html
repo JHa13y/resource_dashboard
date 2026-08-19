@@ -301,8 +301,8 @@
     </div>
   </div>
 
-  <!-- Local LLM section -->
-  <div class="gpu-section" style="margin-top:16px;">
+  <!-- Local LLM section (hidden when the dashboard runs with --no-llama) -->
+  <div class="gpu-section" id="llama-section" style="margin-top:16px;">
     <div class="card" id="llama-card">
       <div class="llama-header">
         <h2>Local LLM · llama.cpp</h2>
@@ -581,6 +581,9 @@ source.onmessage = (e) => {
   const m = JSON.parse(e.data);
   updateSystem(m);
   updateGPUs(m.gpus || []);
+  /* --no-llama: hide the section. Absent key = enabled (older builds). */
+  const llamaSec = document.getElementById('llama-section');
+  if (llamaSec) llamaSec.style.display = m.llama_enabled === false ? 'none' : '';
   updateLlama(m.llama);
 };
 

@@ -642,10 +642,12 @@ class MetricsCollector(threading.Thread):
         self,
         poll_interval: float = 1.0,
         llama_url: str = DEFAULT_LLAMA_URL,
+        llama_enabled: bool = True,
     ) -> None:
         super().__init__(daemon=True)
         self.poll_interval = poll_interval
         self.llama_url = llama_url
+        self.llama_enabled = llama_enabled
         # Bounded queue – maxsize entries; oldest dropped when full.
         self._queue: queue.Queue[str] = queue.Queue(maxsize=30)
         self.running = True
@@ -691,7 +693,10 @@ class MetricsCollector(threading.Thread):
                 "available_gb": round(vm.available / (1024**3), 1),
             },
             "gpus": collect_gpu_metrics(),
-            "llama": collect_llama_metrics(self.llama_url),
+            # Stable signal for the frontend: the llama.cpp section is on by
+            # default; --no-llama skips scraping entirely and hides the card.
+            "llama_enabled": self.llama_enabled,
+            "llama": collect_llama_metrics(self.llama_url) if self.llama_enabled else None,
         }
 
     def run(self) -> None:
@@ -773,10 +778,14 @@ if __name__ == "__main__":
                              "The default http://127.0.0.1:5001 works when the dashboard and "
                              "llama-server run on the same host; pass a remote URL otherwise, "
                              "e.g. http://<llama-host>:5001")
+    parser.add_argument("--no-llama", action="store_true",
+                        help="disable the llama.cpp section (enabled by default)")
     args = parser.parse_args()
 
     collector.llama_url = args.llama_url
+    collector.llama_enabled = not args.no_llama
 
     log.info("Starting Resource Dashboard on http://%s:%d (llama-server: %s)",
-             args.host, args.port, args.llama_url)
+             args.host, args.port,
+             "disabled" if args.no_llama else args.llama_url)
     app.run(host=args.host, port=args.port, debug=False)

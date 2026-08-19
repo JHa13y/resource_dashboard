@@ -40,13 +40,14 @@ The `nvidia-ml-py` package is included in `requirements.txt`. If installation fa
 python app.py                          # binds 0.0.0.0:5000
 python app.py --host 127.0.0.1 --port 8080
 python app.py --llama-url http://192.168.1.50:5001   # point at your llama-server
+python app.py --no-llama                             # hide the llama.cpp section entirely
 ```
 
 Then open **http://localhost:5000** (or your chosen host/port) in your browser.
 
 ### llama.cpp section
 
-`--llama-url` (default `http://127.0.0.1:5001`) is the base URL of your `llama-server`. The default is a local-dev convenience only — in production the dashboard usually runs on a **different host** than the llama-server, so pass the remote URL explicitly (e.g. `--llama-url http://<llama-host>:5001`). The card shows **unreachable** when the URL is wrong, unroutable, or the server was not started with `--metrics`. If a scrape fails (e.g. a timeout under heavy server load), the last data is held for up to 15 s and shown as **stale**; the card only turns "unreachable" after that.
+`--llama-url` (default `http://127.0.0.1:5001`) is the base URL of your `llama-server`. The default is a local-dev convenience only — in production the dashboard usually runs on a **different host** than the llama-server, so pass the remote URL explicitly (e.g. `--llama-url http://<llama-host>:5001`). The card shows **unreachable** when the URL is wrong, unroutable, or the server was not started with `--metrics`. If a scrape fails (e.g. a timeout under heavy server load), the last data is held for up to 15 s and shown as **stale**; the card only turns "unreachable" after that. Pass `--no-llama` to disable the section entirely (no scraping, card hidden); it is enabled by default.
 
 Notes:
 - Gen/prompt tokens/s are computed by the dashboard from the per-slot live decode counters in `GET /slots` (the `/metrics` counters only advance on request completion on some builds, e.g. LM Studio's); token totals are cumulative since server start.

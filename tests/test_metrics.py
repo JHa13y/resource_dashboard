@@ -256,6 +256,52 @@ def test_collector_queue_bounded():
         collector.join(timeout=2)
 
 
+def test_collector_llama_disabled_performs_no_llama_calls():
+    """llama_enabled=False (--no-llama): no llama HTTP calls, flag in snapshot."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1, llama_enabled=False)
+    collector._queue = queue.Queue(maxsize=3)
+    with patch("app.urllib.request.urlopen") as fake_urlopen:
+        fake_urlopen.side_effect = ConnectionRefusedError("llama must not be scraped")
+        collector.start()
+        try:
+            data = collector.get_latest(timeout=3.0)
+            assert data is not None
+            metrics = json.loads(data)
+            assert metrics["llama_enabled"] is False
+            assert metrics.get("llama") is None
+        finally:
+            collector.running = False
+            collector.join(timeout=2)
+        assert fake_urlopen.call_count == 0
+
+
+def test_collector_llama_enabled_by_default():
+    """Default (no flag): llama_enabled True and llama scraped as before."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1)
+    assert collector.llama_enabled is True
+    collector._queue = queue.Queue(maxsize=3)
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+        "/props": b'{"model_path": "/models/x.gguf", "total_slots": 1}',
+        "/slots": b"[]",
+    })):
+        collector.start()
+        try:
+            data = collector.get_latest(timeout=3.0)
+            assert data is not None
+            metrics = json.loads(data)
+            assert metrics["llama_enabled"] is True
+            assert metrics["llama"]["status"] == "up"
+            assert metrics["llama"]["model"] == "x.gguf"
+        finally:
+            collector.running = False
+            collector.join(timeout=2)
+
+
 # ---------------------------------------------------------------------------
 # collect_gpu_metrics integration (prefers pynvml, falls back to CLI)
 # ---------------------------------------------------------------------------
