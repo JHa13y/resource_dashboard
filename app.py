@@ -952,6 +952,12 @@ _vllm_prev: dict[str, float] | None = None
 _VLLM_CONFIG_TTL = 30.0
 _vllm_config_cache: tuple[float, dict[str, Any]] | None = None
 
+# Warn-once guard for LLM auto mode: the first time vLLM comes up, tell the
+# operator it is the active backend and how to pin the choice.
+# Approximation (accepted): we do NOT probe the llama server just to verify
+# it is also reachable, so this may fire when only vLLM is up.
+_llm_tie_warned = False
+
 
 def _parse_prometheus_labeled(text: str, prefix: str) -> dict[str, dict]:
     """Parse Prometheus text into ``{metric_name: {"series": {labelset: float}, "labels": {name: set(values)}}}``.
@@ -1499,12 +1505,24 @@ class MetricsCollector(threading.Thread):
         through to the other backend, and recovery flips back on the
         next cycle. Pinned backend skips the other branch entirely.
         """
+        global _llm_tie_warned
         if not self.llama_enabled:
             return None
         if self.llm_backend in ("auto", "vllm"):
             data = collect_vllm_metrics(self.vllm_url)
             if data is not None:
                 data["backend"] = "vllm"
+                # Warn once: vLLM is silently preferred in auto mode. We
+                # do not probe the llama server here (keeps the cycle cheap),
+                # so this fires the first time vLLM is active in auto mode
+                # even if llama is down - the accepted approximation.
+                if self.llm_backend == "auto" and not _llm_tie_warned:
+                    _llm_tie_warned = True
+                    log.warning(
+                        "LLM auto mode: using vLLM at %s. If llama.cpp is "
+                        "also reachable and you want it instead, pin "
+                        "--llm-backend llama (logged once).",
+                        self.vllm_url)
                 return data
         if self.llm_backend in ("auto", "llama"):
             data = collect_llama_metrics(self.llama_url)
