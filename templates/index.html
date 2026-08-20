@@ -1047,6 +1047,12 @@ function updateLLM(m) {
   /* Per-slot context usage (llama only) */
   updateLlamaSlots(backend === 'llama' && Array.isArray(m.slots) ? m.slots : []);
 
+  /* vLLM has no slots: keep the llama-specific note hidden
+     (updateLlamaSlots([]) would otherwise reveal it). */
+  if (backend === 'vllm') {
+    document.getElementById('llama-slots-note').style.display = 'none';
+  }
+
   /* vLLM sub-lines */
   if (backend === 'vllm') {
     const ttftEl = document.getElementById('vllm-ttft');
