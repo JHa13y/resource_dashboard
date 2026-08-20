@@ -40,7 +40,7 @@ The `nvidia-ml-py` package is included in `requirements.txt`. If installation fa
 python app.py                          # binds 0.0.0.0:5000
 python app.py --host 127.0.0.1 --port 8080
 python app.py --llama-url http://192.168.1.50:5001   # point at your llama-server
-python app.py --vllm-url http://192.168.1.50:9998   # point at your vLLM server
+python app.py --vllm-url http://192.168.1.50:8000   # point at your vLLM server
 python app.py --llm-backend vllm                     # pin to vLLM (skip auto-detect)
 python app.py --no-llama                             # hide the LLM section entirely
 ```
@@ -49,7 +49,7 @@ Then open **http://localhost:5000** (or your chosen host/port) in your browser.
 
 ### Local LLM section (llama.cpp / vLLM)
 
-The dashboard auto-detects which LLM backend is running. In `auto` mode (default), it probes vLLM first (`--vllm-url`, default `http://127.0.0.1:9998`), then llama.cpp (`--llama-url`, default `http://127.0.0.1:5001`). If both are up, vLLM wins. Use `--llm-backend llama` or `--llm-backend vllm` to pin.
+The dashboard auto-detects which LLM backend is running. In `auto` mode (default), it probes vLLM first (`--vllm-url`, default `http://127.0.0.1:8000`), then llama.cpp (`--llama-url`, default `http://127.0.0.1:5001`). If both are up, vLLM wins (a one-time log warning tells you how to pin the other). Use `--llm-backend llama` or `--llm-backend vllm` to pin.
 
 **llama.cpp** (when `llama-server` is reachable with `--metrics`):
 - Gen/prompt tokens/s from per-slot live decode counters in `GET /slots`
@@ -63,6 +63,7 @@ The dashboard auto-detects which LLM backend is running. In `auto` mode (default
 - TTFT / ITL (windowed mean, omitted when idle), prefix-cache hit %, spec-decode accept
 - Config: KV cache tokens, num GPU blocks, block size, cache dtype, GPU memory utilization
 - Stale-hold: last data held for 15 s after a failed scrape
+- vLLM `uptime_s` is `time.time()` minus `process_start_time_seconds` — a cross-host clock comparison, so it assumes roughly NTP-synchronized clocks (clamped to 0); the llama.cpp state-file uptime is single-host and immune
 
 The card shows **unreachable** when the URL is wrong, unroutable, or the server is not running. If a scrape fails, the last data is held for up to 15 s and shown as **stale**. Pass `--no-llama` to disable the section entirely (no scraping, card hidden); it is enabled by default.
 
@@ -71,6 +72,8 @@ The card shows **unreachable** when the URL is wrong, unroutable, or the server 
 ```bash
 curl http://127.0.0.1:5000/api/metrics | python -m json.tool
 ```
+
+**Breaking change:** the per-snapshot key `llama` was replaced by `llm` (with a `backend: "llama" | "vllm"` discriminator) and `llama_enabled` by `llm_enabled`; the older output shape is gone.
 
 ## Running Tests
 
