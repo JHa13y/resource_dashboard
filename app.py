@@ -317,6 +317,9 @@ def collect_gpu_metrics() -> list[dict[str, Any]]:
 # Base URL of the local llama-server (overridable via --llama-url).
 DEFAULT_LLAMA_URL = "http://127.0.0.1:5001"
 
+# Base URL of the vLLM server (overridable via --vllm-url).
+DEFAULT_VLLM_URL = "http://127.0.0.1:8000"
+
 # How often (seconds) to re-fetch /props; model info only changes on reload.
 _LLAMA_PROPS_TTL = 30.0
 _llama_props_cache: tuple[float, dict[str, Any]] | None = None
@@ -934,6 +937,400 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
 
 
 # ---------------------------------------------------------------------------
+# vLLM Monitoring
+# ---------------------------------------------------------------------------
+
+# Stale-hold: last successful vLLM scrape (monotonic ts + dict).
+_VLLM_STALE_MAX_AGE_S = 15.0
+_vllm_last_good: tuple[float, dict[str, Any]] | None = None
+
+# Previous successful scrape's cumulative counters + histogram sums, used
+# to compute rates and windowed means from per-scrape deltas.
+_vllm_prev: dict[str, float] | None = None
+
+# 30 s cache for the parsed cache_config_info dict (static during runtime).
+_VLLM_CONFIG_TTL = 30.0
+_vllm_config_cache: tuple[float, dict[str, Any]] | None = None
+
+
+def _parse_prometheus_labeled(text: str, prefix: str) -> dict[str, dict]:
+    """Parse Prometheus text into ``{metric_name: {"series": {labelset: float}, "labels": {name: set(values)}}}``.
+
+    Keeps only series with the given *prefix* (e.g. ``"vllm:"``) plus the
+    companion unprefixed ``process_start_time_seconds``. Labeled and
+    unlabeled series are both captured. ``# HELP``/``# TYPE`` comment
+    lines and malformed lines are skipped. Never raises.
+    """
+    result: dict[str, dict] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        # Determine metric name, labels string, and value
+        if "{" in line:
+            brace_start = line.index("{")
+            metric_name = line[:brace_start].strip()
+            brace_end = line.index("}")
+            labels_str = line[brace_start + 1:brace_end]
+            rest = line[brace_end + 1:].strip()
+        else:
+            parts0 = line.split()
+            if not parts0:
+                continue
+            metric_name = parts0[0]
+            labels_str = ""
+            rest = " ".join(parts0[1:])
+
+        # Check prefix or companion allowlist
+        if not metric_name.startswith(prefix) and metric_name != "process_start_time_seconds":
+            continue
+
+        # Parse value
+        parts = rest.split()
+        if not parts:
+            continue
+        try:
+            value = float(parts[0])
+        except (ValueError, IndexError):
+            continue
+
+        # Parse labels into a sorted tuple of (key, value) pairs
+        if labels_str:
+            label_pairs: list[tuple[str, str]] = []
+            for pair in labels_str.split(","):
+                pair = pair.strip()
+                if "=" not in pair:
+                    continue
+                k, v = pair.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip('"')
+                label_pairs.append((k, v))
+            label_pairs.sort()
+            labelset = tuple(label_pairs)
+            label_names: dict[str, set[str]] = {}
+            for k, v in label_pairs:
+                label_names.setdefault(k, set()).add(v)
+        else:
+            labelset = ()
+            label_names = {}
+
+        # Accumulate into result
+        if metric_name not in result:
+            result[metric_name] = {"series": {}, "labels": {}}
+        result[metric_name]["series"][labelset] = value
+        for k, vals in label_names.items():
+            if k in result[metric_name]["labels"]:
+                result[metric_name]["labels"][k].update(vals)
+            else:
+                result[metric_name]["labels"][k] = vals
+
+    return result
+
+
+def _vllm_get_entry(metrics: dict[str, dict], *candidates: str) -> dict[str, dict] | None:
+    """Return the first matching entry by full metric name (with ``vllm:`` prefix)."""
+    for name in candidates:
+        if name in metrics:
+            return metrics[name]
+    return None
+
+
+def _vllm_sum(entry: dict[str, dict] | None) -> float | None:
+    """Sum all series values for a metric entry. None if absent or empty."""
+    if entry is None or not entry.get("series"):
+        return None
+    return sum(entry["series"].values())
+
+
+def _vllm_max(entry: dict[str, dict] | None) -> float | None:
+    """Max of all series values for a metric entry. None if absent or empty."""
+    if entry is None or not entry.get("series"):
+        return None
+    return max(entry["series"].values())
+
+
+def _parse_vllm_config(entry: dict[str, dict]) -> dict[str, Any]:
+    """Parse the ``cache_config_info`` label dict into a config summary.
+
+    The row with value 1.0 carries all config as labels. Values that are
+    the literal string ``"None"`` or cannot be converted are omitted.
+    Never raises.
+    """
+    cfg_labels: dict[str, str] = {}
+    for labelset, val in entry.get("series", {}).items():
+        if val == 1.0:
+            cfg_labels = dict(labelset)
+            break
+
+    if not cfg_labels:
+        return {}
+
+    config: dict[str, Any] = {}
+    for f in ("kv_cache_size_tokens", "num_gpu_blocks", "block_size"):
+        v = cfg_labels.get(f)
+        if v is not None:
+            try:
+                config[f] = int(v)
+            except (ValueError, TypeError):
+                pass
+
+    v = cfg_labels.get("gpu_memory_utilization")
+    if v is not None:
+        try:
+            config["gpu_memory_utilization"] = float(v)
+        except (ValueError, TypeError):
+            pass
+
+    for f in ("cache_dtype", "enable_prefix_caching"):
+        v = cfg_labels.get(f)
+        if v is not None and v != "None":
+            config[f] = v
+
+    return config
+
+
+def collect_vllm_metrics(base_url: str) -> dict[str, Any] | None:
+    """Scrape vLLM ``/metrics`` and build the dashboard snapshot.
+
+    Returns ``None`` when the server is unreachable, or the body contains
+    no ``vllm:`` series. Never raises.
+
+    On a failed scrape the last successful snapshot is returned with
+    ``status: "stale"`` for up to ``_VLLM_STALE_MAX_AGE_S`` seconds so a
+    transient timeout doesn't flicker the UI to "unreachable".
+
+    Counter semantics (confirmed against vLLM docs/source): prompt_tokens_cached_total
+    is a SUBSET of prompt_tokens_total (nested, not disjoint). Usage total is
+    therefore ``prompt_total + gen_total`` (NOT + cached).
+    """
+    global _vllm_last_good, _vllm_prev, _vllm_config_cache
+
+    def _stale_or_none() -> dict[str, Any] | None:
+        if _vllm_last_good is not None:
+            ts, held = _vllm_last_good
+            if time.monotonic() - ts <= _VLLM_STALE_MAX_AGE_S:
+                out = dict(held)
+                out["status"] = "stale"
+                return out
+        return None
+
+    try:
+        with urllib.request.urlopen(
+            base_url.rstrip("/") + "/metrics", timeout=2
+        ) as r:
+            body = r.read().decode()
+    except Exception:  # noqa: BLE001 – collector must never raise
+        return _stale_or_none()
+
+    metrics = _parse_prometheus_labeled(body, "vllm:")
+    if not any(k.startswith("vllm:") for k in metrics):
+        return _stale_or_none()  # endpoint up but no vllm: metrics
+
+    out: dict[str, Any] = {"status": "up"}
+    now = time.monotonic()
+    prev = _vllm_prev
+    elapsed = now - prev["ts"] if prev is not None else 0.0
+
+    # --- Model name (from any series' model_name label; extracted every cycle, no TTL cache) ---
+    model_name = None
+    for entry in metrics.values():
+        if "model_name" in entry.get("labels", {}):
+            vals = entry["labels"]["model_name"]
+            if vals:
+                model_name = next(iter(vals))
+                break
+    if model_name:
+        out["model"] = model_name
+
+    # --- Gauges ---
+    # requests_processing (sum across engines)
+    val = _vllm_sum(_vllm_get_entry(metrics,
+        "vllm:num_requests_running"))
+    if val is not None:
+        out["requests_processing"] = round(val, 1)
+
+    # requests_waiting (sum across engines)
+    val = _vllm_sum(_vllm_get_entry(metrics,
+        "vllm:num_requests_waiting"))
+    if val is not None:
+        out["requests_waiting"] = round(val, 1)
+
+    # kv_cache_usage_pct (max across engines; 0..1 → ×100; legacy: gpu_cache_usage_perc)
+    val = _vllm_max(_vllm_get_entry(metrics,
+        "vllm:kv_cache_usage_perc",
+        "vllm:gpu_cache_usage_perc"))
+    if val is not None:
+        out["kv_cache_usage_pct"] = round(val * 100, 1)
+
+    # --- Engine sleep state (one-hot label parse) ---
+    sleep_entry = _vllm_get_entry(metrics, "vllm:engine_sleep_state")
+    if sleep_entry is not None and sleep_entry.get("series"):
+        sleeping = False
+        for labelset, v in sleep_entry["series"].items():
+            labels = dict(labelset)
+            ss = labels.get("sleep_state", "")
+            if ss in ("weights_offloaded", "discard_all") and v == 1.0:
+                sleeping = True
+                break
+            if ss == "awake" and v == 1.0:
+                sleeping = False
+                break
+        out["sleeping"] = sleeping
+
+    # --- Counters (cumulative) ---
+    gen_total = _vllm_sum(_vllm_get_entry(metrics,
+        "vllm:generation_tokens_total",
+        "vllm:num_generation_tokens"))
+    prompt_total = _vllm_sum(_vllm_get_entry(metrics,
+        "vllm:prompt_tokens_total",
+        "vllm:num_prompt_tokens"))
+    cached_total = _vllm_sum(_vllm_get_entry(metrics,
+        "vllm:prompt_tokens_cached_total"))
+    preemptions = _vllm_sum(_vllm_get_entry(metrics,
+        "vllm:num_preemptions_total"))
+    req_success = _vllm_sum(_vllm_get_entry(metrics,
+        "vllm:request_success_total"))
+    spec_draft = _vllm_sum(_vllm_get_entry(metrics,
+        "vllm:spec_decode_num_draft_tokens_total"))
+    spec_accepted = _vllm_sum(_vllm_get_entry(metrics,
+        "vllm:spec_decode_num_accepted_tokens_total"))
+
+    if gen_total is not None:
+        out["gen_tokens_total"] = round(gen_total, 1)
+    if prompt_total is not None:
+        out["prompt_tokens_total"] = round(prompt_total, 1)
+    if cached_total is not None:
+        out["prompt_tokens_cached_total"] = round(cached_total, 1)
+    if preemptions is not None:
+        out["preemptions_total"] = round(preemptions, 1)
+    if req_success is not None:
+        out["requests_completed_total"] = round(req_success, 1)
+    if spec_draft is not None:
+        out["spec_decode_draft_tokens_total"] = round(spec_draft, 1)
+    if spec_accepted is not None:
+        out["spec_decode_accepted_tokens_total"] = round(spec_accepted, 1)
+
+    # --- Rates (Δ counters / elapsed; window guards) ---
+    rate_ok = prev is not None and 0.5 <= elapsed <= 5.0
+    if rate_ok and gen_total is not None and prompt_total is not None:
+        if gen_total < prev.get("gen", 0):
+            out["gen_tokens_per_s"] = 0.0  # counter reset
+        else:
+            out["gen_tokens_per_s"] = round(
+                max(0.0, gen_total - prev["gen"]) / elapsed, 1)
+        if prompt_total < prev.get("prompt", 0):
+            out["prompt_tokens_per_s"] = 0.0  # counter reset
+        else:
+            out["prompt_tokens_per_s"] = round(
+                max(0.0, prompt_total - prev["prompt"]) / elapsed, 1)
+
+    # --- Prefix cache hit rate (lifetime ratio; omit when queries == 0) ---
+    pc_queries = _vllm_sum(_vllm_get_entry(metrics,
+        "vllm:prefix_cache_queries_total",
+        "vllm:gpu_prefix_cache_queries_total"))
+    pc_hits = _vllm_sum(_vllm_get_entry(metrics,
+        "vllm:prefix_cache_hits_total",
+        "vllm:gpu_prefix_cache_hits_total"))
+    if pc_queries is not None and pc_hits is not None and pc_queries > 0:
+        out["prefix_cache_hit_pct"] = round(100.0 * pc_hits / pc_queries, 1)
+
+    # --- Spec decode accept rate (lifetime ratio; omit when draft == 0) ---
+    if spec_draft is not None and spec_accepted is not None and spec_draft > 0:
+        out["spec_accept_pct"] = round(100.0 * spec_accepted / spec_draft, 1)
+
+    # --- Histograms ---
+    # TTFT: windowed mean (Δsum/Δcount); omit when Δcount ≤ 0; NO lifetime fallback
+    ttft_sum = _vllm_sum(_vllm_get_entry(metrics,
+        "vllm:time_to_first_token_seconds_sum"))
+    ttft_count = _vllm_sum(_vllm_get_entry(metrics,
+        "vllm:time_to_first_token_seconds_count"))
+    if rate_ok and ttft_sum is not None and ttft_count is not None:
+        d_count = ttft_count - prev.get("ttft_count", 0)  # type: ignore[union-attr]
+        if d_count > 0:
+            d_sum = max(0.0, ttft_sum - prev.get("ttft_sum", 0))  # type: ignore[union-attr]
+            out["ttft_seconds"] = round(d_sum / d_count, 1)
+
+    # ITL: windowed mean × 1000; same omit rule (legacy: time_per_output_token_seconds)
+    itl_sum = _vllm_sum(_vllm_get_entry(metrics,
+        "vllm:inter_token_latency_seconds_sum",
+        "vllm:time_per_output_token_seconds_sum"))
+    itl_count = _vllm_sum(_vllm_get_entry(metrics,
+        "vllm:inter_token_latency_seconds_count",
+        "vllm:time_per_output_token_seconds_count"))
+    if rate_ok and itl_sum is not None and itl_count is not None:
+        d_count = itl_count - prev.get("itl_count", 0)  # type: ignore[union-attr]
+        if d_count > 0:
+            d_sum = max(0.0, itl_sum - prev.get("itl_sum", 0))  # type: ignore[union-attr]
+            out["itl_ms"] = round(d_sum / d_count * 1000, 1)
+
+    # E2E latency: lifetime mean (sum/count); summary stat
+    e2e_sum = _vllm_sum(_vllm_get_entry(metrics,
+        "vllm:e2e_request_latency_seconds_sum"))
+    e2e_count = _vllm_sum(_vllm_get_entry(metrics,
+        "vllm:e2e_request_latency_seconds_count"))
+    if e2e_sum is not None and e2e_count is not None and e2e_count > 0:
+        out["e2e_latency_seconds"] = round(e2e_sum / e2e_count, 1)
+
+    # --- Config (30 s cache) ---
+    cfg_entry = _vllm_get_entry(metrics, "vllm:cache_config_info")
+    if cfg_entry is not None and cfg_entry.get("series"):
+        now_ts = time.monotonic()
+        if _vllm_config_cache is not None:
+            cache_ts, cached_cfg = _vllm_config_cache
+            if now_ts - cache_ts < _VLLM_CONFIG_TTL:
+                out["config"] = cached_cfg
+            else:
+                out["config"] = _parse_vllm_config(cfg_entry)
+                _vllm_config_cache = (now_ts, out["config"])
+        else:
+            out["config"] = _parse_vllm_config(cfg_entry)
+            _vllm_config_cache = (now_ts, out["config"])
+
+    # --- Usage (derived; vLLM counters are NESTED: cached ⊂ prompt) ---
+    if gen_total is not None or prompt_total is not None:
+        usage: dict[str, Any] = {}
+        total = 0
+        if prompt_total is not None:
+            total += int(round(prompt_total))
+        if gen_total is not None:
+            total += int(round(gen_total))
+        usage["total_tokens"] = total
+        if gen_total is not None:
+            usage["gen_tokens"] = int(round(gen_total))
+        # gen_avg_tps omitted for vLLM (no gen-seconds counter)
+        if (cached_total is not None and prompt_total is not None
+                and prompt_total > 0):
+            usage["prompt_cached_pct"] = round(
+                100.0 * cached_total / prompt_total, 1)
+        # uptime from process_start_time_seconds (cross-host clock, clamp ≥ 0)
+        proc_start = metrics.get("process_start_time_seconds")
+        if proc_start is not None and proc_start.get("series"):
+            start_val = next(iter(proc_start["series"].values()))
+            usage["uptime_s"] = max(0, int(time.time() - start_val))
+        out["usage"] = usage
+
+    # --- Update previous state ---
+    new_prev: dict[str, float] = {"ts": now}
+    if gen_total is not None:
+        new_prev["gen"] = gen_total
+    if prompt_total is not None:
+        new_prev["prompt"] = prompt_total
+    if ttft_sum is not None:
+        new_prev["ttft_sum"] = ttft_sum
+    if ttft_count is not None:
+        new_prev["ttft_count"] = ttft_count
+    if itl_sum is not None:
+        new_prev["itl_sum"] = itl_sum
+    if itl_count is not None:
+        new_prev["itl_count"] = itl_count
+    _vllm_prev = new_prev
+
+    _vllm_last_good = (now, out)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Swap usage + I/O rate (T6)
 # ---------------------------------------------------------------------------
 
@@ -1057,11 +1454,15 @@ class MetricsCollector(threading.Thread):
         poll_interval: float = 1.0,
         llama_url: str = DEFAULT_LLAMA_URL,
         llama_enabled: bool = True,
+        vllm_url: str = DEFAULT_VLLM_URL,
+        llm_backend: str = "auto",
     ) -> None:
         super().__init__(daemon=True)
         self.poll_interval = poll_interval
         self.llama_url = llama_url
         self.llama_enabled = llama_enabled
+        self.vllm_url = vllm_url
+        self.llm_backend = llm_backend
         # Bounded queue – maxsize entries; oldest dropped when full.
         self._queue: queue.Queue[str] = queue.Queue(maxsize=30)
         self.running = True
@@ -1089,6 +1490,29 @@ class MetricsCollector(threading.Thread):
             except queue.Empty:
                 break
 
+    def _collect_llm(self) -> dict[str, Any] | None:
+        """Stateless LLM backend selection (re-evaluated every cycle).
+
+        auto semantics: try vLLM first, fall through to llama. The
+        per-collector 15 s stale-hold IS the hysteresis: a <15 s blip
+        keeps the current backend flagged stale; a real outage falls
+        through to the other backend, and recovery flips back on the
+        next cycle. Pinned backend skips the other branch entirely.
+        """
+        if not self.llama_enabled:
+            return None
+        if self.llm_backend in ("auto", "vllm"):
+            data = collect_vllm_metrics(self.vllm_url)
+            if data is not None:
+                data["backend"] = "vllm"
+                return data
+        if self.llm_backend in ("auto", "llama"):
+            data = collect_llama_metrics(self.llama_url)
+            if data is not None:
+                data["backend"] = "llama"
+                return data
+        return None
+
     def _collect(self) -> dict[str, Any]:
         """Snapshot all metrics once (non-blocking)."""
         cpu_overall = psutil.cpu_percent(percpu=False)
@@ -1109,10 +1533,10 @@ class MetricsCollector(threading.Thread):
             "gpus": collect_gpu_metrics(),
             "swap": collect_swap_metrics(),
             "host_health": collect_host_health_metrics(),
-            # Stable signal for the frontend: the llama.cpp section is on by
+            # Stable signal for the frontend: the LLM section is on by
             # default; --no-llama skips scraping entirely and hides the card.
-            "llama_enabled": self.llama_enabled,
-            "llama": collect_llama_metrics(self.llama_url) if self.llama_enabled else None,
+            "llm_enabled": self.llama_enabled,
+            "llm": self._collect_llm(),
         }
 
     def run(self) -> None:
@@ -1194,14 +1618,25 @@ if __name__ == "__main__":
                              "The default http://127.0.0.1:5001 works when the dashboard and "
                              "llama-server run on the same host; pass a remote URL otherwise, "
                              "e.g. http://<llama-host>:5001")
+    parser.add_argument("--vllm-url", default=DEFAULT_VLLM_URL,
+                        help="Base URL of a vLLM server (expects /metrics). "
+                             "The default http://127.0.0.1:8000 works when the dashboard and "
+                             "vLLM run on the same host; pass a remote URL otherwise, "
+                             "e.g. http://<vllm-host>:8000")
+    parser.add_argument("--llm-backend", default="auto", choices=["auto", "llama", "vllm"],
+                        help="LLM backend selection (default: auto). "
+                             "auto tries vLLM first, then llama.cpp; "
+                             "pin to 'llama' or 'vllm' to skip the other.")
     parser.add_argument("--no-llama", action="store_true",
-                        help="disable the llama.cpp section (enabled by default)")
+                        help="disable the LLM section (enabled by default)")
     args = parser.parse_args()
 
     collector.llama_url = args.llama_url
     collector.llama_enabled = not args.no_llama
+    collector.vllm_url = args.vllm_url
+    collector.llm_backend = args.llm_backend
 
-    log.info("Starting Resource Dashboard on http://%s:%d (llama-server: %s)",
-             args.host, args.port,
-             "disabled" if args.no_llama else args.llama_url)
+    llm_status = "disabled" if args.no_llama else f"backend={args.llm_backend}, vllm={args.vllm_url}, llama={args.llama_url}"
+    log.info("Starting Resource Dashboard on http://%s:%d (LLM: %s)",
+             args.host, args.port, llm_status)
     app.run(host=args.host, port=args.port, debug=False)
