@@ -260,28 +260,28 @@ def test_collector_queue_bounded():
         collector.join(timeout=2)
 
 
-def test_collector_llama_disabled_performs_no_llama_calls():
-    """llama_enabled=False (--no-llama): no llama HTTP calls, flag in snapshot."""
+def test_collector_llm_disabled_performs_no_llm_calls():
+    """llama_enabled=False (--no-llama): no LLM HTTP calls, flag in snapshot."""
     from app import MetricsCollector
 
     collector = MetricsCollector(poll_interval=0.1, llama_enabled=False)
     collector._queue = queue.Queue(maxsize=3)
     with patch("app.urllib.request.urlopen") as fake_urlopen:
-        fake_urlopen.side_effect = ConnectionRefusedError("llama must not be scraped")
+        fake_urlopen.side_effect = ConnectionRefusedError("LLM must not be scraped")
         collector.start()
         try:
             data = collector.get_latest(timeout=3.0)
             assert data is not None
             metrics = json.loads(data)
-            assert metrics["llama_enabled"] is False
-            assert metrics.get("llama") is None
+            assert metrics["llm_enabled"] is False
+            assert metrics.get("llm") is None
         finally:
             collector.running = False
             collector.join(timeout=2)
         assert fake_urlopen.call_count == 0
 
 
-def test_collector_llama_enabled_by_default():
+def test_collector_llm_enabled_by_default():
     """Default (no flag): llama_enabled True and llama scraped as before."""
     from app import MetricsCollector
 
@@ -298,9 +298,9 @@ def test_collector_llama_enabled_by_default():
             data = collector.get_latest(timeout=3.0)
             assert data is not None
             metrics = json.loads(data)
-            assert metrics["llama_enabled"] is True
-            assert metrics["llama"]["status"] == "up"
-            assert metrics["llama"]["model"] == "x.gguf"
+            assert metrics["llm_enabled"] is True
+            assert metrics["llm"]["status"] == "up"
+            assert metrics["llm"]["model"] == "x.gguf"
         finally:
             collector.running = False
             collector.join(timeout=2)
@@ -1898,3 +1898,819 @@ def test_collector_snapshot_includes_host_health():
     hh = metrics["host_health"]
     assert hh["d_state_procs"] == 1
     assert hh["psi_mem_avg10"] is None or isinstance(hh["psi_mem_avg10"], float)
+
+
+# ---------------------------------------------------------------------------
+# vLLM collector tests
+# ---------------------------------------------------------------------------
+
+# Trimmed fixture mirroring probe_vllm_metrics.txt (single engine "0",
+# model "Qwen3.8_NVFP"). Only the metrics the collector reads are included.
+VLLM_METRICS_SAMPLE = (
+    '# HELP vllm:num_requests_running Number of requests in model execution batches.\n'
+    '# TYPE vllm:num_requests_running gauge\n'
+    'vllm:num_requests_running{engine="0",model_name="Qwen3.8_NVFP"} 7.0\n'
+    'vllm:num_requests_waiting{engine="0",model_name="Qwen3.8_NVFP"} 0.0\n'
+    '# HELP vllm:kv_cache_usage_perc KV-cache usage. 1 means 100 percent usage.\n'
+    '# TYPE vllm:kv_cache_usage_perc gauge\n'
+    'vllm:kv_cache_usage_perc{engine="0",model_name="Qwen3.8_NVFP"} 0.09575835475578409\n'
+    '# HELP vllm:engine_sleep_state Engine sleep state.\n'
+    '# TYPE vllm:engine_sleep_state gauge\n'
+    'vllm:engine_sleep_state{engine="0",model_name="Qwen3.8_NVFP",sleep_state="awake"} 1.0\n'
+    'vllm:engine_sleep_state{engine="0",model_name="Qwen3.8_NVFP",sleep_state="weights_offloaded"} 0.0\n'
+    'vllm:engine_sleep_state{engine="0",model_name="Qwen3.8_NVFP",sleep_state="discard_all"} 0.0\n'
+    '# HELP vllm:generation_tokens_total Number of generation tokens processed.\n'
+    '# TYPE vllm:generation_tokens_total counter\n'
+    'vllm:generation_tokens_total{engine="0",model_name="Qwen3.8_NVFP"} 85077.0\n'
+    '# HELP vllm:prompt_tokens_total Number of prefill tokens processed.\n'
+    '# TYPE vllm:prompt_tokens_total counter\n'
+    'vllm:prompt_tokens_total{engine="0",model_name="Qwen3.8_NVFP"} 1722879.0\n'
+    '# HELP vllm:prompt_tokens_cached_total Number of cached prompt tokens (local + external).\n'
+    '# TYPE vllm:prompt_tokens_cached_total counter\n'
+    'vllm:prompt_tokens_cached_total{engine="0",model_name="Qwen3.8_NVFP"} 0.0\n'
+    '# HELP vllm:prefix_cache_queries_total Prefix cache queries.\n'
+    '# TYPE vllm:prefix_cache_queries_total counter\n'
+    'vllm:prefix_cache_queries_total{engine="0",model_name="Qwen3.8_NVFP"} 0.0\n'
+    '# HELP vllm:prefix_cache_hits_total Prefix cache hits.\n'
+    '# TYPE vllm:prefix_cache_hits_total counter\n'
+    'vllm:prefix_cache_hits_total{engine="0",model_name="Qwen3.8_NVFP"} 0.0\n'
+    '# HELP vllm:num_preemptions_total Cumulative number of preemption.\n'
+    '# TYPE vllm:num_preemptions_total counter\n'
+    'vllm:num_preemptions_total{engine="0",model_name="Qwen3.8_NVFP"} 0.0\n'
+    '# HELP vllm:request_success_total Count of successfully processed requests.\n'
+    '# TYPE vllm:request_success_total counter\n'
+    'vllm:request_success_total{engine="0",finished_reason="stop",model_name="Qwen3.8_NVFP"} 91.0\n'
+    'vllm:request_success_total{engine="0",finished_reason="length",model_name="Qwen3.8_NVFP"} 0.0\n'
+    'vllm:request_success_total{engine="0",finished_reason="abort",model_name="Qwen3.8_NVFP"} 0.0\n'
+    'vllm:request_success_total{engine="0",finished_reason="error",model_name="Qwen3.8_NVFP"} 0.0\n'
+    'vllm:request_success_total{engine="0",finished_reason="repetition",model_name="Qwen3.8_NVFP"} 0.0\n'
+    '# HELP vllm:spec_decode_num_draft_tokens_total Number of draft tokens.\n'
+    '# TYPE vllm:spec_decode_num_draft_tokens_total counter\n'
+    'vllm:spec_decode_num_draft_tokens_total{engine="0",model_name="Qwen3.8_NVFP"} 62928.0\n'
+    '# HELP vllm:spec_decode_num_accepted_tokens_total Number of accepted tokens.\n'
+    '# TYPE vllm:spec_decode_num_accepted_tokens_total counter\n'
+    'vllm:spec_decode_num_accepted_tokens_total{engine="0",model_name="Qwen3.8_NVFP"} 53617.0\n'
+    '# HELP vllm:time_to_first_token_seconds Histogram of TTFT.\n'
+    '# TYPE vllm:time_to_first_token_seconds histogram\n'
+    'vllm:time_to_first_token_seconds_count{engine="0",model_name="Qwen3.8_NVFP"} 98.0\n'
+    'vllm:time_to_first_token_seconds_sum{engine="0",model_name="Qwen3.8_NVFP"} 1631.9596149921417\n'
+    '# HELP vllm:inter_token_latency_seconds Histogram of ITL.\n'
+    '# TYPE vllm:inter_token_latency_seconds histogram\n'
+    'vllm:inter_token_latency_seconds_count{engine="0",model_name="Qwen3.8_NVFP"} 31464.0\n'
+    'vllm:inter_token_latency_seconds_sum{engine="0",model_name="Qwen3.8_NVFP"} 8031.58660459629\n'
+    '# HELP vllm:e2e_request_latency_seconds Histogram of e2e request latency.\n'
+    '# TYPE vllm:e2e_request_latency_seconds histogram\n'
+    'vllm:e2e_request_latency_seconds_count{engine="0",model_name="Qwen3.8_NVFP"} 91.0\n'
+    'vllm:e2e_request_latency_seconds_sum{engine="0",model_name="Qwen3.8_NVFP"} 8604.979218482971\n'
+    '# HELP vllm:cache_config_info Information of the LLMEngine CacheConfig\n'
+    '# TYPE vllm:cache_config_info gauge\n'
+    'vllm:cache_config_info{block_size="1600",cache_dtype="fp8",enable_prefix_caching="False",engine="0",gpu_memory_utilization="0.88",kv_cache_size_tokens="2242627",num_gpu_blocks="1557"} 1.0\n'
+    '# HELP process_start_time_seconds Start time of the process since unix epoch.\n'
+    '# TYPE process_start_time_seconds gauge\n'
+    'process_start_time_seconds 1.78725719225e+09\n'
+)
+
+
+@pytest.fixture(autouse=True)
+def reset_vllm_state():
+    """Reset module-level vLLM scrape history around every test."""
+    import app as app_mod
+
+    original_prev = app_mod._vllm_prev
+    original_last_good = app_mod._vllm_last_good
+    original_config_cache = app_mod._vllm_config_cache
+    app_mod._vllm_prev = None
+    app_mod._vllm_last_good = None
+    app_mod._vllm_config_cache = None
+    yield
+    app_mod._vllm_prev = original_prev
+    app_mod._vllm_last_good = original_last_good
+    app_mod._vllm_config_cache = original_config_cache
+
+
+def make_vllm_server(body: bytes, calls: list | None = None):
+    """Build a side_effect for ``app.urllib.request.urlopen`` that serves
+    a vLLM /metrics endpoint. Unknown URL suffixes raise
+    ConnectionRefusedError (auto-mode tests exploit this for "other backend
+    down")."""
+    def fake_urlopen(url, timeout=None):
+        if calls is not None:
+            calls.append(url)
+        if url.endswith("/metrics"):
+            return _http_response(body)
+        raise ConnectionRefusedError(f"no route for {url}")
+    return fake_urlopen
+
+
+# --- _parse_prometheus_labeled tests ----------------------------------------
+
+def test_parse_prometheus_labeled_basic():
+    from app import _parse_prometheus_labeled
+
+    text = (
+        '# HELP vllm:num_requests_running desc\n'
+        '# TYPE vllm:num_requests_running gauge\n'
+        'vllm:num_requests_running{engine="0",model_name="Model"} 7.0\n'
+        'vllm:num_requests_waiting{engine="0",model_name="Model"} 2.0\n'
+        'process_start_time_seconds 1234.5\n'
+        'python_info{implementation="CPython"} 1.0\n'
+    )
+    result = _parse_prometheus_labeled(text, "vllm:")
+
+    assert "vllm:num_requests_running" in result
+    assert "vllm:num_requests_waiting" in result
+    assert "process_start_time_seconds" in result
+    # Unprefixed non-companion metric must NOT be captured
+    assert "python_info" not in result
+
+    entry = result["vllm:num_requests_running"]
+    # Key is a tuple of (k, v) pairs, sorted by label name
+    key = (("engine", "0"), ("model_name", "Model"))
+    assert entry["series"][key] == 7.0
+    assert entry["labels"]["engine"] == {"0"}
+    assert entry["labels"]["model_name"] == {"Model"}
+
+    # process_start_time_seconds: unlabeled
+    pst = result["process_start_time_seconds"]
+    assert pst["series"][()] == 1234.5
+    assert pst["labels"] == {}
+
+
+def test_parse_prometheus_labeled_multi_engine():
+    from app import _parse_prometheus_labeled
+
+    text = (
+        'vllm:kv_cache_usage_perc{engine="0",model_name="M"} 0.5\n'
+        'vllm:kv_cache_usage_perc{engine="1",model_name="M"} 0.3\n'
+        'vllm:num_requests_running{engine="0",model_name="M"} 3.0\n'
+        'vllm:num_requests_running{engine="1",model_name="M"} 5.0\n'
+    )
+    result = _parse_prometheus_labeled(text, "vllm:")
+
+    # Sum across engines
+    from app import _vllm_sum
+    running = _vllm_sum(result.get("vllm:num_requests_running"))
+    assert running == 8.0
+
+    # Max across engines
+    from app import _vllm_max
+    kv = _vllm_max(result.get("vllm:kv_cache_usage_perc"))
+    assert kv == 0.5
+
+
+def test_parse_prometheus_labeled_garbage_tolerant():
+    from app import _parse_prometheus_labeled
+
+    text = (
+        "# comment\n"
+        "\n"
+        "malformed line without value\n"
+        "vllm:bad{engine=0} not_a_number\n"
+        "vllm:good{engine=\"0\"} 42.0\n"
+    )
+    result = _parse_prometheus_labeled(text, "vllm:")
+    assert "vllm:good" in result
+    assert "vllm:bad" not in result
+
+
+# --- collect_vllm_metrics tests ----------------------------------------------
+
+def test_collect_vllm_happy_path():
+    from app import collect_vllm_metrics
+
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_vllm_server(VLLM_METRICS_SAMPLE.encode())):
+        result = collect_vllm_metrics("http://127.0.0.1:9999")
+
+    assert result is not None
+    assert result["status"] == "up"
+    assert result["model"] == "Qwen3.8_NVFP"
+    assert result["requests_processing"] == 7.0
+    assert result["requests_waiting"] == 0.0
+    assert result["kv_cache_usage_pct"] == round(0.09575835475578409 * 100, 1)  # 9.6
+    assert result["gen_tokens_total"] == 85077.0
+    assert result["prompt_tokens_total"] == 1722879.0
+    assert result["requests_completed_total"] == 91.0  # sum across finished_reason
+    assert result["preemptions_total"] == 0.0
+    assert result["sleeping"] is False
+    # E2E latency: lifetime mean
+    assert result["e2e_latency_seconds"] == round(8604.979218482971 / 91.0, 1)
+    # Spec decode accept rate
+    assert result["spec_accept_pct"] == round(100.0 * 53617 / 62928, 1)
+    # Config parsed
+    assert result["config"]["kv_cache_size_tokens"] == 2242627
+    assert result["config"]["num_gpu_blocks"] == 1557
+    assert result["config"]["block_size"] == 1600
+    assert result["config"]["cache_dtype"] == "fp8"
+    assert result["config"]["gpu_memory_utilization"] == 0.88
+    # Usage (nested counters: total = prompt + gen, NOT + cached)
+    assert result["usage"]["total_tokens"] == 1722879 + 85077
+    assert result["usage"]["gen_tokens"] == 85077
+    assert result["usage"]["uptime_s"] >= 0
+
+
+def test_collect_vllm_no_vllm_metrics_returns_none():
+    from app import collect_vllm_metrics
+
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_vllm_server(b"some:other_metric 1.0\n")):
+        assert collect_vllm_metrics("http://127.0.0.1:9999") is None
+
+
+def test_collect_vllm_unreachable():
+    from app import collect_vllm_metrics
+
+    with patch("app.urllib.request.urlopen",
+               side_effect=ConnectionRefusedError("down")):
+        assert collect_vllm_metrics("http://127.0.0.1:9999") is None
+
+
+def test_collect_vllm_stale_hold():
+    """A failed scrape within the hold window returns last data as stale."""
+    from app import collect_vllm_metrics
+
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_vllm_server(VLLM_METRICS_SAMPLE.encode())):
+        first = collect_vllm_metrics("http://127.0.0.1:9999")
+    assert first is not None and first["status"] == "up"
+
+    with patch("app.urllib.request.urlopen",
+               side_effect=ConnectionRefusedError("down")):
+        held = collect_vllm_metrics("http://127.0.0.1:9999")
+    assert held is not None
+    assert held["status"] == "stale"
+    assert held["model"] == "Qwen3.8_NVFP"
+
+
+def test_collect_vllm_stale_expiry():
+    """A failed scrape after the 15 s hold window returns None."""
+    import app as app_mod
+    from app import collect_vllm_metrics
+
+    clock = _FakeClock()
+    with patch.object(app_mod.time, "monotonic", clock), \
+         patch("app.urllib.request.urlopen",
+               side_effect=make_vllm_server(VLLM_METRICS_SAMPLE.encode())):
+        assert collect_vllm_metrics("http://127.0.0.1:9999")["status"] == "up"
+
+    clock.advance(16.0)
+    with patch.object(app_mod.time, "monotonic", clock), \
+         patch("app.urllib.request.urlopen",
+               side_effect=ConnectionRefusedError("down")):
+        assert collect_vllm_metrics("http://127.0.0.1:9999") is None
+
+
+def test_collect_vllm_rates_across_two_scrapes():
+    """gen/prompt tokens/s from counter deltas over a 1 s gap."""
+    from app import collect_vllm_metrics
+
+    body1 = (
+        'vllm:generation_tokens_total{engine="0",model_name="M"} 100.0\n'
+        'vllm:prompt_tokens_total{engine="0",model_name="M"} 500.0\n'
+        'vllm:num_requests_running{engine="0",model_name="M"} 1.0\n'
+    )
+    body2 = (
+        'vllm:generation_tokens_total{engine="0",model_name="M"} 160.0\n'
+        'vllm:prompt_tokens_total{engine="0",model_name="M"} 580.0\n'
+        'vllm:num_requests_running{engine="0",model_name="M"} 1.0\n'
+    )
+
+    clock = _FakeClock()
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_vllm_server(body1.encode())), \
+         patch("app.time.monotonic", clock):
+        first = collect_vllm_metrics("http://127.0.0.1:9999")
+    assert first is not None
+    assert "gen_tokens_per_s" not in first  # first scrape: no prev
+
+    clock.advance(1.0)
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_vllm_server(body2.encode())), \
+         patch("app.time.monotonic", clock):
+        second = collect_vllm_metrics("http://127.0.0.1:9999")
+
+    assert second["gen_tokens_per_s"] == 60.0  # 60 tokens / 1 s
+    assert second["prompt_tokens_per_s"] == 80.0  # 80 tokens / 1 s
+
+
+def test_collect_vllm_counter_reset_rebaselines():
+    """A decreasing counter (server restart) yields 0 rate."""
+    import app as app_mod
+    from app import collect_vllm_metrics
+
+    app_mod._vllm_prev = {"ts": 1000.0, "gen": 10000.0, "prompt": 10000.0}
+    body = (
+        'vllm:generation_tokens_total{engine="0",model_name="M"} 100.0\n'
+        'vllm:prompt_tokens_total{engine="0",model_name="M"} 200.0\n'
+    )
+    clock = _FakeClock(start=1001.0)
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_vllm_server(body.encode())), \
+         patch("app.time.monotonic", clock):
+        result = collect_vllm_metrics("http://127.0.0.1:9999")
+
+    assert result is not None
+    assert result["gen_tokens_per_s"] == 0.0
+    assert result["prompt_tokens_per_s"] == 0.0
+
+
+def test_collect_vllm_rate_window_too_short():
+    """elapsed < 0.5 s: rate is omitted."""
+    import app as app_mod
+    from app import collect_vllm_metrics
+
+    body1 = 'vllm:generation_tokens_total{engine="0",model_name="M"} 100.0\n'
+    body2 = 'vllm:generation_tokens_total{engine="0",model_name="M"} 160.0\n'
+
+    clock = _FakeClock()
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_vllm_server(body1.encode())), \
+         patch("app.time.monotonic", clock):
+        collect_vllm_metrics("http://127.0.0.1:9999")
+
+    clock.advance(0.2)  # < 0.5 s
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_vllm_server(body2.encode())), \
+         patch("app.time.monotonic", clock):
+        result = collect_vllm_metrics("http://127.0.0.1:9999")
+
+    assert "gen_tokens_per_s" not in result
+
+
+def test_collect_vllm_rate_window_too_long():
+    """elapsed > 5 s: rate is omitted (gauges still present)."""
+    import app as app_mod
+    from app import collect_vllm_metrics
+
+    body1 = 'vllm:generation_tokens_total{engine="0",model_name="M"} 100.0\n'
+    body2 = 'vllm:generation_tokens_total{engine="0",model_name="M"} 160.0\n'
+
+    clock = _FakeClock()
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_vllm_server(body1.encode())), \
+         patch("app.time.monotonic", clock):
+        collect_vllm_metrics("http://127.0.0.1:9999")
+
+    clock.advance(6.0)  # > 5 s
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_vllm_server(body2.encode())), \
+         patch("app.time.monotonic", clock):
+        result = collect_vllm_metrics("http://127.0.0.1:9999")
+
+    assert "gen_tokens_per_s" not in result
+    assert result["gen_tokens_total"] == 160.0  # gauge still present
+
+
+def test_collect_vllm_prefix_cache_omitted_at_zero():
+    """prefix_cache_hit_pct omitted when queries == 0."""
+    from app import collect_vllm_metrics
+
+    body = (
+        'vllm:prefix_cache_queries_total{engine="0",model_name="M"} 0.0\n'
+        'vllm:prefix_cache_hits_total{engine="0",model_name="M"} 0.0\n'
+        'vllm:num_requests_running{engine="0",model_name="M"} 1.0\n'
+    )
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_vllm_server(body.encode())):
+        result = collect_vllm_metrics("http://127.0.0.1:9999")
+
+    assert "prefix_cache_hit_pct" not in result
+
+
+def test_collect_vllm_prefix_cache_populated():
+    """prefix_cache_hit_pct = 100 * hits / queries when queries > 0."""
+    from app import collect_vllm_metrics
+
+    body = (
+        'vllm:prefix_cache_queries_total{engine="0",model_name="M"} 1000.0\n'
+        'vllm:prefix_cache_hits_total{engine="0",model_name="M"} 250.0\n'
+        'vllm:num_requests_running{engine="0",model_name="M"} 1.0\n'
+    )
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_vllm_server(body.encode())):
+        result = collect_vllm_metrics("http://127.0.0.1:9999")
+
+    assert result["prefix_cache_hit_pct"] == 25.0
+
+
+def test_collect_vllm_ttft_windowed_mean():
+    """TTFT windowed mean = Δsum/Δcount; omitted when Δcount ≤ 0."""
+    from app import collect_vllm_metrics
+
+    body1 = (
+        'vllm:time_to_first_token_seconds_sum{engine="0",model_name="M"} 100.0\n'
+        'vllm:time_to_first_token_seconds_count{engine="0",model_name="M"} 10.0\n'
+        'vllm:num_requests_running{engine="0",model_name="M"} 1.0\n'
+    )
+    body2 = (
+        'vllm:time_to_first_token_seconds_sum{engine="0",model_name="M"} 200.0\n'
+        'vllm:time_to_first_token_seconds_count{engine="0",model_name="M"} 15.0\n'
+        'vllm:num_requests_running{engine="0",model_name="M"} 1.0\n'
+    )
+
+    clock = _FakeClock()
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_vllm_server(body1.encode())), \
+         patch("app.time.monotonic", clock):
+        first = collect_vllm_metrics("http://127.0.0.1:9999")
+    assert "ttft_seconds" not in first  # no prev
+
+    clock.advance(1.0)
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_vllm_server(body2.encode())), \
+         patch("app.time.monotonic", clock):
+        second = collect_vllm_metrics("http://127.0.0.1:9999")
+
+    # Δsum = 100, Δcount = 5 → mean = 20.0 s
+    assert second["ttft_seconds"] == 20.0
+
+
+def test_collect_vllm_ttft_no_lifetime_fallback():
+    """No TTFT on first scrape (no lifetime fallback)."""
+    from app import collect_vllm_metrics
+
+    body = (
+        'vllm:time_to_first_token_seconds_sum{engine="0",model_name="M"} 100.0\n'
+        'vllm:time_to_first_token_seconds_count{engine="0",model_name="M"} 10.0\n'
+        'vllm:num_requests_running{engine="0",model_name="M"} 1.0\n'
+    )
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_vllm_server(body.encode())):
+        result = collect_vllm_metrics("http://127.0.0.1:9999")
+
+    assert "ttft_seconds" not in result
+
+
+def test_collect_vllm_itl_windowed_mean():
+    """ITL windowed mean × 1000 → ms; omitted when Δcount ≤ 0."""
+    from app import collect_vllm_metrics
+
+    body1 = (
+        'vllm:inter_token_latency_seconds_sum{engine="0",model_name="M"} 1000.0\n'
+        'vllm:inter_token_latency_seconds_count{engine="0",model_name="M"} 100.0\n'
+        'vllm:num_requests_running{engine="0",model_name="M"} 1.0\n'
+    )
+    body2 = (
+        'vllm:inter_token_latency_seconds_sum{engine="0",model_name="M"} 3000.0\n'
+        'vllm:inter_token_latency_seconds_count{engine="0",model_name="M"} 200.0\n'
+        'vllm:num_requests_running{engine="0",model_name="M"} 1.0\n'
+    )
+
+    clock = _FakeClock()
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_vllm_server(body1.encode())), \
+         patch("app.time.monotonic", clock):
+        collect_vllm_metrics("http://127.0.0.1:9999")
+
+    clock.advance(1.0)
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_vllm_server(body2.encode())), \
+         patch("app.time.monotonic", clock):
+        second = collect_vllm_metrics("http://127.0.0.1:9999")
+
+    # Δsum = 2000, Δcount = 100 → mean = 20.0 s → 20000 ms
+    assert second["itl_ms"] == 20000.0
+
+
+def test_collect_vllm_sleep_state_omitted_when_absent():
+    """engine_sleep_state absent → sleeping key omitted."""
+    from app import collect_vllm_metrics
+
+    body = 'vllm:num_requests_running{engine="0",model_name="M"} 1.0\n'
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_vllm_server(body.encode())):
+        result = collect_vllm_metrics("http://127.0.0.1:9999")
+
+    assert "sleeping" not in result
+
+
+def test_collect_vllm_sleep_state_weights_offloaded():
+    """engine_sleep_state with weights_offloaded=1 → sleeping=True."""
+    from app import collect_vllm_metrics
+
+    body = (
+        'vllm:num_requests_running{engine="0",model_name="M"} 0.0\n'
+        'vllm:engine_sleep_state{engine="0",model_name="M",sleep_state="awake"} 0.0\n'
+        'vllm:engine_sleep_state{engine="0",model_name="M",sleep_state="weights_offloaded"} 1.0\n'
+        'vllm:engine_sleep_state{engine="0",model_name="M",sleep_state="discard_all"} 0.0\n'
+    )
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_vllm_server(body.encode())):
+        result = collect_vllm_metrics("http://127.0.0.1:9999")
+
+    assert result["sleeping"] is True
+
+
+def test_collect_vllm_spec_accept_omitted_when_draft_zero():
+    """spec_accept_pct omitted when draft == 0."""
+    from app import collect_vllm_metrics
+
+    body = (
+        'vllm:spec_decode_num_draft_tokens_total{engine="0",model_name="M"} 0.0\n'
+        'vllm:spec_decode_num_accepted_tokens_total{engine="0",model_name="M"} 0.0\n'
+        'vllm:num_requests_running{engine="0",model_name="M"} 1.0\n'
+    )
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_vllm_server(body.encode())):
+        result = collect_vllm_metrics("http://127.0.0.1:9999")
+
+    assert "spec_accept_pct" not in result
+
+
+def test_collect_vllm_config_none_values_omitted():
+    """cache_config_info label values that are the literal string "None"
+    are omitted from the config dict."""
+    import app as app_mod
+    from app import collect_vllm_metrics
+
+    body = (
+        'vllm:num_requests_running{engine="0",model_name="M"} 1.0\n'
+        'vllm:cache_config_info{block_size="1600",cache_dtype="fp8",'
+        'enable_prefix_caching="False",engine="0",'
+        'gpu_memory_utilization="None",kv_cache_size_tokens="1000",'
+        'num_gpu_blocks="100"} 1.0\n'
+    )
+    app_mod._vllm_config_cache = None  # bypass 30s cache
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_vllm_server(body.encode())):
+        result = collect_vllm_metrics("http://127.0.0.1:9999")
+
+    assert result["config"]["block_size"] == 1600
+    assert result["config"]["num_gpu_blocks"] == 100
+    assert result["config"]["kv_cache_size_tokens"] == 1000
+    assert result["config"]["cache_dtype"] == "fp8"
+    assert "gpu_memory_utilization" not in result["config"]
+
+
+def test_collect_vllm_usage_nested_counters():
+    """vLLM usage: total = prompt + gen (nested: cached ⊂ prompt)."""
+    from app import collect_vllm_metrics
+
+    body = (
+        'vllm:prompt_tokens_total{engine="0",model_name="M"} 10000.0\n'
+        'vllm:generation_tokens_total{engine="0",model_name="M"} 5000.0\n'
+        'vllm:prompt_tokens_cached_total{engine="0",model_name="M"} 3000.0\n'
+        'process_start_time_seconds 1000000.0\n'
+    )
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_vllm_server(body.encode())), \
+         patch("app.time.time", return_value=1001000.0):
+        result = collect_vllm_metrics("http://127.0.0.1:9999")
+
+    usage = result["usage"]
+    assert usage["total_tokens"] == 15000  # prompt + gen (NOT + cached)
+    assert usage["gen_tokens"] == 5000
+    assert usage["prompt_cached_pct"] == 30.0  # 3000/10000
+    assert usage["uptime_s"] == 1000
+
+
+def test_collect_vllm_version_skew_aliases():
+    """Legacy metric names are used when current names are absent."""
+    from app import collect_vllm_metrics
+
+    body = (
+        'vllm:gpu_cache_usage_perc{engine="0",model_name="M"} 0.5\n'
+        'vllm:num_prompt_tokens{engine="0",model_name="M"} 1000.0\n'
+        'vllm:num_generation_tokens{engine="0",model_name="M"} 500.0\n'
+        'vllm:num_requests_running{engine="0",model_name="M"} 1.0\n'
+    )
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_vllm_server(body.encode())):
+        result = collect_vllm_metrics("http://127.0.0.1:9999")
+
+    assert result["kv_cache_usage_pct"] == 50.0  # 0.5 × 100
+    assert result["prompt_tokens_total"] == 1000.0
+    assert result["gen_tokens_total"] == 500.0
+
+
+# --- _collect_llm fallback matrix (oracle R2) --------------------------------
+
+def test_collect_llm_both_up_vllm_wins():
+    """auto mode: both vLLM and llama up → vLLM wins, llama not scraped."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1, llm_backend="auto")
+    collector._queue = queue.Queue(maxsize=3)
+
+    vllm_body = VLLM_METRICS_SAMPLE.encode()
+    llama_body = LLAMA_METRICS_SAMPLE.encode()
+    calls: list[str] = []
+
+    def fake_urlopen(url, timeout=None):
+        calls.append(url)
+        if url.endswith("/metrics"):
+            if "9998" in url:
+                return _http_response(vllm_body)
+            return _http_response(llama_body)
+        if url.endswith("/props"):
+            return _http_response(b'{"model_path": "/models/x.gguf", "total_slots": 1}')
+        if url.endswith("/slots"):
+            return _http_response(b"[]")
+        if url.endswith("/health"):
+            return _http_response(b'{"status":"ok"}')
+        raise ConnectionRefusedError(f"no route for {url}")
+
+    collector.vllm_url = "http://127.0.0.1:9998"
+    collector.llama_url = "http://127.0.0.1:9999"
+
+    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen):
+        data = collector._collect_llm()
+
+    assert data is not None
+    assert data["backend"] == "vllm"
+    assert data["model"] == "Qwen3.8_NVFP"
+    # llama was NOT scraped (only vllm /metrics called)
+    assert not any("9999" in c for c in calls)
+
+
+def test_collect_llm_only_vllm_up():
+    """auto mode: only vLLM up → vLLM returned."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1, llm_backend="auto")
+    collector.vllm_url = "http://127.0.0.1:9998"
+    collector.llama_url = "http://127.0.0.1:9999"
+
+    vllm_body = VLLM_METRICS_SAMPLE.encode()
+
+    def fake_urlopen(url, timeout=None):
+        if url.endswith("/metrics") and "9998" in url:
+            return _http_response(vllm_body)
+        raise ConnectionRefusedError("down")
+
+    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen):
+        data = collector._collect_llm()
+
+    assert data is not None
+    assert data["backend"] == "vllm"
+
+
+def test_collect_llm_only_llama_up():
+    """auto mode: vLLM down, llama up → llama returned."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1, llm_backend="auto")
+    collector.vllm_url = "http://127.0.0.1:9998"
+    collector.llama_url = "http://127.0.0.1:9999"
+
+    llama_body = LLAMA_METRICS_SAMPLE.encode()
+
+    def fake_urlopen(url, timeout=None):
+        if url.endswith("/metrics") and "9999" in url:
+            return _http_response(llama_body)
+        if url.endswith("/props") and "9999" in url:
+            return _http_response(b'{"model_path": "/models/x.gguf", "total_slots": 1}')
+        if url.endswith("/slots") and "9999" in url:
+            return _http_response(b"[]")
+        raise ConnectionRefusedError("down")
+
+    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen):
+        data = collector._collect_llm()
+
+    assert data is not None
+    assert data["backend"] == "llama"
+    assert data["model"] == "x.gguf"
+
+
+def test_collect_llm_both_down_returns_none():
+    """auto mode: both down → None."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1, llm_backend="auto")
+    collector.vllm_url = "http://127.0.0.1:9998"
+    collector.llama_url = "http://127.0.0.1:9999"
+
+    with patch("app.urllib.request.urlopen",
+               side_effect=ConnectionRefusedError("both down")):
+        data = collector._collect_llm()
+
+    assert data is None
+
+
+def test_collect_llm_vllm_stale_stays_vllm():
+    """vLLM within stale-hold returns non-None → stays vLLM (stale)."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1, llm_backend="auto")
+    collector.vllm_url = "http://127.0.0.1:9998"
+    collector.llama_url = "http://127.0.0.1:9999"
+
+    vllm_body = VLLM_METRICS_SAMPLE.encode()
+
+    def fake_urlopen(url, timeout=None):
+        if url.endswith("/metrics") and "9998" in url:
+            return _http_response(vllm_body)
+        raise ConnectionRefusedError("down")
+
+    # First: vLLM up
+    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen):
+        data = collector._collect_llm()
+    assert data["backend"] == "vllm" and data["status"] == "up"
+
+    # Second: vLLM down, within stale-hold → still vLLM (stale)
+    with patch("app.urllib.request.urlopen",
+               side_effect=ConnectionRefusedError("down")):
+        data = collector._collect_llm()
+    assert data is not None
+    assert data["backend"] == "vllm"
+    assert data["status"] == "stale"
+
+
+def test_collect_llm_pinned_llama_ignores_vllm():
+    """Pinned --llm-backend llama: vLLM URL is never scraped."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1, llm_backend="llama")
+    collector.vllm_url = "http://127.0.0.1:9998"
+    collector.llama_url = "http://127.0.0.1:9999"
+
+    llama_body = LLAMA_METRICS_SAMPLE.encode()
+    calls: list[str] = []
+
+    def fake_urlopen(url, timeout=None):
+        calls.append(url)
+        if url.endswith("/metrics") and "9999" in url:
+            return _http_response(llama_body)
+        if url.endswith("/props") and "9999" in url:
+            return _http_response(b'{"model_path": "/models/x.gguf", "total_slots": 1}')
+        if url.endswith("/slots") and "9999" in url:
+            return _http_response(b"[]")
+        raise ConnectionRefusedError("down")
+
+    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen):
+        data = collector._collect_llm()
+
+    assert data is not None
+    assert data["backend"] == "llama"
+    # vLLM was NOT scraped
+    assert not any("9998" in c for c in calls)
+
+
+def test_collect_llm_pinned_vllm_ignores_llama():
+    """Pinned --llm-backend vllm: llama URL is never scraped."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1, llm_backend="vllm")
+    collector.vllm_url = "http://127.0.0.1:9998"
+    collector.llama_url = "http://127.0.0.1:9999"
+
+    vllm_body = VLLM_METRICS_SAMPLE.encode()
+    calls: list[str] = []
+
+    def fake_urlopen(url, timeout=None):
+        calls.append(url)
+        if url.endswith("/metrics") and "9998" in url:
+            return _http_response(vllm_body)
+        raise ConnectionRefusedError("down")
+
+    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen):
+        data = collector._collect_llm()
+
+    assert data is not None
+    assert data["backend"] == "vllm"
+    # llama was NOT scraped
+    assert not any("9999" in c for c in calls)
+
+
+def test_collect_llm_disabled_returns_none():
+    """--no-llama: _collect_llm returns None without any scraping."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1, llama_enabled=False)
+
+    with patch("app.urllib.request.urlopen") as fake_urlopen:
+        fake_urlopen.side_effect = ConnectionRefusedError("must not be called")
+        data = collector._collect_llm()
+
+    assert data is None
+    assert fake_urlopen.call_count == 0
+
+
+# --- Snapshot schema tests ---------------------------------------------------
+
+def test_snapshot_schema_llm_key_singular():
+    """Exactly one backend in llm; no llama key; llm_enabled present."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1, llm_backend="vllm")
+    collector._queue = queue.Queue(maxsize=3)
+    collector.vllm_url = "http://127.0.0.1:9998"
+
+    vllm_body = VLLM_METRICS_SAMPLE.encode()
+
+    def fake_urlopen(url, timeout=None):
+        if url.endswith("/metrics") and "9998" in url:
+            return _http_response(vllm_body)
+        raise ConnectionRefusedError("down")
+
+    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen), \
+         patch("app.collect_gpu_metrics", return_value=[]), \
+         patch("app.collect_swap_metrics", return_value=None), \
+         patch("app.collect_host_health_metrics", return_value={"psi_mem_avg10": None, "d_state_procs": 0}):
+        snapshot = collector._collect()
+
+    assert "llm" in snapshot
+    assert "llama" not in snapshot
+    assert "llm_enabled" in snapshot
+    assert snapshot["llm"]["backend"] == "vllm"
+    assert "backend" in snapshot["llm"]
