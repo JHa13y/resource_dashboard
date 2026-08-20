@@ -2616,6 +2616,58 @@ def test_collect_llm_vllm_stale_stays_vllm():
     assert data["status"] == "stale"
 
 
+def test_collect_llm_vllm_recovers_returns_to_vllm():
+    """vLLM down >15 s → llama; vLLM recovers → selection flips back to vLLM."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1, llm_backend="auto")
+    collector.vllm_url = "http://127.0.0.1:9998"
+    collector.llama_url = "http://127.0.0.1:9999"
+
+    vllm_body = VLLM_METRICS_SAMPLE.encode()
+    llama_body = LLAMA_METRICS_SAMPLE.encode()
+
+    def up_vllm_down_llama(url, timeout=None):
+        if url.endswith("/metrics") and "9998" in url:
+            return _http_response(vllm_body)
+        raise ConnectionRefusedError("down")
+
+    def down_vllm_up_llama(url, timeout=None):
+        if "9998" in url:
+            raise ConnectionRefusedError("vLLM down")
+        if url.endswith("/metrics"):
+            return _http_response(llama_body)
+        if url.endswith("/props"):
+            return _http_response(
+                b'{"model_path": "/models/x.gguf", "total_slots": 1}')
+        if url.endswith("/slots"):
+            return _http_response(b"[]")
+        raise ConnectionRefusedError(f"no route for {url}")
+
+    clock = _FakeClock()
+    # 1. vLLM up
+    with patch("app.urllib.request.urlopen", side_effect=up_vllm_down_llama), \
+         patch("app.time.monotonic", clock):
+        data = collector._collect_llm()
+    assert data is not None
+    assert data["backend"] == "vllm"
+
+    # 2. vLLM down beyond the 15 s stale-hold → fall through to llama
+    clock.advance(16.0)
+    with patch("app.urllib.request.urlopen", side_effect=down_vllm_up_llama), \
+         patch("app.time.monotonic", clock):
+        data = collector._collect_llm()
+    assert data is not None
+    assert data["backend"] == "llama"
+
+    # 3. vLLM recovers → selection flips back to vLLM
+    with patch("app.urllib.request.urlopen", side_effect=up_vllm_down_llama), \
+         patch("app.time.monotonic", clock):
+        data = collector._collect_llm()
+    assert data is not None
+    assert data["backend"] == "vllm"
+
+
 def test_collect_llm_pinned_llama_ignores_vllm():
     """Pinned --llm-backend llama: vLLM URL is never scraped."""
     from app import MetricsCollector
