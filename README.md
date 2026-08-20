@@ -12,7 +12,7 @@ A lightweight, real-time web dashboard for monitoring CPU load, memory usage, an
   - Current graphics clock frequency (MHz)
   - Power draw (W), with the enforced power limit in the label when available (`nvmlDeviceGetPowerUsage` / `nvidia-smi power.draw`)
   - Thermal throttle indicators (`hw_thermal_slowdown`, `sw_thermal_slowdown`) — pulsing red when active
-- **llama.cpp / local LLM** (when a `llama-server` is reachable): generation & prompt tokens/s, request queue (processing/deferred), context high-water mark, loaded model name, and per-slot context usage bars
+- **Local LLM (llama.cpp / vLLM)** — generation & prompt tokens/s, requests in flight, KV cache / context, latency (TTFT/ITL/E2E for vLLM), spec-decode accept, prefix-cache hit, loaded model name. Auto-detects the backend (vLLM wins on tie); pin with `--llm-backend`
 - **Real-time updates** via Server-Sent Events (SSE) — no page refreshes needed
 
 ## Prerequisites
@@ -40,19 +40,31 @@ The `nvidia-ml-py` package is included in `requirements.txt`. If installation fa
 python app.py                          # binds 0.0.0.0:5000
 python app.py --host 127.0.0.1 --port 8080
 python app.py --llama-url http://192.168.1.50:5001   # point at your llama-server
-python app.py --no-llama                             # hide the llama.cpp section entirely
+python app.py --vllm-url http://192.168.1.50:9998   # point at your vLLM server
+python app.py --llm-backend vllm                     # pin to vLLM (skip auto-detect)
+python app.py --no-llama                             # hide the LLM section entirely
 ```
 
 Then open **http://localhost:5000** (or your chosen host/port) in your browser.
 
-### llama.cpp section
+### Local LLM section (llama.cpp / vLLM)
 
-`--llama-url` (default `http://127.0.0.1:5001`) is the base URL of your `llama-server`. The default is a local-dev convenience only — in production the dashboard usually runs on a **different host** than the llama-server, so pass the remote URL explicitly (e.g. `--llama-url http://<llama-host>:5001`). The card shows **unreachable** when the URL is wrong, unroutable, or the server was not started with `--metrics`. If a scrape fails (e.g. a timeout under heavy server load), the last data is held for up to 15 s and shown as **stale**; the card only turns "unreachable" after that. Pass `--no-llama` to disable the section entirely (no scraping, card hidden); it is enabled by default.
+The dashboard auto-detects which LLM backend is running. In `auto` mode (default), it probes vLLM first (`--vllm-url`, default `http://127.0.0.1:9998`), then llama.cpp (`--llama-url`, default `http://127.0.0.1:5001`). If both are up, vLLM wins. Use `--llm-backend llama` or `--llm-backend vllm` to pin.
 
-Notes:
-- Gen/prompt tokens/s are computed by the dashboard from the per-slot live decode counters in `GET /slots` (the `/metrics` counters only advance on request completion on some builds, e.g. LM Studio's); token totals are cumulative since server start.
-- The prompt rate counts **cached + uncached** prompt tokens (matches the server's own prompt t/s and the CLI, which include KV-cache hits); the gauge label shows the last prompt's size and cache-hit percentage (e.g. `… · last 74.0k tok · 99.8% cached`), falling back to the `prompt_tokens_cached_total` rate on servers without `/slots` data.
-- The model name and slot count come from `GET /props` (cached 30 s); per-slot context usage (`used / n_ctx`) comes from `GET /slots` and updates every second.
+**llama.cpp** (when `llama-server` is reachable with `--metrics`):
+- Gen/prompt tokens/s from per-slot live decode counters in `GET /slots`
+- The prompt rate counts **cached + uncached** prompt tokens; the gauge label shows the last prompt's size and cache-hit percentage
+- Per-slot context usage bars, peak ctx, spec-decode accept rate
+- The model name and slot count come from `GET /props` (cached 30 s)
+
+**vLLM** (when `/metrics` responds with `vllm:*` metrics):
+- Gen/prompt tokens/s from Prometheus counter deltas (rate window 0.5–5 s)
+- KV cache % (per-engine max), Running/Waiting (N/M), E2E latency (lifetime mean)
+- TTFT / ITL (windowed mean, omitted when idle), prefix-cache hit %, spec-decode accept
+- Config: KV cache tokens, num GPU blocks, block size, cache dtype, GPU memory utilization
+- Stale-hold: last data held for 15 s after a failed scrape
+
+The card shows **unreachable** when the URL is wrong, unroutable, or the server is not running. If a scrape fails, the last data is held for up to 15 s and shown as **stale**. Pass `--no-llama` to disable the section entirely (no scraping, card hidden); it is enabled by default.
 
 ### One-shot API (for testing / scripting)
 
@@ -93,5 +105,5 @@ resource_dashboard/
 |-------|-----|
 | `nvidia-ml-py` install fails | Dashboard falls back to CLI parsing automatically. To fix: install NVIDIA driver development headers (`nvidia-driver-dev` on Ubuntu). |
 | No GPU data shown | Verify `nvidia-smi` works in terminal. If it errors, check NVIDIA drivers are installed and running. |
-| LLM card shows "unreachable" | Check `--llama-url` is reachable from the dashboard host (`curl <url>/metrics`), that `llama-server` was started with `--metrics`, and that any firewall allows the port. |
+| LLM card shows "unreachable" | Check `--llama-url` / `--vllm-url` is reachable from the dashboard host (`curl <url>/metrics`), that the server is running with metrics enabled, and that any firewall allows the port. |
 | Charts not updating | Check browser console for SSE connection errors. The green "Live" dot in the top-right corner indicates a healthy connection. |

@@ -7,10 +7,11 @@ Wants=network-online.target
 Type=simple
 User=joshua
 WorkingDirectory=/home/joshua/resource_dashboard
-# Replace LLAMA_HOST with the hostname/IP of the machine running llama-server
-# (dashboard and llama-server are on different hosts; drop the flag if the
-# Local LLM section is not needed).
-ExecStart=/home/joshua/resource_dashboard/.venv/bin/python /home/joshua/resource_dashboard/app.py --host 0.0.0.0 --port 5000 --llama-url http://LLAMA_HOST:5001
+# Replace LLAMA_HOST / VLLM_HOST with the hostname/IP of the machine(s)
+# running the LLM server(s). In auto mode (default) the dashboard probes
+# vLLM first, then llama.cpp; pin with --llm-backend {llama|vllm}.
+# Drop both URL flags if the Local LLM section is not needed.
+ExecStart=/home/joshua/resource_dashboard/.venv/bin/python /home/joshua/resource_dashboard/app.py --host 0.0.0.0 --port 5000 --llama-url http://LLAMA_HOST:5001 --vllm-url http://VLLM_HOST:9998
 Restart=on-failure
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
