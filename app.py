@@ -1129,6 +1129,9 @@ def collect_vllm_metrics(base_url: str) -> dict[str, Any] | None:
     except Exception:  # noqa: BLE001 – collector must never raise
         return _stale_or_none()
 
+    # Deliberate deviation from the strict R2 wording: when /metrics is
+    # reachable but carries no vllm: series, return the <=15 s stale hold
+    # instead of strict None (mirrors the llama convention; better hysteresis).
     metrics = _parse_prometheus_labeled(body, "vllm:")
     if not any(k.startswith("vllm:") for k in metrics):
         return _stale_or_none()  # endpoint up but no vllm: metrics
