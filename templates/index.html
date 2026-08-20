@@ -318,7 +318,7 @@
   <div class="gpu-section" id="llama-section" style="margin-top:16px;">
     <div class="card" id="llama-card">
       <div class="llama-header">
-        <h2>Local LLM · llama.cpp</h2>
+        <h2>Local LLM <span id="llm-backend-label" style="font-weight:normal;font-size:0.8rem;color:#94a3b8;"></span></h2>
         <span class="llama-model" id="llama-model">–</span>
         <span id="llama-status" class="badge down">unreachable</span>
         <span id="llama-stalled" class="badge down" style="display:none;">stalled</span>
@@ -346,6 +346,14 @@
           <div class="gauge-value" id="llama-spec-accept">–</div>
           <div class="gauge-label">spec accept (lifetime)</div>
         </div>
+      </div>
+      <!-- vLLM sub-lines (hidden for llama.cpp backend) -->
+      <div id="vllm-details" style="display:none;margin-top:10px;font-size:0.85rem;color:#94a3b8;">
+        <span id="vllm-ttft">TTFT –</span>
+        <span id="vllm-itl"> · ITL –</span>
+        <span id="vllm-e2e"> · E2E –</span>
+        <span id="vllm-prefix-cache"> · prefix cache –</span>
+        <span id="vllm-kv-config"> · KV –</span>
       </div>
       <div class="llama-slots" id="llama-slots-container">
         <!-- Slot bars injected by JS -->
@@ -631,10 +639,10 @@ source.onmessage = (e) => {
   updateGPUs(m.gpus || []);
   /* --no-llama: hide the section. Absent key = enabled (older builds). */
   const llamaSec = document.getElementById('llama-section');
-  if (llamaSec) llamaSec.style.display = m.llama_enabled === false ? 'none' : '';
-  updateLlama(m.llama);
-  updateLlamaUsage(m);
-  updateLlamaProcess(m);
+  if (llamaSec) llamaSec.style.display = m.llm_enabled === false ? 'none' : '';
+  updateLLM(m.llm);
+  updateLLMUsage(m);
+  updateLLMProcess(m);
   updateSwap(m);
   updateHostHealth(m);
 };
@@ -897,37 +905,60 @@ function updateLlamaSlots(slots) {
     slots.length === 0 ? '' : 'none';
 }
 
-function updateLlama(llama) {
+/* Track current backend to clear chart history on switch */
+let _llmCurrentBackend = null;
+
+function updateLLM(m) {
   const statusEl = document.getElementById('llama-status');
   const modelEl = document.getElementById('llama-model');
+  const backendLabel = document.getElementById('llm-backend-label');
 
-  if (llama == null) {
+  if (m == null) {
     statusEl.textContent = 'unreachable';
     statusEl.className = 'badge down';
     statusEl.removeAttribute('title');
     modelEl.textContent = '–';
     modelEl.removeAttribute('title');
+    backendLabel.textContent = '';
     document.getElementById('llama-stalled').style.display = 'none';
     document.getElementById('llama-build').style.display = 'none';
     document.getElementById('llama-slots-free').style.display = 'none';
     document.getElementById('llama-peak-ctx').style.display = 'none';
     document.getElementById('llama-spec-gauge').style.display = 'none';
+    document.getElementById('vllm-details').style.display = 'none';
     updateLlamaSlots([]);
+    _llmCurrentBackend = null;
     return; // keep gauges / chart history as-is
   }
 
+  /* Backend subtitle + chart history reset on switch */
+  const backend = m.backend || 'llama';
+  backendLabel.textContent = backend === 'vllm' ? '· vLLM' : '· llama.cpp';
+  if (_llmCurrentBackend !== null && _llmCurrentBackend !== backend) {
+    // Backend switched: clear chart history
+    if (llamaChart) {
+      llamaChart.data.labels = [];
+      llamaChart.data.datasets[0].data = [];
+      llamaChart.update('none');
+    }
+  }
+  _llmCurrentBackend = backend;
+
+  /* vLLM details block visibility */
+  document.getElementById('vllm-details').style.display = backend === 'vllm' ? '' : 'none';
+
   /* Status + model ("stale" = last data held after a failed scrape;
-     "loading" = /health answered 503, model still loading) */
-  if (llama.status === 'loading') {
+     "loading" = /health answered 503, model still loading — llama only) */
+  if (m.status === 'loading') {
     statusEl.textContent = 'loading model';
     statusEl.className = 'badge warn';
-    if (llama.health_detail) statusEl.title = llama.health_detail;
+    if (m.health_detail) statusEl.title = m.health_detail;
     else statusEl.removeAttribute('title');
-  } else if (llama.status === 'stale') {
+  } else if (m.status === 'stale') {
     statusEl.textContent = 'stale';
     statusEl.className = 'badge warn';
     statusEl.removeAttribute('title');
-  } else if (llama.sleeping) {
+  } else if (m.sleeping) {
     statusEl.textContent = 'sleeping';
     statusEl.className = 'badge warn';
     statusEl.removeAttribute('title');
@@ -936,22 +967,22 @@ function updateLlama(llama) {
     statusEl.className = 'badge ok';
     statusEl.removeAttribute('title');
   }
-  modelEl.textContent = llama.model != null ? llama.model : '–';
-  if (llama.model_path) modelEl.title = llama.model_path;
+  modelEl.textContent = m.model != null ? m.model : '–';
+  if (m.model_path) modelEl.title = m.model_path;
   else modelEl.removeAttribute('title');
 
-  /* Build info (sub-text under the model name; hidden on older builds) */
+  /* Build info (llama only; hidden for vLLM) */
   const buildEl = document.getElementById('llama-build');
-  if (llama.build_info) {
-    buildEl.textContent = `build ${llama.build_info}`;
+  if (backend === 'llama' && m.build_info) {
+    buildEl.textContent = `build ${m.build_info}`;
     buildEl.style.display = '';
   } else {
     buildEl.style.display = 'none';
   }
 
-  /* Decode-stall flag (n_decode_total frozen while a slot is generating) */
+  /* Decode-stall flag (llama only) */
   document.getElementById('llama-stalled').style.display =
-    llama.stalled === true ? '' : 'none';
+    backend === 'llama' && m.stalled === true ? '' : 'none';
 
   /* Gauges (older builds may omit keys – show '–') */
   const genEl = document.getElementById('llama-gen-tokens-s');
@@ -959,50 +990,91 @@ function updateLlama(llama) {
   const busyEl = document.getElementById('llama-busy');
   const ctxEl = document.getElementById('llama-context-max');
 
-  genEl.textContent = llama.gen_tokens_per_s != null ? llama.gen_tokens_per_s : '–';
-  promptEl.textContent = llama.prompt_tokens_per_s != null ? llama.prompt_tokens_per_s : '–';
-  // The prompt rate counts cached + uncached tokens (server/CLI
-  // accounting); the label shows the last prompt's size and cache share.
-  document.getElementById('llama-prompt-label').textContent = llama.prompt_last
-    ? `Prompt tokens/s · last ${fmtTok(llama.prompt_last.total)} tok · ${llama.prompt_last.pct_cached}% cached`
-    : `Prompt tokens/s · cached ${llama.prompt_cached_tokens_per_s != null ? llama.prompt_cached_tokens_per_s : '–'}`;
-  busyEl.textContent = `${llama.requests_processing ?? 0}/${llama.requests_deferred ?? 0}`;
-  ctxEl.textContent = llama.context_tokens_max != null ? llama.context_tokens_max : '–';
+  genEl.textContent = m.gen_tokens_per_s != null ? m.gen_tokens_per_s : '–';
+  promptEl.textContent = m.prompt_tokens_per_s != null ? m.prompt_tokens_per_s : '–';
+  const ctxLabelEl = ctxEl.parentElement.querySelector('.gauge-label');
+  if (backend === 'llama') {
+    // The prompt rate counts cached + uncached tokens (server/CLI
+    // accounting); the label shows the last prompt's size and cache share.
+    document.getElementById('llama-prompt-label').textContent = m.prompt_last
+      ? `Prompt tokens/s · last ${fmtTok(m.prompt_last.total)} tok · ${m.prompt_last.pct_cached}% cached`
+      : `Prompt tokens/s · cached ${m.prompt_cached_tokens_per_s != null ? m.prompt_cached_tokens_per_s : '–'}`;
+    busyEl.textContent = `${m.requests_processing ?? 0}/${m.requests_deferred ?? 0}`;
+    ctxEl.textContent = m.context_tokens_max != null ? m.context_tokens_max : '–';
+    ctxEl.style.color = '';
+    ctxLabelEl.textContent = 'Context high-water (tokens)';
+  } else {
+    // vLLM: KV cache % replaces context high-water
+    document.getElementById('llama-prompt-label').textContent = 'Prompt tokens/s';
+    busyEl.textContent = `${m.requests_processing ?? 0}/${m.requests_waiting ?? 0}`;
+    const kvPct = m.kv_cache_usage_pct;
+    ctxEl.textContent = kvPct != null ? `${kvPct}%` : '–';
+    ctxEl.style.color = kvPct != null ? colorFor(kvPct) : '';
+    ctxLabelEl.textContent = 'KV cache %';
+  }
+
   /* Spec-decode accept rate (lifetime); hidden when spec decode is off */
   const specGaugeEl = document.getElementById('llama-spec-gauge');
-  if (llama.spec_accept_pct != null) {
-    document.getElementById('llama-spec-accept').textContent = `${llama.spec_accept_pct}%`;
+  if (m.spec_accept_pct != null) {
+    document.getElementById('llama-spec-accept').textContent = `${m.spec_accept_pct}%`;
     specGaugeEl.style.display = '';
   } else {
     specGaugeEl.style.display = 'none';
   }
 
-  /* Free slots + peak context (older builds may omit keys – hide) */
+  /* Free slots + peak context (llama only) */
   const freeEl = document.getElementById('llama-slots-free');
-  if (llama.free_slots != null && llama.total_slots != null) {
-    freeEl.textContent = `${llama.free_slots}/${llama.total_slots} slots free`;
+  if (backend === 'llama' && m.free_slots != null && m.total_slots != null) {
+    freeEl.textContent = `${m.free_slots}/${m.total_slots} slots free`;
     freeEl.style.display = '';
   } else {
     freeEl.style.display = 'none';
   }
   const peakEl = document.getElementById('llama-peak-ctx');
-  const nCtx = (Array.isArray(llama.slots) ? llama.slots : [])
-    .map(s => s.n_ctx).find(v => v != null && v > 0);
-  if (llama.context_tokens_max != null && nCtx) {
-    peakEl.textContent = `peak ctx ${fmtTok(llama.context_tokens_max)} / ${fmtTok(nCtx)} (${Math.round(100 * llama.context_tokens_max / nCtx)}%)`;
-    peakEl.style.display = '';
+  if (backend === 'llama') {
+    const nCtx = (Array.isArray(m.slots) ? m.slots : [])
+      .map(s => s.n_ctx).find(v => v != null && v > 0);
+    if (m.context_tokens_max != null && nCtx) {
+      peakEl.textContent = `peak ctx ${fmtTok(m.context_tokens_max)} / ${fmtTok(nCtx)} (${Math.round(100 * m.context_tokens_max / nCtx)}%)`;
+      peakEl.style.display = '';
+    } else {
+      peakEl.style.display = 'none';
+    }
   } else {
     peakEl.style.display = 'none';
   }
 
-  /* Per-slot context usage */
-  updateLlamaSlots(Array.isArray(llama.slots) ? llama.slots : []);
+  /* Per-slot context usage (llama only) */
+  updateLlamaSlots(backend === 'llama' && Array.isArray(m.slots) ? m.slots : []);
+
+  /* vLLM sub-lines */
+  if (backend === 'vllm') {
+    const ttftEl = document.getElementById('vllm-ttft');
+    const itlEl = document.getElementById('vllm-itl');
+    const e2eEl = document.getElementById('vllm-e2e');
+    const pcEl = document.getElementById('vllm-prefix-cache');
+    const kvEl = document.getElementById('vllm-kv-config');
+    ttftEl.textContent = m.ttft_seconds != null ? `TTFT ${m.ttft_seconds}s` : 'TTFT –';
+    itlEl.textContent = m.itl_ms != null ? ` · ITL ${m.itl_ms}ms` : ' · ITL –';
+    e2eEl.textContent = m.e2e_latency_seconds != null ? ` · E2E ${m.e2e_latency_seconds}s` : ' · E2E –';
+    pcEl.textContent = m.prefix_cache_hit_pct != null ? ` · prefix ${m.prefix_cache_hit_pct}%` : '';
+    if (m.config) {
+      const c = m.config;
+      const parts = [];
+      if (c.kv_cache_size_tokens != null) parts.push(`${fmtTok(c.kv_cache_size_tokens)} tok KV`);
+      if (c.cache_dtype) parts.push(c.cache_dtype);
+      if (c.gpu_memory_utilization != null) parts.push(`mem ${Math.round(c.gpu_memory_utilization * 100)}%`);
+      kvEl.textContent = parts.length ? ` · ${parts.join(' · ')}` : '';
+    } else {
+      kvEl.textContent = '';
+    }
+  }
 
   /* Gen tokens/s trend (skip while stale: values are held, not new data) */
-  if (llama.status !== 'stale') {
+  if (m.status !== 'stale') {
     const chart = ensureLlamaChart();
     chart.data.labels.push(nowLabel());
-    chart.data.datasets[0].data.push(llama.gen_tokens_per_s ?? null);
+    chart.data.datasets[0].data.push(m.gen_tokens_per_s ?? null);
     if (chart.data.labels.length > MAX_POINTS) {
       chart.data.labels.shift();
       chart.data.datasets[0].data.shift();
@@ -1024,14 +1096,15 @@ function fmtUptime(s) {
   return `${m}m`;
 }
 
-function updateLlamaProcess(m) {
+function updateLLMProcess(m) {
   const card = document.getElementById('llama-proc-card');
   if (!card) return;
-  const llama = m.llama;
-  const proc = llama && llama.process;
+  const llm = m.llm;
+  const proc = llm && llm.process;
   // Hidden with --no-llama, and when the dashboard runs on a different
-  // host than llama-server (process null) — silent, no red state.
-  if (m.llama_enabled === false || !proc) {
+  // host than the LLM server (process null) — silent, no red state.
+  // vLLM never sends `process` → card stays hidden (existing path).
+  if (m.llm_enabled === false || !proc) {
     card.style.display = 'none';
     return;
   }
@@ -1040,8 +1113,8 @@ function updateLlamaProcess(m) {
     `${proc.cpu_pct}% CPU (all cores)`,
     `${proc.threads} thr`,
   ];
-  if (llama.model_size_gb != null) {
-    parts.push(`model ${llama.model_size_gb} GB`);
+  if (llm.model_size_gb != null) {
+    parts.push(`model ${llm.model_size_gb} GB`);
   }
   document.getElementById('llama-proc-line').textContent = parts.join(' · ');
   card.style.display = '';
@@ -1099,11 +1172,11 @@ function updateHostHealth(m) {
   card.style.display = '';
 }
 
-function updateLlamaUsage(m) {
+function updateLLMUsage(m) {
   const card = document.getElementById('llama-usage-card');
   if (!card) return;
-  const usage = m.llama && m.llama.usage;
-  if (m.llama_enabled === false || !usage) {
+  const usage = m.llm && m.llm.usage;
+  if (m.llm_enabled === false || !usage) {
     card.style.display = 'none';
     return;
   }
