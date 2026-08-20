@@ -1222,13 +1222,16 @@ def collect_vllm_metrics(base_url: str) -> dict[str, Any] | None:
 
     # --- Rates (Δ counters / elapsed; window guards) ---
     rate_ok = prev is not None and 0.5 <= elapsed <= 5.0
-    if rate_ok and gen_total is not None and prompt_total is not None:
-        if gen_total < prev.get("gen", 0):
+    # Each rate is computed only when the previous scrape has that counter
+    # (a version rename mid-flight may lack it): omit the rate key otherwise.
+    if rate_ok and gen_total is not None and prev.get("gen") is not None:
+        if gen_total < prev["gen"]:
             out["gen_tokens_per_s"] = 0.0  # counter reset
         else:
             out["gen_tokens_per_s"] = round(
                 max(0.0, gen_total - prev["gen"]) / elapsed, 1)
-        if prompt_total < prev.get("prompt", 0):
+    if rate_ok and prompt_total is not None and prev.get("prompt") is not None:
+        if prompt_total < prev["prompt"]:
             out["prompt_tokens_per_s"] = 0.0  # counter reset
         else:
             out["prompt_tokens_per_s"] = round(
