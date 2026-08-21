@@ -736,7 +736,7 @@ function updateGPUs(gpus) {
           </div>
           <div class="gauge">
             <div class="gauge-value" id="gpu-mem-${gpu.index}">–</div>
-            <div class="gauge-label">Mem %</div>
+            <div class="gauge-label" id="gpu-mem-label-${gpu.index}">Mem %</div>
           </div>
           <div class="gauge">
             <div class="gauge-value" id="gpu-temp-${gpu.index}">–</div>
@@ -766,16 +766,30 @@ function updateGPUs(gpus) {
     const tempEl  = document.getElementById(`gpu-temp-${gpu.index}`);
     const clockEl = document.getElementById(`gpu-clock-${gpu.index}`);
 
-    utilEl.textContent  = `${gpu.utilization_pct}%`;
+    /* Gauges: JetPack omits fields it cannot source (late boot, no sensor,
+       N/A from nvidia-smi) — render '–' instead of 'undefined'. */
+    utilEl.textContent  = gpu.utilization_pct != null ? `${gpu.utilization_pct}%` : '–';
     utilEl.style.color  = colorFor(gpu.utilization_pct);
 
-    memEl.textContent   = `${gpu.memory_pct}%`;
+    memEl.textContent   = gpu.memory_pct != null ? `${gpu.memory_pct}%` : '–';
     memEl.style.color   = colorFor(gpu.memory_pct);
 
-    tempEl.textContent  = `${gpu.temperature_c}°C`;
-    tempEl.style.color  = gpu.temperature_c > 85 ? '#ef4444' : gpu.temperature_c > 70 ? '#eab308' : '#22c55e';
+    tempEl.textContent  = gpu.temperature_c != null ? `${gpu.temperature_c}°C` : '–';
+    tempEl.style.color  = gpu.temperature_c != null
+      ? (gpu.temperature_c > 85 ? '#ef4444' : gpu.temperature_c > 70 ? '#eab308' : '#22c55e')
+      : '';
 
     clockEl.textContent = gpu.graphics_clock_mhz != null ? `${gpu.graphics_clock_mhz}` : '–';
+
+    /* JetPack: the memory gauge shows the unified CPU/OS/GPU pool */
+    const memLabelEl = document.getElementById(`gpu-mem-label-${gpu.index}`);
+    if (gpu.memory_unified === true) {
+      memLabelEl.textContent = 'Unified mem %';
+      memLabelEl.title = 'Shared system memory (CPU+OS+GPU)';
+    } else {
+      memLabelEl.textContent = 'Mem %';
+      memLabelEl.title = '';
+    }
 
     const powerEl = document.getElementById(`gpu-power-${gpu.index}`);
     const powerLabelEl = document.getElementById(`gpu-power-label-${gpu.index}`);

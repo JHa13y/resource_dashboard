@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
 import queue
 import sys
@@ -15,6 +16,7 @@ import threading
 import time
 import urllib.error
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import psutil
@@ -2766,3 +2768,417 @@ def test_snapshot_schema_llm_key_singular():
     assert "llm_enabled" in snapshot
     assert snapshot["llm"]["backend"] == "vllm"
     assert "backend" in snapshot["llm"]
+
+
+# ---------------------------------------------------------------------------
+# JetPack platform detection + integrated-GPU collection
+# ---------------------------------------------------------------------------
+
+_MEMINFO_16GB = (
+    "MemTotal:        16777216 kB\n"
+    "MemFree:         2000000 kB\n"
+    "MemAvailable:     8388608 kB\n"
+)
+
+
+@pytest.fixture
+def platform_env(tmp_path, monkeypatch):
+    """Point all platform-detection inputs at an empty tmp tree, reset the
+    lazy platform globals, and pin a deterministic non-tegra kernel."""
+    import app
+
+    monkeypatch.setattr(app, "_PLATFORM", None)
+    monkeypatch.setattr(app, "_JETSON_SOC", None)
+    dt = tmp_path / "dt"
+    dt.mkdir()
+    monkeypatch.setattr(app, "_DT_MODEL_PATHS", (str(dt / "model"),))
+    monkeypatch.setattr(app, "_DT_COMPATIBLE_PATHS", (str(dt / "compatible"),))
+    monkeypatch.setattr(app, "_NV_TEGRA_RELEASE_PATH", str(tmp_path / "nv_tegra_release"))
+    monkeypatch.setattr("platform.release", lambda: "6.8.0-test")
+    return SimpleNamespace(
+        model=dt / "model",
+        compatible=dt / "compatible",
+        nv_tegra_release=tmp_path / "nv_tegra_release",
+    )
+
+
+@pytest.fixture
+def jetson_env(tmp_path, monkeypatch):
+    """Reset jetson globals to a known state; provide empty fake sysfs dirs
+    and a 16 GiB unified-pool meminfo (8 GiB available → 50 % used)."""
+    import app
+
+    monkeypatch.setattr(app, "_PLATFORM", "jetson")
+    monkeypatch.setattr(app, "_JETSON_SOC", "orin")
+    monkeypatch.setattr(app, "_jetson_devfreq_cache", None)
+    monkeypatch.setattr(app, "_jetson_mode_logged", True)  # keep logs quiet
+    devfreq = tmp_path / "devfreq"
+    devfreq.mkdir()
+    thermal = tmp_path / "thermal"
+    thermal.mkdir()
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text(_MEMINFO_16GB)
+
+    def args():
+        return dict(
+            devfreq_dir=str(devfreq),
+            meminfo_path=str(meminfo),
+            thermal_dir=str(thermal),
+        )
+
+    return SimpleNamespace(devfreq=devfreq, thermal=thermal, meminfo=meminfo, args=args)
+
+
+def _add_gpu_node(env, name="17000000.gpu", load=None, cur_freq=None):
+    node = env.devfreq / name
+    node.mkdir()
+    if cur_freq is not None:
+        (node / "cur_freq").write_text(f"{cur_freq}\n")
+    if load is not None:
+        (node / "device").mkdir()
+        (node / "device" / "load").write_text(f"{load}\n")
+    return node
+
+
+def _add_zone(env, idx, ztype, temp):
+    zone = env.thermal / f"thermal_zone{idx}"
+    zone.mkdir()
+    (zone / "type").write_text(f"{ztype}\n")
+    (zone / "temp").write_text(f"{temp}\n")
+    return zone
+
+
+# -- platform detection ------------------------------------------------------
+
+
+def test_platform_desktop_no_signals(platform_env):
+    import app
+
+    assert app._init_platform() == "desktop"
+    assert app._JETSON_SOC == "unknown"
+
+
+def test_platform_model_jetson(platform_env):
+    import app
+
+    platform_env.model.write_bytes(b"NVIDIA Jetson AGX Orin Developer Kit\x00")
+    assert app._init_platform() == "jetson"
+
+
+def test_platform_model_orin_nx_without_jetson_word(platform_env):
+    """Vendor-board model string without the literal "Jetson" (oracle m5)."""
+    import app
+
+    platform_env.model.write_bytes(b"NVIDIA Orin NX Developer Kit\x00")
+    assert app._init_platform() == "jetson"
+
+
+def test_platform_model_thor_without_nvidia_is_desktop(platform_env):
+    """Custom board with "thor" in the model but no nvidia co-occurrence →
+    desktop (oracle m1 false-positive guard)."""
+    import app
+
+    platform_env.model.write_bytes(b"Acme Thor Developer Board\x00")
+    assert app._init_platform() == "desktop"
+
+
+def test_platform_compatible_only(platform_env):
+    import app
+
+    platform_env.compatible.write_bytes(
+        b"nvidia,p4071-0000+p3834-0008\x00nvidia,tegra264\x00"
+    )
+    assert app._init_platform() == "jetson"
+    assert app._JETSON_SOC == "thor"
+
+
+def test_platform_nv_tegra_release_fallback(platform_env):
+    import app
+
+    platform_env.nv_tegra_release.write_text(
+        "# R38 (release), REVISION: 2.1, GCID: 1234567, EABI: aarch64\n"
+    )
+    assert app._init_platform() == "jetson"
+    assert app._JETSON_SOC == "unknown"
+
+
+def test_platform_tegra_kernel_fallback(platform_env, monkeypatch):
+    import app
+
+    monkeypatch.setattr("platform.release", lambda: "6.8.12-1021-tegra")
+    assert app._init_platform() == "jetson"
+
+
+def test_platform_unreadable_model_file_skipped(platform_env):
+    """An unreadable model path (a directory) is an OSError → skipped."""
+    import app
+
+    platform_env.model.mkdir()  # open() raises IsADirectoryError
+    assert app._init_platform() == "desktop"
+
+
+def test_platform_result_cached(platform_env):
+    """Detection runs once; later file changes do not re-detect."""
+    import app
+
+    assert app._init_platform() == "desktop"
+    platform_env.model.write_bytes(b"NVIDIA Jetson AGX Orin Developer Kit\x00")
+    assert app._init_platform() == "desktop"
+    assert app._JETSON_SOC == "unknown"
+
+
+# -- SoC parse + board label ---------------------------------------------------
+
+
+def test_soc_from_compatible_tegra264_is_thor():
+    from app import _soc_from_compatible
+
+    assert _soc_from_compatible(b"nvidia,p4071+p3834\x00nvidia,tegra264\x00") == "thor"
+
+
+def test_soc_from_compatible_tegra234_is_orin():
+    from app import _soc_from_compatible
+
+    assert _soc_from_compatible(b"nvidia,orin-nx-nv\x00nvidia,tegra234\x00") == "orin"
+
+
+def test_soc_from_compatible_garbage_is_unknown():
+    from app import _soc_from_compatible
+
+    assert _soc_from_compatible(b"nvidia,tegra210\x00") == "unknown"
+    assert _soc_from_compatible(b"") == "unknown"
+
+
+def test_board_label_soc_names(platform_env, monkeypatch):
+    import app
+
+    monkeypatch.setattr(app, "_JETSON_SOC", "thor")
+    assert app._jetson_board_label() == "NVIDIA Thor"
+    monkeypatch.setattr(app, "_JETSON_SOC", "orin")
+    assert app._jetson_board_label() == "NVIDIA Orin"
+    monkeypatch.setattr(app, "_JETSON_SOC", "unknown")
+    platform_env.model.write_bytes(b"NVIDIA Jetson AGX Thor Developer Kit\x00")
+    assert app._jetson_board_label() == "NVIDIA Jetson AGX Thor Developer Kit"
+    platform_env.model.write_bytes(b"")
+    assert app._jetson_board_label() == "NVIDIA Jetson"
+
+
+# -- jetson collector ----------------------------------------------------------
+
+
+def test_jetson_orin_happy_path(jetson_env):
+    from app import collect_jetson_gpu_metrics
+
+    _add_gpu_node(jetson_env, load=420, cur_freq=1_365_000_000)
+    _add_zone(jetson_env, 1, "gpu-thermal", 54_500)
+    result = collect_jetson_gpu_metrics(**jetson_env.args())
+
+    assert len(result) == 1
+    gpu = result[0]
+    assert gpu["index"] == 0
+    assert gpu["name"] == "NVIDIA Orin"
+    assert gpu["memory_unified"] is True
+    assert gpu["utilization_pct"] == 42.0
+    assert gpu["memory_total_gb"] == 16.0
+    assert gpu["memory_used_gb"] == 8.0
+    assert gpu["memory_pct"] == 50.0
+    assert gpu["temperature_c"] == 54.5
+    assert gpu["graphics_clock_mhz"] == 1365.0
+    # Intentionally absent on JetPack (renderer-tolerated)
+    for key in ("pci_bus_id", "board_vendor", "throttle", "power_w",
+                "power_limit_w"):
+        assert key not in gpu
+
+
+def test_jetson_util_prefers_load_file_over_smi(jetson_env, no_real_nvidia,
+                                                monkeypatch):
+    """Capability rule: a devfreq node with device/load wins even on Thor."""
+    import app
+
+    monkeypatch.setattr(app, "_JETSON_SOC", "thor")
+    _add_gpu_node(jetson_env, name="gpu-gpc-0", load=330, cur_freq=1_500_000_000)
+    no_real_nvidia.return_value = MagicMock(stdout="99\n")
+    gpu = app.collect_jetson_gpu_metrics(**jetson_env.args())[0]
+
+    assert gpu["utilization_pct"] == 33.0
+    assert gpu["name"] == "NVIDIA Thor"
+    no_real_nvidia.assert_not_called()
+
+
+def test_jetson_thor_util_from_nvidia_smi(jetson_env, no_real_nvidia,
+                                          monkeypatch):
+    """Thor without device/load falls back to nvidia-smi (tolerant parse)."""
+    import app
+
+    monkeypatch.setattr(app, "_JETSON_SOC", "thor")
+    _add_gpu_node(jetson_env, name="gpu-gpc-0", cur_freq=1_500_000_000)
+    no_real_nvidia.return_value = MagicMock(stdout="73\n")
+    gpu = app.collect_jetson_gpu_metrics(**jetson_env.args())[0]
+
+    assert gpu["utilization_pct"] == 73.0
+    assert gpu["graphics_clock_mhz"] == 1500.0
+    no_real_nvidia.assert_called_once()
+
+
+def test_jetson_thor_nvidia_smi_na_omits_util(jetson_env, no_real_nvidia,
+                                              monkeypatch):
+    import app
+
+    monkeypatch.setattr(app, "_JETSON_SOC", "thor")
+    _add_gpu_node(jetson_env, name="gpu-gpc-0", cur_freq=1_500_000_000)
+    _add_zone(jetson_env, 1, "gpu-thermal", 49_000)
+    no_real_nvidia.return_value = MagicMock(stdout="N/A\n")
+    gpu = app.collect_jetson_gpu_metrics(**jetson_env.args())[0]
+
+    assert "utilization_pct" not in gpu
+    # Everything else still present
+    assert gpu["graphics_clock_mhz"] == 1500.0
+    assert gpu["temperature_c"] == 49.0
+    assert gpu["memory_pct"] == 50.0
+
+
+def test_jetson_orin_no_node_omits_util_not_zero(jetson_env, no_real_nvidia):
+    """Late-boot Orin (no devfreq node yet): util omitted, never 0, never CLI."""
+    import app
+
+    _add_zone(jetson_env, 1, "gpu-thermal", 45_000)
+    gpu = app.collect_jetson_gpu_metrics(**jetson_env.args())[0]
+
+    assert "utilization_pct" not in gpu
+    assert "graphics_clock_mhz" not in gpu
+    assert gpu["temperature_c"] == 45.0
+    no_real_nvidia.assert_not_called()
+
+
+def test_jetson_devfreq_late_boot_not_cached_absent(jetson_env):
+    """Node absent on tick 1, present on tick 2 → picked up (no cached
+    absence)."""
+    import app
+
+    first = app.collect_jetson_gpu_metrics(**jetson_env.args())[0]
+    assert "utilization_pct" not in first
+
+    _add_gpu_node(jetson_env, load=500, cur_freq=1_000_000_000)
+    second = app.collect_jetson_gpu_metrics(**jetson_env.args())[0]
+    assert second["utilization_pct"] == 50.0
+    assert second["graphics_clock_mhz"] == 1000.0
+    assert app._jetson_devfreq_cache == "17000000.gpu"
+
+
+def test_jetson_devfreq_strict_pattern(jetson_env):
+    """Non-matching devfreq names are ignored (no loose 'contains gpu')."""
+    import app
+
+    _add_gpu_node(jetson_env, name="foo-gpu-bar", cur_freq=1_000_000_000)
+    gpu = app.collect_jetson_gpu_metrics(**jetson_env.args())[0]
+
+    assert "graphics_clock_mhz" not in gpu
+    assert "utilization_pct" not in gpu
+    assert app._jetson_devfreq_cache is None
+
+
+def test_jetson_thermal_max_and_filtering(jetson_env):
+    import app
+
+    _add_zone(jetson_env, 0, "tj-thermal", 90_000)      # wrong type
+    _add_zone(jetson_env, 1, "gpu-thermal", -256_000)   # no sensor
+    _add_zone(jetson_env, 2, "gpu-thermal", 50_000)
+    _add_zone(jetson_env, 3, "gpu-thermal", 61_000)
+    _add_zone(jetson_env, 4, "cpu-thermal", 99_000)     # wrong type
+    gpu = app.collect_jetson_gpu_metrics(**jetson_env.args())[0]
+
+    assert gpu["temperature_c"] == 61.0
+
+
+def test_jetson_thermal_zone_missing_temp_skipped(jetson_env):
+    import app
+
+    zone = jetson_env.thermal / "thermal_zone5"
+    zone.mkdir()
+    (zone / "type").write_text("gpu-thermal\n")  # no temp file
+    _add_zone(jetson_env, 6, "gpu-thermal", 44_000)
+    gpu = app.collect_jetson_gpu_metrics(**jetson_env.args())[0]
+
+    assert gpu["temperature_c"] == 44.0
+
+
+def test_jetson_meminfo_missing_omits_mem_keys(jetson_env):
+    import app
+
+    gpu = app.collect_jetson_gpu_metrics(
+        devfreq_dir=str(jetson_env.devfreq),
+        meminfo_path=str(jetson_env.meminfo.parent / "no_meminfo"),
+        thermal_dir=str(jetson_env.thermal),
+    )[0]
+
+    for key in ("memory_total_gb", "memory_used_gb", "memory_pct"):
+        assert key not in gpu
+    assert gpu["memory_unified"] is True
+
+
+def test_jetson_all_absent_never_raises(jetson_env):
+    import app
+
+    gpu = app.collect_jetson_gpu_metrics(
+        devfreq_dir=str(jetson_env.devfreq),  # empty dir
+        meminfo_path=str(jetson_env.meminfo.parent / "no_meminfo"),
+        thermal_dir=str(jetson_env.thermal),  # empty dir
+    )[0]
+
+    assert gpu == {"index": 0, "name": "NVIDIA Orin", "memory_unified": True}
+
+
+# -- collect_gpu_metrics gate --------------------------------------------------
+
+
+def test_gpu_metrics_gate_jetson_skips_desktop_paths(jetson_env, no_real_nvidia,
+                                                    monkeypatch):
+    """Platform "jetson" ⇒ _gpu_pynvml and _gpu_cli are never called."""
+    import app
+
+    calls = []
+    monkeypatch.setattr(app, "_gpu_pynvml",
+                        lambda: calls.append("pynvml") or [{"index": 9}])
+    monkeypatch.setattr(app, "_gpu_cli",
+                        lambda: calls.append("cli") or [{"index": 9}])
+    # The no-arg call inside collect_gpu_metrics() binds the path defaults at
+    # def-time, so re-pointing the module constants is inert - patch the
+    # function's __defaults__ instead (keeps the test hermetic: the fake
+    # meminfo below is what feeds the assertions, not the host's /sys).
+    monkeypatch.setattr(
+        app.collect_jetson_gpu_metrics, "__defaults__",
+        (str(jetson_env.devfreq), str(jetson_env.meminfo),
+         str(jetson_env.thermal)))
+    result = app.collect_gpu_metrics()
+
+    assert calls == []
+    no_real_nvidia.assert_not_called()
+    assert len(result) == 1
+    assert result[0]["name"] == "NVIDIA Orin"
+    assert result[0]["memory_unified"] is True
+    # Fake 16 GiB pool, 8 GiB available -> proves the fixture paths are live.
+    assert result[0]["memory_pct"] == 50.0
+
+
+def test_gpu_metrics_gate_desktop_unchanged(platform_env, no_real_nvidia,
+                                            monkeypatch):
+    import app
+
+    assert app._init_platform() == "desktop"
+    monkeypatch.setattr(app, "_gpu_pynvml", lambda: [{"index": 0, "name": "fake"}])
+    result = app.collect_gpu_metrics()
+
+    assert result == [{"index": 0, "name": "fake"}]
+    no_real_nvidia.assert_not_called()
+
+
+def test_gpu_metrics_jetson_mode_logged_once(jetson_env, monkeypatch, caplog):
+    import app
+
+    monkeypatch.setattr(app, "_jetson_mode_logged", False)
+    with caplog.at_level(logging.INFO):
+        app.collect_gpu_metrics()
+        app.collect_gpu_metrics()
+
+    msgs = [r.getMessage() for r in caplog.records]
+    assert sum("GPU mode: jetson (SoC: orin)" in m for m in msgs) == 1
