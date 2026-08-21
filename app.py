@@ -18,7 +18,9 @@ import io
 import json
 import logging
 import os
+import platform
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -302,8 +304,336 @@ def _gpu_cli() -> list[dict[str, Any]]:
     return gpus
 
 
+# ---------------------------------------------------------------------------
+# JetPack (Orin / Thor) platform detection + integrated-GPU collection
+# ---------------------------------------------------------------------------
+#
+# JetPack boards are unified-memory SoCs: NVML is unsupported (Orin) or
+# mostly "Not Supported" (Thor), and the Orin nvidia-smi stub reports
+# plausible-looking junk (0% utilisation, N/A memory). The honest sources
+# there are sysfs (devfreq ``device/load`` / ``cur_freq``, the ``gpu-thermal``
+# zone) and /proc/meminfo (the single DRAM pool shared by CPU, OS and GPU —
+# vLLM weights + KV cache live there). On Thor only, nvidia-smi is a
+# usable utilisation source. See research_jetpack_gpu.md for the evidence.
+
+# Lazy, resettable platform cache — filled on the first
+# collect_gpu_metrics() call, never at import (importing app.py must stay
+# side-effect-free; the test suite imports it on macOS where /proc is
+# absent). Test reset: monkeypatch.setattr(app, "_PLATFORM", None) — and
+# likewise "_JETSON_SOC", "_jetson_devfreq_cache", "_jetson_mode_logged".
+_PLATFORM: str | None = None      # "desktop" | "jetson"
+_JETSON_SOC: str | None = None    # "thor" | "orin" | "unknown"
+
+# Real paths — module constants so tests can point them at temp files
+# (same injectable-path seam as collect_host_health_metrics' psi_mem_path).
+_DT_MODEL_PATHS = (
+    "/proc/device-tree/model",
+    "/sys/firmware/devicetree/base/model",
+)
+_DT_COMPATIBLE_PATHS = (
+    "/proc/device-tree/compatible",
+    "/sys/firmware/devicetree/base/compatible",
+)
+_NV_TEGRA_RELEASE_PATH = "/etc/nv_tegra_release"
+_DEVFREQ_DIR = "/sys/class/devfreq"
+_MEMINFO_PATH = "/proc/meminfo"
+_THERMAL_DIR = "/sys/class/thermal"
+
+
+def _read_dt_string(path: str) -> str:
+    """Read a NUL-padded device-tree string file; '' on any error."""
+    try:
+        with open(path, "rb") as f:
+            return f.read().rstrip(b"\x00").decode(errors="replace")
+    except OSError:
+        return ""
+
+
+def _read_dt_bytes(path: str) -> bytes:
+    """Read a raw device-tree blob (e.g. ``compatible``); b'' on error."""
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return b""
+
+
+def _soc_from_compatible(compatible: bytes) -> str:
+    """Parse the SoC id from a device-tree ``compatible`` blob.
+
+    The NUL-separated list ends with the SoC id (``nvidia,tegra234`` =
+    Orin, ``nvidia,tegra264`` = Thor). Returns "thor" / "orin" /
+    "unknown" — never raises.
+    """
+    if b"nvidia,tegra264" in compatible:
+        return "thor"
+    if b"nvidia,tegra234" in compatible:
+        return "orin"
+    return "unknown"
+
+
+def _init_platform() -> str:
+    r"""Detect "desktop" vs "jetson" once and cache it in the globals.
+
+    Cascade (each step best-effort; missing/unreadable files are skipped):
+    1. device-tree ``model`` must contain BOTH "nvidia" and one of
+       "jetson"/"orin"/"thor" (case-insensitive) — the nvidia
+       co-occurrence guard keeps custom aarch64 boards out.
+    2. device-tree ``compatible`` contains "nvidia,tegra" (the stable SoC
+       discriminator; covers vendor boards and model-string gaps).
+    3. ``/etc/nv_tegra_release`` first line matches ``R\d+`` (survives
+       apt-based L4T updates that can drop the file's location).
+    4. "tegra" in the kernel release (visible in containers where the
+       device-tree is hidden).
+    """
+    global _PLATFORM, _JETSON_SOC
+    if _PLATFORM is not None:
+        return _PLATFORM
+
+    model = ""
+    for path in _DT_MODEL_PATHS:
+        model = _read_dt_string(path)
+        if model:
+            break
+
+    compatible = b""
+    for path in _DT_COMPATIBLE_PATHS:
+        compatible = _read_dt_bytes(path)
+        if compatible:
+            break
+
+    if (
+        model
+        and re.search(r"nvidia", model, re.I)
+        and re.search(r"jetson|orin|thor", model, re.I)
+    ):
+        _PLATFORM = "jetson"
+    elif b"nvidia,tegra" in compatible:
+        _PLATFORM = "jetson"
+    else:
+        found = False
+        try:
+            with open(_NV_TEGRA_RELEASE_PATH) as f:
+                found = bool(re.search(r"R\d+", f.readline()))
+        except OSError:
+            pass
+        if not found:
+            try:
+                found = "tegra" in platform.release()
+            except Exception:  # noqa: BLE001 – detection must never raise
+                pass
+        _PLATFORM = "jetson" if found else "desktop"
+
+    _JETSON_SOC = _soc_from_compatible(compatible)
+    return _PLATFORM
+
+
+def _jetson_board_label() -> str:
+    """Name for the JetPack GPU card: SoC first, device-tree model next."""
+    if _JETSON_SOC == "thor":
+        return "NVIDIA Thor"
+    if _JETSON_SOC == "orin":
+        return "NVIDIA Orin"
+    for path in _DT_MODEL_PATHS:
+        model = _read_dt_string(path)
+        if model:
+            return model
+    return "NVIDIA Jetson"
+
+
+_jetson_devfreq_cache: str | None = None  # resolved node name; never caches absence
+
+
+def _jetson_devfreq_node(devfreq_dir: str) -> str | None:
+    r"""Resolve the nvgpu devfreq node name (late-boot safe).
+
+    Strict patterns over a sorted listing: ``^gpu-gpc-\d+$`` (Thor) or a
+    name ending ``.gpu`` (Orin, e.g. ``17000000.gpu``). The node appears
+    seconds after boot, so the resolved name is cached once found but
+    absence is never cached. No locking needed — the collector is
+    single-threaded (MetricsCollector.run).
+    """
+    global _jetson_devfreq_cache
+    if _jetson_devfreq_cache is not None:
+        return _jetson_devfreq_cache
+    try:
+        entries = sorted(os.listdir(devfreq_dir))
+    except OSError:
+        return None
+    for name in entries:
+        if re.fullmatch(r"gpu-gpc-\d+", name) or name.endswith(".gpu"):
+            _jetson_devfreq_cache = name
+            return name
+    return None
+
+
+def _read_int_file(path: str) -> int | None:
+    """Read a single-integer sysfs file; None on any error."""
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _jetson_thor_utilization() -> float | None:
+    """GPU utilization % from nvidia-smi on Thor (the only SoC that shells out).
+
+    2 s timeout (a wedged CLI stalls the snapshot by at most that long —
+    same class as the desktop path, and the SSE queue holds the last
+    payload). "N/A" / "[Not Supported]" / non-numeric output → None.
+    """
+    try:
+        result = subprocess.run(  # noqa: S603 – static args only
+            [
+                "nvidia-smi",
+                "--query-gpu=utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    try:
+        return round(float(result.stdout.split(",")[0].strip()), 1)
+    except ValueError:
+        return None
+
+
+def _read_unified_mem_gb(meminfo_path: str) -> tuple[float, float] | None:
+    """(total, used) GiB of the unified DRAM pool from /proc/meminfo.
+
+    used = MemTotal − MemAvailable — the pool shared by CPU, OS and GPU,
+    so CUDA weights and the vLLM KV cache show up here. None when the
+    file is missing or incomplete.
+    """
+    try:
+        with open(meminfo_path) as f:
+            text = f.read()
+    except OSError:
+        return None
+    kb: dict[str, float] = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] in ("MemTotal:", "MemAvailable:"):
+            try:
+                kb[parts[0]] = float(parts[1])  # kB
+            except ValueError:
+                return None
+    if "MemTotal:" not in kb or "MemAvailable:" not in kb:
+        return None
+    total = kb["MemTotal:"]
+    used = max(total - kb["MemAvailable:"], 0.0)
+    return total / 1024**2, used / 1024**2
+
+
+def _jetson_gpu_temp_c(thermal_dir: str) -> float | None:
+    """Max °C across thermal zones whose ``type`` file says ``gpu-thermal``.
+
+    Zones are matched by their ``type`` file, never by index (indices
+    shift between SoCs/boards); ``temp < 0`` (−256000 = no sensor) is
+    skipped. None when no zone qualifies.
+    """
+    try:
+        zones = sorted(os.listdir(thermal_dir))
+    except OSError:
+        return None
+    temps: list[float] = []
+    for zone in zones:
+        if not zone.startswith("thermal_zone"):
+            continue
+        try:
+            with open(os.path.join(thermal_dir, zone, "type")) as f:
+                if f.read().strip() != "gpu-thermal":
+                    continue
+            with open(os.path.join(thermal_dir, zone, "temp")) as f:
+                temp = int(f.read().strip())  # millidegrees C
+        except (OSError, ValueError):
+            continue
+        if temp < 0:
+            continue
+        temps.append(temp / 1000.0)
+    if not temps:
+        return None
+    return round(max(temps), 1)
+
+
+def collect_jetson_gpu_metrics(
+    devfreq_dir: str = _DEVFREQ_DIR,
+    meminfo_path: str = _MEMINFO_PATH,
+    thermal_dir: str = _THERMAL_DIR,
+) -> list[dict[str, Any]]:
+    """Collect the single integrated GPU's metrics on JetPack (Orin/Thor).
+
+    pynvml and the desktop nvidia-smi path are NOT used here (NVML is
+    unsupported on Orin / mostly NotSupported on Thor; the Orin nvidia-smi
+    stub reports plausible junk). Memory is the unified DRAM pool
+    (``memory_unified: true``). Utilization is chosen per tick by
+    capability: devfreq ``device/load`` (any SoC with an nvgpu sysfs) →
+    known-Thor nvidia-smi → omitted (never a false 0). Never raises;
+    absent sources are omitted per the house rule. The path arguments are
+    injectable for tests (real paths are the module defaults).
+    """
+    _init_platform()
+    gpu: dict[str, Any] = {
+        "index": 0,
+        "name": _jetson_board_label(),
+        "memory_unified": True,
+    }
+
+    # Unified memory pool (CPU + OS + CUDA weights + vLLM KV cache).
+    mem = _read_unified_mem_gb(meminfo_path)
+    if mem is not None:
+        total_gb, used_gb = mem
+        gpu["memory_total_gb"] = round(total_gb, 1)
+        gpu["memory_used_gb"] = round(used_gb, 1)
+        if total_gb > 0:
+            gpu["memory_pct"] = round(used_gb / total_gb * 100, 1)
+
+    # Utilization — per-tick capability rule (no SoC table).
+    node = _jetson_devfreq_node(devfreq_dir)
+    util: float | None = None
+    if node is not None:
+        load = _read_int_file(os.path.join(devfreq_dir, node, "device", "load"))
+        if load is not None:
+            util = round(load / 10.0, 1)  # load is 0–1000
+    if util is None and _JETSON_SOC == "thor":
+        util = _jetson_thor_utilization()
+    if util is not None:
+        gpu["utilization_pct"] = util
+
+    # Graphics clock (devfreq cur_freq, Hz → MHz).
+    if node is not None:
+        cur = _read_int_file(os.path.join(devfreq_dir, node, "cur_freq"))
+        if cur is not None:
+            gpu["graphics_clock_mhz"] = round(cur / 1e6, 1)
+
+    # Temperature (gpu-thermal zone).
+    temp = _jetson_gpu_temp_c(thermal_dir)
+    if temp is not None:
+        gpu["temperature_c"] = temp
+
+    return [gpu]
+
+
+_jetson_mode_logged = False
+
+
 def collect_gpu_metrics() -> list[dict[str, Any]]:
-    """Return GPU metrics via pynvml (preferred) or CLI fallback."""
+    """Return GPU metrics via the platform-appropriate collector.
+
+    JetPack (Orin/Thor): sysfs + unified memory — pynvml and the desktop
+    nvidia-smi path are skipped entirely. Desktop: pynvml (preferred) or
+    nvidia-smi CLI fallback, unchanged.
+    """
+    global _jetson_mode_logged
+    if _init_platform() == "jetson":
+        if not _jetson_mode_logged:
+            log.info("GPU mode: jetson (SoC: %s)", _JETSON_SOC)
+            _jetson_mode_logged = True
+        return collect_jetson_gpu_metrics()
     gpus = _gpu_pynvml()
     if not gpus:
         gpus = _gpu_cli()
