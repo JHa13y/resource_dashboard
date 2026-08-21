@@ -2273,9 +2273,14 @@ def test_gpu_metrics_gate_jetson_skips_desktop_paths(jetson_env, no_real_nvidia,
                         lambda: calls.append("pynvml") or [{"index": 9}])
     monkeypatch.setattr(app, "_gpu_cli",
                         lambda: calls.append("cli") or [{"index": 9}])
-    monkeypatch.setattr(app, "_DEVFREQ_DIR", str(jetson_env.devfreq))
-    monkeypatch.setattr(app, "_MEMINFO_PATH", str(jetson_env.meminfo))
-    monkeypatch.setattr(app, "_THERMAL_DIR", str(jetson_env.thermal))
+    # The no-arg call inside collect_gpu_metrics() binds the path defaults at
+    # def-time, so re-pointing the module constants is inert - patch the
+    # function's __defaults__ instead (keeps the test hermetic: the fake
+    # meminfo below is what feeds the assertions, not the host's /sys).
+    monkeypatch.setattr(
+        app.collect_jetson_gpu_metrics, "__defaults__",
+        (str(jetson_env.devfreq), str(jetson_env.meminfo),
+         str(jetson_env.thermal)))
     result = app.collect_gpu_metrics()
 
     assert calls == []
@@ -2283,6 +2288,8 @@ def test_gpu_metrics_gate_jetson_skips_desktop_paths(jetson_env, no_real_nvidia,
     assert len(result) == 1
     assert result[0]["name"] == "NVIDIA Orin"
     assert result[0]["memory_unified"] is True
+    # Fake 16 GiB pool, 8 GiB available -> proves the fixture paths are live.
+    assert result[0]["memory_pct"] == 50.0
 
 
 def test_gpu_metrics_gate_desktop_unchanged(platform_env, no_real_nvidia,

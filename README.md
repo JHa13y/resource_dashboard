@@ -53,7 +53,7 @@ The dashboard auto-detects JetPack boards and switches to a sysfs-based GPU coll
 | Memory (unified) | `/proc/meminfo` — `MemTotal` / `MemAvailable` of the single DRAM pool shared by CPU, OS and GPU |
 | Temperature | `/sys/class/thermal/thermal_zone*/temp` of the zone whose `type` is `gpu-thermal` (matched by type, never by index; `−256000` "no sensor" readings are skipped) |
 | Graphics clock | devfreq node `cur_freq` (Orin: e.g. `17000000.gpu`; Thor: `gpu-gpc-0`) |
-| Name | SoC (`NVIDIA Thor` / `NVIDIA Orin`), falling back to the device-tree model string |
+| Name | SoC (`NVIDIA Thor` / `NVIDIA Orin`), falling back to the device-tree model string, then `NVIDIA Jetson` |
 
 **Intentionally absent on JetPack** (the UI renders `–`): power draw / power limit, thermal-throttle badges, PCIe bus id, board vendor. There is no reliable root-free source for rail power without a persistent `tegrastats` process (deferred to a future version); NVML power is NotSupported on Jetson.
 
