@@ -1274,9 +1274,12 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
     if prompt_last is not None:
         out["prompt_last"] = prompt_last
 
-    # Per-request prompt rate (see LLM_REQ_RATE_WINDOW): a task's prefill
-    # is complete when processed + cached tokens reach the task's prompt
-    # size (n_prompt_tokens = prompt + cache). The rate is prompt size /
+    # Per-request prompt rate (see LLM_REQ_RATE_WINDOW): a task completes
+    # when (a) processed + cached tokens reach the task's prompt size
+    # (n_prompt_tokens = prompt + cache), or (b) the slot goes idle
+    # (is_processing false) while still holding the task — the universal
+    # fallback, needed because some builds (LM Studio's llama.cpp) never
+    # advance n_prompt_tokens_processed. The rate is prompt size /
     # (first-sight .. completion) wall time; prefills shorter than
     # _LLAMA_MIN_PREFILL_S finish between scrapes and are skipped.
     new_slot_state: dict[Any, dict[str, Any]] = {}
@@ -1286,11 +1289,15 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
             entry = {"task_ts": p.get("task_ts", now),
                      "prefill_done": p.get("prefill_done", False)}
         else:
-            # A prefill already complete at first sight (fast prefill or
-            # full cache hit) cannot be timed: no sample.
-            entry = {"task_ts": now, "prefill_done": s["prompt_total"] > 0
-                     and s["prompt_processed"] + s["cached"]
-                     >= s["prompt_total"]}
+            # Already finished (or generation already running, or the slot
+            # is idle showing an old task) at first sight: cannot be
+            # timed, no sample.
+            entry = {"task_ts": now, "prefill_done":
+                     not s["is_processing"]
+                     or s["decoded"] > 0
+                     or (s["prompt_total"] > 0
+                         and s["prompt_processed"] + s["cached"]
+                         >= s["prompt_total"])}
         new_slot_state[s["id"]] = entry
     if prev_slot is not None:
         for s in slots:
@@ -1302,16 +1309,22 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
             total = s["prompt_total"]
             if total <= 0:
                 continue
-            if s["prompt_processed"] + s["cached"] < total:
+            # Prefill complete when: the counters say so (reference build),
+            # generation has started (n_decoded > 0 — the signal on builds
+            # that never advance n_prompt_tokens_processed), or the slot
+            # went idle with the task still held.
+            prefill_done = (
+                s["prompt_processed"] + s["cached"] >= total
+                or s["decoded"] > 0
+                or not s["is_processing"]
+            )
+            if not prefill_done:
                 continue  # prefill still in flight
-            # If the prefill already finished before first sight we cannot
-            # time it: record done, skip the sample.
-            if p.get("task_ts") is None or s["prompt_processed"] == 0:
-                new_slot_state[s["id"]]["prefill_done"] = True
-                continue
-            duration = now - p["task_ts"]
-            if duration >= _LLAMA_MIN_PREFILL_S:
-                _llama_req_rates.append(total / duration)
+            task_ts = p.get("task_ts")
+            if task_ts is not None:
+                duration = now - task_ts
+                if duration >= _LLAMA_MIN_PREFILL_S:
+                    _llama_req_rates.append(total / duration)
             new_slot_state[s["id"]]["prefill_done"] = True
 
     _llama_slot_prev = {

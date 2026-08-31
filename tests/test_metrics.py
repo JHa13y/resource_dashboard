@@ -840,14 +840,16 @@ def test_collect_llama_live_rate_from_slots():
         # No previous scrape yet -> counter-delta fallback (0 here)
         assert first["gen_tokens_per_s"] == 0.0
 
-        # 67 tokens decoded + 67 prompt tokens processed over 2 s
+        # 67 tokens decoded + 67 prompt tokens processed over 2 s.
+        # Generation has started (n_decoded > 0): prefill is done, so the
+        # prompt gauge switches to the per-request rate 100 tok / 2 s.
         clock.advance(2.0)
         state["slots"][0]["n_prompt_tokens_processed"] = 67
         state["slots"][0]["next_token"] = [{"n_decoded": 67}]
         second = collect_llama_metrics("http://127.0.0.1:9999")
 
     assert second["gen_tokens_per_s"] == 33.5
-    assert second["prompt_tokens_per_s"] == 33.5
+    assert second["prompt_tokens_per_s"] == 50.0
 
 
 def test_collect_llama_live_rate_task_reset_clamp():
@@ -1078,6 +1080,77 @@ def test_collect_llama_prompt_rate_skips_unmeasurable_prefills():
 
     assert first["prompt_tokens_per_s"] == 0.0
     assert second["prompt_tokens_per_s"] == 800.0
+
+
+def test_collect_llama_prompt_rate_lmstudio_idle_counters():
+    """LM Studio's llama.cpp never advances n_prompt_tokens_processed
+    (stays 0 even for 12k-token prompts) and resets it when the slot goes
+    idle: completion must be detected via n_decoded > 0 (generation start)
+    and the sample must not be skipped."""
+    from app import collect_llama_metrics
+
+    def lm_slot(task, processing, decoded):
+        return {"id": 0, "n_ctx": 131072, "n_prompt_tokens": 4000,
+                "n_prompt_tokens_processed": 0, "n_prompt_tokens_cache": 0,
+                "id_task": task, "is_processing": processing,
+                "next_token": [{"n_decoded": decoded,
+                                "n_remain": -1 if decoded == 0 else 9}]}
+
+    state = {"metrics": ("llamacpp:tokens_predicted_total 0\n"
+                         "llamacpp:prompt_tokens_total 0\n"),
+             "slots": [lm_slot(1, True, 0)]}
+
+    def fake_urlopen(url, timeout=None):
+        if url.endswith("/metrics"):
+            return _http_response(state["metrics"].encode())
+        if url.endswith("/props"):
+            return _http_response(b"{}")
+        return _http_response(json.dumps(state["slots"]).encode())
+
+    clock = _FakeClock()
+    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen), \
+         patch("app.time.monotonic", clock):
+        collect_llama_metrics("http://127.0.0.1:9999")  # t0: task starts
+        # t1: still mid-prefill (decoded 0) -> no sample yet
+        clock.advance(1.0)
+        r = collect_llama_metrics("http://127.0.0.1:9999")
+        # t2: first generated token -> prefill done: 4000 tok / 2 s
+        clock.advance(1.0)
+        state["slots"] = [lm_slot(1, True, 7)]
+        r = collect_llama_metrics("http://127.0.0.1:9999")
+        assert r["prompt_tokens_per_s"] == 2000.0
+        # t3: slot idle (counters reset to 0) -> rate holds
+        clock.advance(1.0)
+        state["slots"] = [lm_slot(1, False, 0)]
+        r = collect_llama_metrics("http://127.0.0.1:9999")
+        assert r["prompt_tokens_per_s"] == 2000.0
+
+
+def test_collect_llama_prompt_rate_idle_slot_at_first_sight():
+    """A slot that is idle at first sight (showing a finished task) must
+    not produce a bogus 1-scrape-interval sample."""
+    from app import collect_llama_metrics
+
+    state = {"metrics": ("llamacpp:tokens_predicted_total 0\n"
+                         "llamacpp:prompt_tokens_total 0\n"),
+             "slots": [_llama_slot_fixture(9, 12844, 0, 0, processing=False)]}
+
+    def fake_urlopen(url, timeout=None):
+        if url.endswith("/metrics"):
+            return _http_response(state["metrics"].encode())
+        if url.endswith("/props"):
+            return _http_response(b"{}")
+        return _http_response(json.dumps(state["slots"]).encode())
+
+    clock = _FakeClock()
+    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen), \
+         patch("app.time.monotonic", clock):
+        collect_llama_metrics("http://127.0.0.1:9999")
+        clock.advance(1.0)
+        r = collect_llama_metrics("http://127.0.0.1:9999")
+
+    # No sample recorded; gauge falls back to the (zero) live rate
+    assert r["prompt_tokens_per_s"] == 0.0
 
 
 def test_collect_llama_prompt_rate_cleared_on_counter_reset():
