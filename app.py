@@ -682,6 +682,18 @@ _llama_slot_prev: dict[str, Any] | None = None
 _LLAMA_DECODE_HISTORY_LEN = 10
 _llama_decode_history: list[tuple[float, float]] = []
 
+# Per-completed-request prompt-rate samples (tokens/s), kept for BOTH
+# llama and vLLM: the per-scrape delta spikes for one tick when a large
+# prompt prefills and then reads 0. The gauge reports the mean of the last
+# N completed requests instead, falling back to the per-scrape live rate
+# until the first measurable request completes.
+LLM_REQ_RATE_WINDOW = 5
+_llama_req_rates: deque[float] = deque(maxlen=LLM_REQ_RATE_WINDOW)
+_vllm_req_rates: deque[float] = deque(maxlen=LLM_REQ_RATE_WINDOW)
+# A prefill shorter than this cannot be measured at 1 s scrape cadence
+# (it finishes between two scrapes); such requests are skipped.
+_LLAMA_MIN_PREFILL_S = 0.25
+
 # Local llama-server process handle (T5): retained across scrapes so
 # cpu_percent(None) measures against the previous tick. A dead handle
 # (NoSuchProcess) is dropped and re-identified on the next scrape — a
@@ -979,11 +991,17 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
     windowed gauges are only a fallback for the first scrape (they read
     0 permanently on some builds, e.g. LM Studio's bundled llama.cpp).
 
+    ``prompt_tokens_per_s`` is the mean of the last LLM_REQ_RATE_WINDOW
+    completed-request rates (prompt size / prefill duration, tracked
+    per-slot) when any exist — the raw per-scrape delta only spikes for
+    one tick on a large prefill — else the per-scrape live rate.
+
     On a failed scrape the last successful snapshot is returned with
     ``status: "stale"`` for up to ``_LLAMA_STALE_MAX_AGE_S`` seconds so a
     transient timeout doesn't flicker the UI to "unreachable".
     """
     global _llama_prev, _llama_last_good, _llama_slot_prev, _llama_decode_history
+    global _llama_req_rates
 
     def _stale_or_none() -> dict[str, Any] | None:
         """Hold last-good data during a transient scrape failure."""
@@ -1038,6 +1056,13 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
     now = time.monotonic()
     prev = _llama_prev
     elapsed = now - prev["ts"] if prev is not None else 0.0
+    # A counter decrease means the server restarted/reloaded: the
+    # per-request prompt-rate history belongs to the old process.
+    if prev is not None and (
+        (gen_total is not None and gen_total < prev["gen"])
+        or (prompt_total is not None and prompt_total < prev["prompt"])
+    ):
+        _llama_req_rates.clear()
     if (
         prev is not None
         and gen_total is not None
@@ -1248,6 +1273,47 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
                 }
     if prompt_last is not None:
         out["prompt_last"] = prompt_last
+
+    # Per-request prompt rate (see LLM_REQ_RATE_WINDOW): a task's prefill
+    # is complete when processed + cached tokens reach the task's prompt
+    # size (n_prompt_tokens = prompt + cache). The rate is prompt size /
+    # (first-sight .. completion) wall time; prefills shorter than
+    # _LLAMA_MIN_PREFILL_S finish between scrapes and are skipped.
+    new_slot_state: dict[Any, dict[str, Any]] = {}
+    for s in slots:
+        p = prev_slot["slots"].get(s["id"]) if prev_slot is not None else None
+        if p is not None and p.get("id_task") == s["id_task"]:
+            entry = {"task_ts": p.get("task_ts", now),
+                     "prefill_done": p.get("prefill_done", False)}
+        else:
+            # A prefill already complete at first sight (fast prefill or
+            # full cache hit) cannot be timed: no sample.
+            entry = {"task_ts": now, "prefill_done": s["prompt_total"] > 0
+                     and s["prompt_processed"] + s["cached"]
+                     >= s["prompt_total"]}
+        new_slot_state[s["id"]] = entry
+    if prev_slot is not None:
+        for s in slots:
+            p = prev_slot["slots"].get(s["id"])
+            if p is None or p.get("id_task") != s["id_task"]:
+                continue  # new task (or first sight): no rate this scrape
+            if p.get("prefill_done"):
+                continue
+            total = s["prompt_total"]
+            if total <= 0:
+                continue
+            if s["prompt_processed"] + s["cached"] < total:
+                continue  # prefill still in flight
+            # If the prefill already finished before first sight we cannot
+            # time it: record done, skip the sample.
+            if p.get("task_ts") is None or s["prompt_processed"] == 0:
+                new_slot_state[s["id"]]["prefill_done"] = True
+                continue
+            duration = now - p["task_ts"]
+            if duration >= _LLAMA_MIN_PREFILL_S:
+                _llama_req_rates.append(total / duration)
+            new_slot_state[s["id"]]["prefill_done"] = True
+
     _llama_slot_prev = {
         "ts": now,
         "slots": {
@@ -1256,11 +1322,19 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
                 "prompt": s["prompt_processed"],
                 "cached": s["cached"],
                 "id_task": s["id_task"],
+                **new_slot_state[s["id"]],
             }
             for s in slots
         },
         "prompt_last": prompt_last,
     }
+
+    # Gauge value: mean of the last 5 completed-request prompt rates when
+    # available; otherwise the per-scrape live rate computed above.
+    if _llama_req_rates:
+        out["prompt_tokens_per_s"] = round(
+            sum(_llama_req_rates) / len(_llama_req_rates), 1
+        )
 
     _llama_last_good = (now, out)
     return out
@@ -1440,7 +1514,7 @@ def collect_vllm_metrics(base_url: str) -> dict[str, Any] | None:
     is a SUBSET of prompt_tokens_total (nested, not disjoint). Usage total is
     therefore ``prompt_total + gen_total`` (NOT + cached).
     """
-    global _vllm_last_good, _vllm_prev, _vllm_config_cache
+    global _vllm_last_good, _vllm_prev, _vllm_config_cache, _vllm_req_rates
 
     def _stale_or_none() -> dict[str, Any] | None:
         if _vllm_last_good is not None:
@@ -1563,6 +1637,7 @@ def collect_vllm_metrics(base_url: str) -> dict[str, Any] | None:
     if rate_ok and prompt_total is not None and prev.get("prompt") is not None:
         if prompt_total < prev["prompt"]:
             out["prompt_tokens_per_s"] = 0.0  # counter reset
+            _vllm_req_rates.clear()  # restart: history belongs to old proc
         else:
             out["prompt_tokens_per_s"] = round(
                 max(0.0, prompt_total - prev["prompt"]) / elapsed, 1)
@@ -1614,6 +1689,27 @@ def collect_vllm_metrics(base_url: str) -> dict[str, Any] | None:
     if e2e_sum is not None and e2e_count is not None and e2e_count > 0:
         out["e2e_latency_seconds"] = round(e2e_sum / e2e_count, 1)
 
+    # --- Prompt rate per completed request (see LLM_REQ_RATE_WINDOW) ---
+    # vLLM exposes no per-request prompt size/duration, so each scrape in
+    # which requests completed contributes one window sample:
+    # Δprompt_tokens / ΣTTFT (TTFT ≈ prefill + queue time). The gauge
+    # reports the mean of the last 5 samples, falling back to the raw
+    # per-scrape delta until the first completed request is observed.
+    if (rate_ok and req_success is not None
+            and prev.get("req_success") is not None
+            and ttft_sum is not None and prev.get("ttft_sum") is not None
+            and prompt_total is not None and prev.get("prompt") is not None):
+        d_req = req_success - prev["req_success"]
+        if d_req > 0:
+            d_ttft = max(0.0, ttft_sum - prev["ttft_sum"])
+            if d_ttft > 0:
+                d_prompt = max(0.0, prompt_total - prev["prompt"])
+                _vllm_req_rates.append(d_prompt / d_ttft)
+    if _vllm_req_rates:
+        out["prompt_tokens_per_s"] = round(
+            sum(_vllm_req_rates) / len(_vllm_req_rates), 1
+        )
+
     # --- Config (30 s cache) ---
     cfg_entry = _vllm_get_entry(metrics, "vllm:cache_config_info")
     if cfg_entry is not None and cfg_entry.get("series"):
@@ -1662,6 +1758,8 @@ def collect_vllm_metrics(base_url: str) -> dict[str, Any] | None:
         new_prev["ttft_sum"] = ttft_sum
     if ttft_count is not None:
         new_prev["ttft_count"] = ttft_count
+    if req_success is not None:
+        new_prev["req_success"] = req_success
     if itl_sum is not None:
         new_prev["itl_sum"] = itl_sum
     if itl_count is not None:
@@ -1921,7 +2019,7 @@ collector.start()
 @app.route("/")
 def index() -> str:
     """Serve the dashboard HTML page."""
-    return render_template("index.html")
+    return render_template("index.html", hostname=platform.node())
 
 
 @app.route("/events")

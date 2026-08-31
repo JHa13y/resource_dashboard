@@ -386,15 +386,18 @@ def reset_llama_prev():
     original_last_good = app_mod._llama_last_good
     original_slot_prev = app_mod._llama_slot_prev
     original_decode_history = app_mod._llama_decode_history
+    original_req_rates = app_mod._llama_req_rates
     app_mod._llama_prev = None
     app_mod._llama_last_good = None
     app_mod._llama_slot_prev = None
     app_mod._llama_decode_history = []
+    app_mod._llama_req_rates.clear()
     yield
     app_mod._llama_prev = original_prev
     app_mod._llama_last_good = original_last_good
     app_mod._llama_slot_prev = original_slot_prev
     app_mod._llama_decode_history = original_decode_history
+    app_mod._llama_req_rates.extend(original_req_rates)
 
 
 @pytest.fixture(autouse=True)
@@ -956,15 +959,146 @@ def test_collect_llama_live_rate_cached_reset_clamp():
         set_task(101, 0, 0, 0)
         second = collect_llama_metrics("http://127.0.0.1:9999")
 
-        # Same task: cached 0 -> 800, processed 0 -> 20 over 2 s
+        # Same task: cached 0 -> 800, processed 0 -> 20 over 2 s.
+        # processed + cached reaches the 800-token prompt: prefill done,
+        # per-request rate 800 tok / 2 s = 400 t/s replaces the delta.
         clock.advance(2.0)
         set_task(101, 20, 800, 30)
         third = collect_llama_metrics("http://127.0.0.1:9999")
 
     assert second["prompt_tokens_per_s"] == 0.0
     assert second["gen_tokens_per_s"] == 0.0
-    assert third["prompt_tokens_per_s"] == 410.0
+    assert third["prompt_tokens_per_s"] == 400.0
     assert third["gen_tokens_per_s"] == 15.0
+
+
+def _llama_slot_fixture(task, total, processed, cached, decoded=0,
+                        processing=True):
+    return {"id": 0, "n_ctx": 8192, "n_prompt_tokens": total,
+            "n_prompt_tokens_processed": processed,
+            "n_prompt_tokens_cache": cached, "id_task": task,
+            "is_processing": processing,
+            "next_token": [{"n_decoded": decoded}]}
+
+
+def test_collect_llama_prompt_rate_averages_completed_requests():
+    """prompt tokens/s is the mean of the last 5 completed prefills
+    (prompt size / prefill duration): a large prefill must not spike for
+    one scrape and then drop to 0, and the window must evict the oldest
+    sample after 5 requests."""
+    from app import collect_llama_metrics
+
+    state = {
+        "metrics": ("llamacpp:tokens_predicted_total 0\n"
+                    "llamacpp:prompt_tokens_total 0\n"),
+        "slots": [],
+    }
+
+    def fake_urlopen(url, timeout=None):
+        if url.endswith("/metrics"):
+            return _http_response(state["metrics"].encode())
+        if url.endswith("/props"):
+            return _http_response(b"{}")
+        return _http_response(json.dumps(state["slots"]).encode())
+
+    def run_request(task, total, per_step, steps):
+        """Run a request whose prefill reaches *total* after *steps*
+        scrapes of 1 s; returns the snapshot from the completing scrape.
+        Per-request rate is total / steps t/s."""
+        state["slots"] = [_llama_slot_fixture(task, total, 0, 0)]
+        collect_llama_metrics("http://127.0.0.1:9999")
+        r = None
+        for i in range(1, steps + 1):
+            clock.advance(1.0)
+            state["slots"] = [
+                _llama_slot_fixture(task, total, min(per_step * i, total), 0)
+            ]
+            r = collect_llama_metrics("http://127.0.0.1:9999")
+        return r
+
+    clock = _FakeClock()
+    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen), \
+         patch("app.time.monotonic", clock):
+        # Req 1: 4000 tok over 4 s -> 1000 t/s
+        r = run_request(1, 4000, 1000, 4)
+        assert r["prompt_tokens_per_s"] == 1000.0
+        # Slot goes idle: the rate HOLDS (mean of 1 sample) instead of
+        # dropping to 0 for the rest of the idle period.
+        clock.advance(1.0)
+        state["slots"] = [
+            _llama_slot_fixture(1, 4000, 4000, 0, processing=False)
+        ]
+        r = collect_llama_metrics("http://127.0.0.1:9999")
+        assert r["prompt_tokens_per_s"] == 1000.0
+
+        # Req 2: 8000 tok over 4 s -> 2000 t/s; mean(1000, 2000) = 1500
+        r = run_request(2, 8000, 2000, 4)
+        assert r["prompt_tokens_per_s"] == 1500.0
+        # Reqs 3-5: 300, 50, 1000 t/s
+        r = run_request(3, 1200, 300, 4)
+        r = run_request(4, 200, 50, 4)
+        r = run_request(5, 4000, 1000, 4)
+        # mean(1000, 2000, 300, 50, 1000) = 870
+        assert r["prompt_tokens_per_s"] == pytest.approx(870.0)
+        # Req 6: 2000 t/s; window evicts req 1 -> mean(2000, 300, 50,
+        # 1000, 2000) = 1070
+        r = run_request(6, 8000, 2000, 4)
+        assert r["prompt_tokens_per_s"] == pytest.approx(1070.0)
+
+
+def test_collect_llama_prompt_rate_skips_unmeasurable_prefills():
+    """Prefills that finish between scrapes (fast or fully cached) cannot
+    be timed: no sample is recorded and the gauge falls back to the
+    per-scrape live rate."""
+    from app import collect_llama_metrics
+
+    state = {
+        "metrics": ("llamacpp:tokens_predicted_total 0\n"
+                    "llamacpp:prompt_tokens_total 0\n"),
+        # Fast prefill: already complete at first sight
+        "slots": [_llama_slot_fixture(1, 100, 100, 0)],
+    }
+
+    def fake_urlopen(url, timeout=None):
+        if url.endswith("/metrics"):
+            return _http_response(state["metrics"].encode())
+        if url.endswith("/props"):
+            return _http_response(b"{}")
+        return _http_response(json.dumps(state["slots"]).encode())
+
+    clock = _FakeClock()
+    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen), \
+         patch("app.time.monotonic", clock):
+        first = collect_llama_metrics("http://127.0.0.1:9999")
+        # Fully cached request: complete at first sight, no sample; gauge
+        # shows the raw live rate (800 cached tokens / 1 s), not a mean.
+        clock.advance(1.0)
+        state["slots"] = [_llama_slot_fixture(2, 800, 0, 800)]
+        second = collect_llama_metrics("http://127.0.0.1:9999")
+
+    assert first["prompt_tokens_per_s"] == 0.0
+    assert second["prompt_tokens_per_s"] == 800.0
+
+
+def test_collect_llama_prompt_rate_cleared_on_counter_reset():
+    """A server restart (cumulative counters decrease) clears the
+    per-request history: the gauge falls back to the live rate."""
+    import app as app_mod
+    from app import collect_llama_metrics
+
+    app_mod._llama_req_rates.append(1000.0)  # pretend a request completed
+    app_mod._llama_prev = {"ts": 1000.0, "gen": 1000.0, "prompt": 1000.0}
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/metrics": ("llamacpp:tokens_predicted_total 100\n"
+                     "llamacpp:prompt_tokens_total 50\n").encode(),
+        "/props": b"{}",
+        "/slots": b"[]",
+    })):
+        result = collect_llama_metrics("http://127.0.0.1:9999")
+
+    # Restart detected (prev 1000 -> now 100): history cleared, no mean
+    assert list(app_mod._llama_req_rates) == []
+    assert result["prompt_tokens_per_s"] == 0.0
 
 
 def test_collect_llama_prompt_last_new_task():
@@ -1981,13 +2115,16 @@ def reset_vllm_state():
     original_prev = app_mod._vllm_prev
     original_last_good = app_mod._vllm_last_good
     original_config_cache = app_mod._vllm_config_cache
+    original_req_rates = app_mod._vllm_req_rates
     app_mod._vllm_prev = None
     app_mod._vllm_last_good = None
     app_mod._vllm_config_cache = None
+    app_mod._vllm_req_rates.clear()
     yield
     app_mod._vllm_prev = original_prev
     app_mod._vllm_last_good = original_last_good
     app_mod._vllm_config_cache = original_config_cache
+    app_mod._vllm_req_rates.extend(original_req_rates)
 
 
 def make_vllm_server(body: bytes, calls: list | None = None):
@@ -2193,6 +2330,51 @@ def test_collect_vllm_rates_across_two_scrapes():
 
     assert second["gen_tokens_per_s"] == 60.0  # 60 tokens / 1 s
     assert second["prompt_tokens_per_s"] == 80.0  # 80 tokens / 1 s
+
+
+def test_collect_vllm_prompt_rate_averages_completed_requests():
+    """prompt tokens/s is the mean of the last 5 completed-request windows
+    (Δprompt tokens / ΣTTFT), not the spiky per-scrape delta. TTFT ≈
+    prefill + queue time, so a window's sample is that window's effective
+    prompt rate."""
+    from app import collect_vllm_metrics
+
+    def body(gen, prompt, req, ttft_sum, ttft_count):
+        return (
+            f'vllm:generation_tokens_total{{engine="0",model_name="M"}} {gen}\n'
+            f'vllm:prompt_tokens_total{{engine="0",model_name="M"}} {prompt}\n'
+            f'vllm:request_success_total{{engine="0",model_name="M"}} {req}\n'
+            f'vllm:time_to_first_token_seconds_sum{{engine="0",model_name="M"}} {ttft_sum}\n'
+            f'vllm:time_to_first_token_seconds_count{{engine="0",model_name="M"}} {ttft_count}\n'
+        )
+
+    clock = _FakeClock()
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_vllm_server(body(0, 0, 0, 0.0, 0).encode())), \
+         patch("app.time.monotonic", clock):
+        first = collect_vllm_metrics("http://127.0.0.1:9999")
+    # First scrape: no prev -> rate omitted
+    assert "prompt_tokens_per_s" not in first
+
+    # Window 1: 3 requests, 600 prompt tokens, ΣTTFT 0.6 s -> 1000 t/s
+    # (raw delta would read 600 — the spike-then-0 pattern).
+    clock.advance(1.0)
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_vllm_server(
+                   body(10, 600, 3, 0.6, 3).encode())), \
+         patch("app.time.monotonic", clock):
+        second = collect_vllm_metrics("http://127.0.0.1:9999")
+    assert second["prompt_tokens_per_s"] == 1000.0
+
+    # Window 2: 2 requests, 700 tokens, ΣTTFT 1.4 s -> 500 t/s;
+    # gauge = mean(1000, 500) = 750 (raw delta would read 700).
+    clock.advance(1.0)
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_vllm_server(
+                   body(30, 1300, 5, 2.0, 5).encode())), \
+         patch("app.time.monotonic", clock):
+        third = collect_vllm_metrics("http://127.0.0.1:9999")
+    assert third["prompt_tokens_per_s"] == 750.0
 
 
 def test_collect_vllm_counter_reset_rebaselines():

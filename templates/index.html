@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Resource Dashboard</title>
+  <title>Resource Dashboard-{{ hostname }}</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
   <style>
     :root {
@@ -1011,15 +1011,15 @@ function updateLLM(m) {
     // The prompt rate counts cached + uncached tokens (server/CLI
     // accounting); the label shows the last prompt's size and cache share.
     document.getElementById('llama-prompt-label').textContent = m.prompt_last
-      ? `Prompt tokens/s · last ${fmtTok(m.prompt_last.total)} tok · ${m.prompt_last.pct_cached}% cached`
-      : `Prompt tokens/s · cached ${m.prompt_cached_tokens_per_s != null ? m.prompt_cached_tokens_per_s : '–'}`;
+      ? `Prompt tokens/s (last 5 reqs) · last ${fmtTok(m.prompt_last.total)} tok · ${m.prompt_last.pct_cached}% cached`
+      : `Prompt tokens/s (last 5 reqs) · cached ${m.prompt_cached_tokens_per_s != null ? m.prompt_cached_tokens_per_s : '–'}`;
     busyEl.textContent = `${m.requests_processing ?? 0}/${m.requests_deferred ?? 0}`;
     ctxEl.textContent = m.context_tokens_max != null ? m.context_tokens_max : '–';
     ctxEl.style.color = '';
     ctxLabelEl.textContent = 'Context high-water (tokens)';
   } else {
     // vLLM: KV cache % replaces context high-water
-    document.getElementById('llama-prompt-label').textContent = 'Prompt tokens/s';
+    document.getElementById('llama-prompt-label').textContent = 'Prompt tokens/s (last 5 reqs)';
     busyEl.textContent = `${m.requests_processing ?? 0}/${m.requests_waiting ?? 0}`;
     const kvPct = m.kv_cache_usage_pct;
     ctxEl.textContent = kvPct != null ? `${kvPct}%` : '–';
