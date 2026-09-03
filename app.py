@@ -992,9 +992,10 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
     0 permanently on some builds, e.g. LM Studio's bundled llama.cpp).
 
     ``prompt_tokens_per_s`` is the mean of the last LLM_REQ_RATE_WINDOW
-    completed-request rates (prompt size / prefill duration, tracked
-    per-slot) when any exist — the raw per-scrape delta only spikes for
-    one tick on a large prefill — else the per-scrape live rate.
+    completed-request rates (UNCACHED prompt tokens / prefill duration,
+    tracked per-slot — the speed llama-server itself logs) when any
+    exist; else the raw per-scrape delta, which spikes for one tick on a
+    large prefill and reads 0 afterwards.
 
     On a failed scrape the last successful snapshot is returned with
     ``status: "stale"`` for up to ``_LLAMA_STALE_MAX_AGE_S`` seconds so a
@@ -1322,8 +1323,20 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
             task_ts = p.get("task_ts")
             if task_ts is not None:
                 duration = now - task_ts
-                if duration >= _LLAMA_MIN_PREFILL_S:
-                    _llama_req_rates.append(total / duration)
+                # Sample the UNCACHED prompt rate (n_prompt_tokens_processed
+                # / wall time): this matches the speed llama-server itself
+                # logs ("prompt eval time = X ms / Y tokens"). Using the
+                # prompt total would count KV-cache hits as prefill work
+                # and inflate the rate to ~prompt size on mostly-cached
+                # requests (agentic workloads). Fully-cached requests do
+                # no prefill work: no sample.
+                if (
+                    duration >= _LLAMA_MIN_PREFILL_S
+                    and s["prompt_processed"] > 0
+                ):
+                    _llama_req_rates.append(
+                        s["prompt_processed"] / duration
+                    )
             new_slot_state[s["id"]]["prefill_done"] = True
 
     _llama_slot_prev = {
@@ -1715,8 +1728,16 @@ def collect_vllm_metrics(base_url: str) -> dict[str, Any] | None:
         if d_req > 0:
             d_ttft = max(0.0, ttft_sum - prev["ttft_sum"])
             if d_ttft > 0:
+                # Uncached tokens only (cached is a SUBSET of prompt
+                # total): mirrors the llama per-request semantics.
                 d_prompt = max(0.0, prompt_total - prev["prompt"])
-                _vllm_req_rates.append(d_prompt / d_ttft)
+                if (cached_total is not None
+                        and prev.get("cached") is not None):
+                    d_prompt = max(
+                        0.0, d_prompt - (cached_total - prev["cached"])
+                    )
+                if d_prompt > 0:
+                    _vllm_req_rates.append(d_prompt / d_ttft)
     if _vllm_req_rates:
         out["prompt_tokens_per_s"] = round(
             sum(_vllm_req_rates) / len(_vllm_req_rates), 1
@@ -1766,6 +1787,8 @@ def collect_vllm_metrics(base_url: str) -> dict[str, Any] | None:
         new_prev["gen"] = gen_total
     if prompt_total is not None:
         new_prev["prompt"] = prompt_total
+    if cached_total is not None:
+        new_prev["cached"] = cached_total
     if ttft_sum is not None:
         new_prev["ttft_sum"] = ttft_sum
     if ttft_count is not None:

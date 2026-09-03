@@ -842,14 +842,15 @@ def test_collect_llama_live_rate_from_slots():
 
         # 67 tokens decoded + 67 prompt tokens processed over 2 s.
         # Generation has started (n_decoded > 0): prefill is done, so the
-        # prompt gauge switches to the per-request rate 100 tok / 2 s.
+        # prompt gauge switches to the per-request UNCACHED rate
+        # 67 tok / 2 s (matches llama-server's logged prompt-eval speed).
         clock.advance(2.0)
         state["slots"][0]["n_prompt_tokens_processed"] = 67
         state["slots"][0]["next_token"] = [{"n_decoded": 67}]
         second = collect_llama_metrics("http://127.0.0.1:9999")
 
     assert second["gen_tokens_per_s"] == 33.5
-    assert second["prompt_tokens_per_s"] == 50.0
+    assert second["prompt_tokens_per_s"] == 33.5
 
 
 def test_collect_llama_live_rate_task_reset_clamp():
@@ -962,15 +963,16 @@ def test_collect_llama_live_rate_cached_reset_clamp():
         second = collect_llama_metrics("http://127.0.0.1:9999")
 
         # Same task: cached 0 -> 800, processed 0 -> 20 over 2 s.
-        # processed + cached reaches the 800-token prompt: prefill done,
-        # per-request rate 800 tok / 2 s = 400 t/s replaces the delta.
+        # Generation started (decoded 30 > 0): prefill done. The per-
+        # request rate counts UNCACHED tokens only: 20 tok / 2 s = 10 t/s
+        # (the 800 cache hits did no prefill work).
         clock.advance(2.0)
         set_task(101, 20, 800, 30)
         third = collect_llama_metrics("http://127.0.0.1:9999")
 
     assert second["prompt_tokens_per_s"] == 0.0
     assert second["gen_tokens_per_s"] == 0.0
-    assert third["prompt_tokens_per_s"] == 400.0
+    assert third["prompt_tokens_per_s"] == 10.0
     assert third["gen_tokens_per_s"] == 15.0
 
 
@@ -985,9 +987,10 @@ def _llama_slot_fixture(task, total, processed, cached, decoded=0,
 
 def test_collect_llama_prompt_rate_averages_completed_requests():
     """prompt tokens/s is the mean of the last 5 completed prefills
-    (prompt size / prefill duration): a large prefill must not spike for
-    one scrape and then drop to 0, and the window must evict the oldest
-    sample after 5 requests."""
+    (uncached prompt tokens / prefill duration; the fixtures here are
+    fully uncached): a large prefill must not spike for one scrape and
+    then drop to 0, and the window must evict the oldest sample after
+    5 requests."""
     from app import collect_llama_metrics
 
     state = {
@@ -1092,9 +1095,10 @@ def test_collect_llama_prompt_rate_lmstudio_idle_counters():
     and the sample must not be skipped."""
     from app import collect_llama_metrics
 
-    def lm_slot(task, processing, decoded):
+    def lm_slot(task, processing, decoded, processed=0):
         return {"id": 0, "n_ctx": 131072, "n_prompt_tokens": 4000,
-                "n_prompt_tokens_processed": 0, "n_prompt_tokens_cache": 0,
+                "n_prompt_tokens_processed": processed,
+                "n_prompt_tokens_cache": 0,
                 "id_task": task, "is_processing": processing,
                 "next_token": [{"n_decoded": decoded,
                                 "n_remain": -1 if decoded == 0 else 9}]}
@@ -1116,10 +1120,11 @@ def test_collect_llama_prompt_rate_lmstudio_idle_counters():
         collect_llama_metrics("http://127.0.0.1:9999")  # t0: task starts
         # t1: still mid-prefill (decoded 0) -> no sample yet
         clock.advance(1.0)
+        state["slots"] = [lm_slot(1, True, 0, processed=2000)]
         r = collect_llama_metrics("http://127.0.0.1:9999")
         # t2: first generated token -> prefill done: 4000 tok / 2 s
         clock.advance(1.0)
-        state["slots"] = [lm_slot(1, True, 7)]
+        state["slots"] = [lm_slot(1, True, 7, processed=4000)]
         r = collect_llama_metrics("http://127.0.0.1:9999")
         assert r["prompt_tokens_per_s"] == 2000.0
         # t3: slot idle (counters reset to 0) -> rate holds

@@ -112,12 +112,12 @@ The dashboard auto-detects which LLM backend is running. In `auto` mode (default
 
 **llama.cpp** (when `llama-server` is reachable with `--metrics`):
 - Gen/prompt tokens/s from per-slot live decode counters in `GET /slots`
-- The prompt rate counts **cached + uncached** prompt tokens; the gauge shows the mean over the last 5 completed requests (prompt size / prefill duration) so a large prefill doesn't spike for one second and then read 0, falling back to the per-scrape live rate until the first request completes. The gauge label shows the last prompt's size and cache-hit percentage
+- Prompt tokens/s gauge: mean over the last 5 completed requests of **uncached** prompt tokens / prefill duration — the same speed llama-server logs ("prompt eval time"); cache hits do no prefill work, so fully-cached requests don't skew it. Falls back to the per-scrape live rate until the first request completes. The gauge label shows the last prompt's size and cache-hit percentage
 - Per-slot context usage bars, peak ctx, spec-decode accept rate
 - The model name and slot count come from `GET /props` (cached 30 s)
 
 **vLLM** (when `/metrics` responds with `vllm:*` metrics):
-- Gen/prompt tokens/s from Prometheus counter deltas (rate window 0.5–5 s); the prompt gauge shows the mean over the last 5 completed-request windows (Δprompt tokens / ΣTTFT) instead of the raw delta
+- Gen/prompt tokens/s from Prometheus counter deltas (rate window 0.5–5 s); the prompt gauge shows the mean over the last 5 completed-request windows (Δuncached prompt tokens / ΣTTFT) instead of the raw delta
 - KV cache % (per-engine max), Running/Waiting (N/M), E2E latency (lifetime mean)
 - TTFT / ITL (windowed mean, omitted when idle), prefix-cache hit %, spec-decode accept
 - Config: KV cache tokens, num GPU blocks, block size, cache dtype, GPU memory utilization
