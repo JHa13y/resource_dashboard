@@ -1309,16 +1309,15 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
             total = s["prompt_total"]
             if total <= 0:
                 continue
-            # Prefill complete when: the counters say so (reference build),
-            # generation has started (n_decoded > 0 — the signal on builds
-            # that never advance n_prompt_tokens_processed), or the slot
-            # went idle with the task still held.
-            prefill_done = (
-                s["prompt_processed"] + s["cached"] >= total
-                or s["decoded"] > 0
-                or not s["is_processing"]
-            )
-            if not prefill_done:
+            # Prefill complete when generation has started (n_decoded > 0)
+            # or the slot went idle with the task still held. The
+            # processed/cached counters must NOT be used here: LM Studio's
+            # build sets n_prompt_tokens_cache one scrape after task start
+            # and streams n_prompt_tokens live during prefill, so
+            # processed+cached >= total fires ~1 s after start and the
+            # sample degenerates to prompt-size / 1 s (verified against a
+            # live /slots trace on 100.68.63.37).
+            if s["decoded"] <= 0 and s["is_processing"]:
                 continue  # prefill still in flight
             task_ts = p.get("task_ts")
             if task_ts is not None:

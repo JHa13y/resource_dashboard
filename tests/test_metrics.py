@@ -1012,8 +1012,11 @@ def test_collect_llama_prompt_rate_averages_completed_requests():
         r = None
         for i in range(1, steps + 1):
             clock.advance(1.0)
+            # On the completing scrape generation has started (decoded > 0):
+            # that is what marks the prefill done.
             state["slots"] = [
-                _llama_slot_fixture(task, total, min(per_step * i, total), 0)
+                _llama_slot_fixture(task, total, min(per_step * i, total), 0,
+                                    decoded=1 if i == steps else 0)
             ]
             r = collect_llama_metrics("http://127.0.0.1:9999")
         return r
