@@ -308,6 +308,32 @@ def test_collector_llm_enabled_by_default():
             collector.join(timeout=2)
 
 
+def test_collector_llm_thread_populates_latest():
+    """The LLM scrape runs on its own thread; _llm_latest is populated
+    and the first main snapshot is complete (run() waits for the first
+    LLM cycle)."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1)
+    collector._queue = queue.Queue(maxsize=3)
+    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        "/metrics": LLAMA_METRICS_SAMPLE.encode(),
+        "/props": b'{"model_path": "/models/x.gguf", "total_slots": 1}',
+        "/slots": b"[]",
+    })):
+        collector.start()
+        try:
+            data = collector.get_latest(timeout=3.0)
+            assert data is not None
+            metrics = json.loads(data)
+            assert metrics["llm"]["status"] == "up"
+            assert collector._llm_latest is not None
+            assert collector._llm_latest["status"] == "up"
+        finally:
+            collector.running = False
+            collector.join(timeout=2)
+
+
 # ---------------------------------------------------------------------------
 # collect_gpu_metrics integration (prefers pynvml, falls back to CLI)
 # ---------------------------------------------------------------------------
@@ -2503,7 +2529,7 @@ def test_collect_vllm_rate_window_too_short():
 
 
 def test_collect_vllm_rate_window_too_long():
-    """elapsed > 5 s: rate is omitted (gauges still present)."""
+    """elapsed > 15 s: rate is omitted (gauges still present)."""
     import app as app_mod
     from app import collect_vllm_metrics
 
@@ -2516,7 +2542,7 @@ def test_collect_vllm_rate_window_too_long():
          patch("app.time.monotonic", clock):
         collect_vllm_metrics("http://127.0.0.1:9999")
 
-    clock.advance(6.0)  # > 5 s
+    clock.advance(16.0)  # > 15 s
     with patch("app.urllib.request.urlopen",
                side_effect=make_vllm_server(body2.encode())), \
          patch("app.time.monotonic", clock):
@@ -3024,6 +3050,9 @@ def test_snapshot_schema_llm_key_singular():
          patch("app.collect_gpu_metrics", return_value=[]), \
          patch("app.collect_swap_metrics", return_value=None), \
          patch("app.collect_host_health_metrics", return_value={"psi_mem_avg10": None, "d_state_procs": 0}):
+        # Populate _llm_latest the way the LLM thread would (this test
+        # calls _collect() directly without starting the threads).
+        collector._llm_latest = collector._collect_llm()
         snapshot = collector._collect()
 
     assert "llm" in snapshot
@@ -3431,7 +3460,8 @@ def test_gpu_metrics_gate_desktop_unchanged(platform_env, no_real_nvidia,
     monkeypatch.setattr(app, "_gpu_pynvml", lambda: [{"index": 0, "name": "fake"}])
     result = app.collect_gpu_metrics()
 
-    assert result == [{"index": 0, "name": "fake"}]
+    # Desktop path now tags each card with its vendor
+    assert result == [{"index": 0, "name": "fake", "vendor": "nvidia"}]
     no_real_nvidia.assert_not_called()
 
 
@@ -3445,3 +3475,1280 @@ def test_gpu_metrics_jetson_mode_logged_once(jetson_env, monkeypatch, caplog):
 
     msgs = [r.getMessage() for r in caplog.records]
     assert sum("GPU mode: jetson (SoC: orin)" in m for m in msgs) == 1
+
+
+# ---------------------------------------------------------------------------
+# LiteLLM collector tests
+# ---------------------------------------------------------------------------
+
+# Trimmed fixture mirroring a real LiteLLM proxy /metrics body (prometheus
+# callback enabled). Counters carry the prometheus_client `_total` suffix;
+# two label series exercise the sum-across-deployments path.
+LITELLM_METRICS_SAMPLE = (
+    '# HELP litellm_in_flight_requests Number of HTTP requests currently in-flight.\n'
+    '# TYPE litellm_in_flight_requests gauge\n'
+    'litellm_in_flight_requests 3.0\n'
+    '# HELP litellm_output_tokens_metric Total output tokens.\n'
+    '# TYPE litellm_output_tokens_metric counter\n'
+    'litellm_output_tokens_metric_total{api_provider="openai",model_id="m1",requested_model="llama-3.1-8b"} 12000.0\n'
+    'litellm_output_tokens_metric_total{api_provider="openai",model_id="m2",requested_model="llama-3.1-8b"} 345.0\n'
+    '# HELP litellm_input_tokens_metric Total input tokens.\n'
+    '# TYPE litellm_input_tokens_metric counter\n'
+    'litellm_input_tokens_metric_total{api_provider="openai",model_id="m1",requested_model="llama-3.1-8b"} 98765.0\n'
+    '# HELP litellm_input_cached_tokens_metric Provider-reported cached input tokens.\n'
+    '# TYPE litellm_input_cached_tokens_metric counter\n'
+    'litellm_input_cached_tokens_metric_total{api_provider="openai",model_id="m1",requested_model="llama-3.1-8b"} 9876.5\n'
+    '# HELP litellm_proxy_total_requests_metric Total requests made to the proxy.\n'
+    '# TYPE litellm_proxy_total_requests_metric counter\n'
+    'litellm_proxy_total_requests_metric_total{requested_model="llama-3.1-8b",status_code="200"} 42.0\n'
+    '# HELP litellm_proxy_failed_requests_metric Failed responses from the proxy.\n'
+    '# TYPE litellm_proxy_failed_requests_metric counter\n'
+    'litellm_proxy_failed_requests_metric_total{exception_class="Timeout",requested_model="llama-3.1-8b"} 2.0\n'
+    '# HELP litellm_spend_metric Total spend.\n'
+    '# TYPE litellm_spend_metric counter\n'
+    'litellm_spend_metric_total{requested_model="llama-3.1-8b"} 0.123456\n'
+    '# HELP litellm_llm_api_time_to_first_token_metric Time to first token (streaming).\n'
+    '# TYPE litellm_llm_api_time_to_first_token_metric histogram\n'
+    'litellm_llm_api_time_to_first_token_metric_sum{requested_model="llama-3.1-8b"} 12.5\n'
+    'litellm_llm_api_time_to_first_token_metric_count{requested_model="llama-3.1-8b"} 10.0\n'
+    '# HELP litellm_deployment_latency_per_output_token Latency per output token.\n'
+    '# TYPE litellm_deployment_latency_per_output_token gauge\n'
+    'litellm_deployment_latency_per_output_token{litellm_model_name="llama-3.1-8b",model_id="m1"} 0.031\n'
+    'litellm_deployment_latency_per_output_token{litellm_model_name="llama-3.1-8b",model_id="m2"} 0.022\n'
+    '# HELP litellm_request_total_latency_metric End-to-end request latency.\n'
+    '# TYPE litellm_request_total_latency_metric histogram\n'
+    'litellm_request_total_latency_metric_sum{requested_model="llama-3.1-8b"} 55.0\n'
+    'litellm_request_total_latency_metric_count{requested_model="llama-3.1-8b"} 40.0\n'
+    '# HELP litellm_llm_api_latency_metric LLM API call latency.\n'
+    '# TYPE litellm_llm_api_latency_metric histogram\n'
+    'litellm_llm_api_latency_metric_sum{requested_model="llama-3.1-8b"} 50.0\n'
+    'litellm_llm_api_latency_metric_count{requested_model="llama-3.1-8b"} 40.0\n'
+    '# HELP process_start_time_seconds Start time of the process since unix epoch.\n'
+    '# TYPE process_start_time_seconds gauge\n'
+    'process_start_time_seconds 1.78725719225e+09\n'
+)
+
+
+@pytest.fixture(autouse=True)
+def reset_litellm_state():
+    """Reset module-level LiteLLM scrape history around every test."""
+    import app as app_mod
+
+    original_prev = app_mod._litellm_prev
+    original_last_good = app_mod._litellm_last_good
+    app_mod._litellm_prev = None
+    app_mod._litellm_last_good = None
+    yield
+    app_mod._litellm_prev = original_prev
+    app_mod._litellm_last_good = original_last_good
+
+
+def make_litellm_server(body: bytes, calls: list | None = None):
+    """Side_effect for ``app.urllib.request.urlopen`` serving a LiteLLM
+    /metrics endpoint. The collector passes a urllib Request object, so
+    resolve ``full_url`` and capture headers (token tests)."""
+    import urllib.request as _ur
+
+    def fake_urlopen(req, timeout=None):
+        url = getattr(req, "full_url", req)
+        if calls is not None:
+            headers = dict(req.header_items()) if isinstance(req, _ur.Request) else {}
+            calls.append((url, headers))
+        if url.endswith("/metrics"):
+            return _http_response(body)
+        raise ConnectionRefusedError(f"no route for {url}")
+    return fake_urlopen
+
+
+def test_collect_litellm_happy_path():
+    from app import collect_litellm_metrics
+
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_litellm_server(LITELLM_METRICS_SAMPLE.encode())):
+        result = collect_litellm_metrics("http://127.0.0.1:9997")
+
+    assert result is not None
+    assert result["status"] == "up"
+    assert result["model"] == "llama-3.1-8b"
+    assert result["requests_processing"] == 3.0
+    # Counters summed across label series
+    assert result["gen_tokens_total"] == 12345.0
+    assert result["prompt_tokens_total"] == 98765.0
+    assert result["requests_completed_total"] == 42.0
+    assert result["requests_failed_total"] == 2.0
+    assert result["spend_usd"] == 0.1235
+    # Provider-side prompt-cache hit rate (lifetime ratio)
+    assert result["prefix_cache_hit_pct"] == round(100.0 * 9876.5 / 98765.0, 1)
+    # ITL: max across deployments × 1000
+    assert result["itl_ms"] == 31.0
+    # Lifetime means
+    assert result["e2e_latency_seconds"] == round(55.0 / 40.0, 1)  # 1.4
+    assert result["llm_api_latency_seconds"] == round(50.0 / 40.0, 1)  # 1.25
+    # First scrape: no Δ-window rates yet
+    assert "gen_tokens_per_s" not in result
+    assert "prompt_tokens_per_s" not in result
+    assert "ttft_seconds" not in result
+    # Usage (disjoint counters: total = input + output)
+    usage = result["usage"]
+    assert usage["total_tokens"] == 98765 + 12345
+    assert usage["gen_tokens"] == 12345
+    assert usage["prompt_cached_pct"] == round(100.0 * 9876.5 / 98765.0, 1)
+    assert usage["total_spend_usd"] == 0.1235
+    assert usage["uptime_s"] >= 0
+
+
+def test_collect_litellm_rates_and_ttft_from_deltas():
+    """Second scrape within the 0.5–5 s window yields rates + windowed TTFT."""
+    from app import collect_litellm_metrics
+
+    body = LITELLM_METRICS_SAMPLE.replace(
+        "litellm_output_tokens_metric_total{api_provider=\"openai\",model_id=\"m1\",requested_model=\"llama-3.1-8b\"} 12000.0",
+        "litellm_output_tokens_metric_total{api_provider=\"openai\",model_id=\"m1\",requested_model=\"llama-3.1-8b\"} 12250.0",
+    ).replace(
+        "litellm_input_tokens_metric_total{api_provider=\"openai\",model_id=\"m1\",requested_model=\"llama-3.1-8b\"} 98765.0",
+        "litellm_input_tokens_metric_total{api_provider=\"openai\",model_id=\"m1\",requested_model=\"llama-3.1-8b\"} 99765.0",
+    ).replace(
+        "litellm_llm_api_time_to_first_token_metric_sum{requested_model=\"llama-3.1-8b\"} 12.5",
+        "litellm_llm_api_time_to_first_token_metric_sum{requested_model=\"llama-3.1-8b\"} 18.5",
+    ).replace(
+        "litellm_llm_api_time_to_first_token_metric_count{requested_model=\"llama-3.1-8b\"} 10.0",
+        "litellm_llm_api_time_to_first_token_metric_count{requested_model=\"llama-3.1-8b\"} 14.0",
+    )
+
+    clock = _FakeClock()
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_litellm_server(LITELLM_METRICS_SAMPLE.encode())), \
+         patch("app.time.monotonic", clock):
+        first = collect_litellm_metrics("http://127.0.0.1:9997")
+        assert "gen_tokens_per_s" not in first
+        clock.advance(2.0)
+        with patch("app.urllib.request.urlopen",
+                   side_effect=make_litellm_server(body.encode())):
+            second = collect_litellm_metrics("http://127.0.0.1:9997")
+
+    # gen: (12250+345) - (12000+345) = 250 tok / 2 s
+    assert second["gen_tokens_per_s"] == 125.0
+    # prompt: 99765 - 98765 = 1000 tok / 2 s
+    assert second["prompt_tokens_per_s"] == 500.0
+    # TTFT: windowed mean (18.5-12.5)/(14-10) = 1.5 s
+    assert second["ttft_seconds"] == 1.5
+
+
+def test_collect_litellm_counter_reset_clamps_rate():
+    from app import collect_litellm_metrics
+
+    reset_body = LITELLM_METRICS_SAMPLE.replace(
+        "litellm_output_tokens_metric_total{api_provider=\"openai\",model_id=\"m1\",requested_model=\"llama-3.1-8b\"} 12000.0",
+        "litellm_output_tokens_metric_total{api_provider=\"openai\",model_id=\"m1\",requested_model=\"llama-3.1-8b\"} 1.0",
+    )
+
+    clock = _FakeClock()
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_litellm_server(LITELLM_METRICS_SAMPLE.encode())), \
+         patch("app.time.monotonic", clock):
+        collect_litellm_metrics("http://127.0.0.1:9997")
+        clock.advance(2.0)
+        with patch("app.urllib.request.urlopen",
+                   side_effect=make_litellm_server(reset_body.encode())):
+            second = collect_litellm_metrics("http://127.0.0.1:9997")
+
+    assert second["gen_tokens_per_s"] == 0.0  # counter reset → clamped
+
+
+def _two_model_body() -> str:
+    """LiteLLM body with two distinct requested_model aliases.
+
+    The shared fixture labels both deployments as llama-3.1-8b; rename
+    m2 so per-model grouping has two distinct models.
+    """
+    return LITELLM_METRICS_SAMPLE.replace(
+        'litellm_output_tokens_metric_total{api_provider="openai",model_id="m2",requested_model="llama-3.1-8b"} 345.0',
+        'litellm_output_tokens_metric_total{api_provider="openai",model_id="m2",requested_model="gpt-4o-mini"} 345.0',
+    )
+
+
+def test_collect_litellm_per_model_rates():
+    """Per-model gen tokens/s from per-model counter deltas (2 models)."""
+    from app import collect_litellm_metrics
+
+    clock = _FakeClock()
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_litellm_server(_two_model_body().encode())), \
+         patch("app.time.monotonic", clock):
+        first = collect_litellm_metrics("http://127.0.0.1:9997")
+        assert "gen_tokens_per_s_by_model" not in first  # no baseline yet
+        clock.advance(2.0)
+        second_body = _two_model_body().replace(
+            'litellm_output_tokens_metric_total{api_provider="openai",model_id="m1",requested_model="llama-3.1-8b"} 12000.0',
+            'litellm_output_tokens_metric_total{api_provider="openai",model_id="m1",requested_model="llama-3.1-8b"} 12100.0',
+        ).replace(
+            'litellm_output_tokens_metric_total{api_provider="openai",model_id="m2",requested_model="gpt-4o-mini"} 345.0',
+            'litellm_output_tokens_metric_total{api_provider="openai",model_id="m2",requested_model="gpt-4o-mini"} 385.0',
+        )
+        with patch("app.urllib.request.urlopen",
+                   side_effect=make_litellm_server(second_body.encode())):
+            second = collect_litellm_metrics("http://127.0.0.1:9997")
+
+    assert second["gen_tokens_per_s_by_model"] == {
+        "llama-3.1-8b": 50.0,  # 100 tok / 2 s
+        "gpt-4o-mini": 20.0,   # 40 tok / 2 s
+    }
+    # Aggregate total still reported (sum of per-model deltas)
+    assert second["gen_tokens_per_s"] == 70.0
+
+
+def test_collect_litellm_per_model_counter_reset_clamps():
+    """A per-model counter reset clamps only that model's rate to 0."""
+    from app import collect_litellm_metrics
+
+    clock = _FakeClock()
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_litellm_server(_two_model_body().encode())), \
+         patch("app.time.monotonic", clock):
+        collect_litellm_metrics("http://127.0.0.1:9997")
+        clock.advance(2.0)
+        reset_body = _two_model_body().replace(
+            'litellm_output_tokens_metric_total{api_provider="openai",model_id="m1",requested_model="llama-3.1-8b"} 12000.0',
+            'litellm_output_tokens_metric_total{api_provider="openai",model_id="m1",requested_model="llama-3.1-8b"} 12200.0',
+        ).replace(
+            'litellm_output_tokens_metric_total{api_provider="openai",model_id="m2",requested_model="gpt-4o-mini"} 345.0',
+            'litellm_output_tokens_metric_total{api_provider="openai",model_id="m2",requested_model="gpt-4o-mini"} 1.0',
+        )
+        with patch("app.urllib.request.urlopen",
+                   side_effect=make_litellm_server(reset_body.encode())):
+            second = collect_litellm_metrics("http://127.0.0.1:9997")
+
+    pm = second["gen_tokens_per_s_by_model"]
+    assert pm["gpt-4o-mini"] == 0.0   # reset → clamped
+    assert pm["llama-3.1-8b"] == 100.0  # 200 tok / 2 s, unaffected
+
+
+def test_collect_litellm_per_model_new_model_omitted():
+    """A model with no previous baseline is omitted from per-model rates."""
+    from app import collect_litellm_metrics
+
+    only_m1 = "\n".join(
+        line for line in LITELLM_METRICS_SAMPLE.splitlines()
+        if 'model_id="m2"' not in line
+    )
+    clock = _FakeClock()
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_litellm_server(only_m1.encode())), \
+         patch("app.time.monotonic", clock):
+        collect_litellm_metrics("http://127.0.0.1:9997")
+        clock.advance(2.0)
+        with patch("app.urllib.request.urlopen",
+                   side_effect=make_litellm_server(_two_model_body().encode())):
+            second = collect_litellm_metrics("http://127.0.0.1:9997")
+
+    pm = second["gen_tokens_per_s_by_model"]
+    assert "gpt-4o-mini" not in pm  # new model: no baseline yet
+    assert pm["llama-3.1-8b"] == 0.0  # 12000 - 12000 = 0
+
+
+def test_collect_litellm_rate_gap_within_widened_window():
+    """A 12 s gap (within the 0.5–15 s window) computes the rate over
+    the actual gap instead of omitting it."""
+    from app import collect_litellm_metrics
+
+    body = LITELLM_METRICS_SAMPLE.replace(
+        'litellm_output_tokens_metric_total{api_provider="openai",model_id="m1",requested_model="llama-3.1-8b"} 12000.0',
+        'litellm_output_tokens_metric_total{api_provider="openai",model_id="m1",requested_model="llama-3.1-8b"} 12300.0',
+    )
+    clock = _FakeClock()
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_litellm_server(LITELLM_METRICS_SAMPLE.encode())), \
+         patch("app.time.monotonic", clock):
+        collect_litellm_metrics("http://127.0.0.1:9997")
+        clock.advance(12.0)
+        with patch("app.urllib.request.urlopen",
+                   side_effect=make_litellm_server(body.encode())):
+            second = collect_litellm_metrics("http://127.0.0.1:9997")
+
+    assert second["gen_tokens_per_s"] == 25.0  # 300 tok / 12 s
+
+
+def test_collect_litellm_rate_hold_after_long_gap():
+    """A gap > 15 s (e.g. right after an outage) holds the last
+    computed rate instead of omitting it — the UI never flashes '–'."""
+    from app import collect_litellm_metrics
+
+    body = LITELLM_METRICS_SAMPLE.replace(
+        'litellm_output_tokens_metric_total{api_provider="openai",model_id="m1",requested_model="llama-3.1-8b"} 12000.0',
+        'litellm_output_tokens_metric_total{api_provider="openai",model_id="m1",requested_model="llama-3.1-8b"} 12250.0',
+    )
+    clock = _FakeClock()
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_litellm_server(LITELLM_METRICS_SAMPLE.encode())), \
+         patch("app.time.monotonic", clock):
+        collect_litellm_metrics("http://127.0.0.1:9997")
+        clock.advance(2.0)
+        with patch("app.urllib.request.urlopen",
+                   side_effect=make_litellm_server(body.encode())):
+            second = collect_litellm_metrics("http://127.0.0.1:9997")
+        assert second["gen_tokens_per_s"] == 125.0  # 250 tok / 2 s
+        # 20 s outage, then recovery with the same (unchanged) body.
+        clock.advance(20.0)
+        with patch("app.urllib.request.urlopen",
+                   side_effect=make_litellm_server(body.encode())):
+            third = collect_litellm_metrics("http://127.0.0.1:9997")
+
+    assert third["gen_tokens_per_s"] == 125.0  # held, not omitted
+    assert third["gen_tokens_per_s_by_model"]["llama-3.1-8b"] == 125.0
+
+
+def test_collect_litellm_bearer_token_sent():
+    """A configured token is sent as an Authorization: Bearer header."""
+    from app import collect_litellm_metrics
+
+    calls: list = []
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_litellm_server(LITELLM_METRICS_SAMPLE.encode(),
+                                               calls=calls)):
+        result = collect_litellm_metrics("http://127.0.0.1:9997", token="sk-123")
+
+    assert result is not None
+    url, headers = calls[0]
+    assert url == "http://127.0.0.1:9997/metrics"
+    # urllib capitalizes header names (e.g. "Authorization")
+    auth = [v for k, v in headers.items() if k.lower() == "authorization"]
+    assert auth == ["Bearer sk-123"]
+
+    # No token → no Authorization header
+    calls.clear()
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_litellm_server(LITELLM_METRICS_SAMPLE.encode(),
+                                               calls=calls)):
+        collect_litellm_metrics("http://127.0.0.1:9997")
+    url, headers = calls[0]
+    assert all(k.lower() != "authorization" for k in headers)
+
+
+def test_collect_litellm_no_litellm_metrics_returns_none():
+    from app import collect_litellm_metrics
+
+    other_body = b'up 1.0\npython_info{implementation="CPython"} 1.0\n'
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_litellm_server(other_body)):
+        result = collect_litellm_metrics("http://127.0.0.1:9997")
+
+    assert result is None
+
+
+def test_collect_litellm_unreachable():
+    from app import collect_litellm_metrics
+
+    with patch("app.urllib.request.urlopen",
+               side_effect=ConnectionRefusedError("down")):
+        assert collect_litellm_metrics("http://127.0.0.1:9997") is None
+
+
+def test_collect_litellm_stale_hold_then_expiry():
+    from app import collect_litellm_metrics
+
+    clock = _FakeClock()
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_litellm_server(LITELLM_METRICS_SAMPLE.encode())), \
+         patch("app.time.monotonic", clock):
+        good = collect_litellm_metrics("http://127.0.0.1:9997")
+        assert good["status"] == "up"
+        clock.advance(1.0)
+        with patch("app.urllib.request.urlopen",
+                   side_effect=ConnectionRefusedError("down")):
+            stale = collect_litellm_metrics("http://127.0.0.1:9997")
+        assert stale is not None and stale["status"] == "stale"
+        clock.advance(20.0)  # beyond the 15 s hold
+        with patch("app.urllib.request.urlopen",
+                   side_effect=ConnectionRefusedError("down")):
+            assert collect_litellm_metrics("http://127.0.0.1:9997") is None
+
+
+def test_collect_llm_auto_vllm_down_litellm_wins():
+    """auto mode: vLLM down, LiteLLM up → LiteLLM returned."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1, llm_backend="auto")
+    collector.vllm_url = "http://127.0.0.1:9998"
+    collector.litellm_url = "http://127.0.0.1:9997"
+    collector.llama_url = "http://127.0.0.1:9999"
+
+    litellm_body = LITELLM_METRICS_SAMPLE.encode()
+
+    def fake_urlopen(req, timeout=None):
+        url = getattr(req, "full_url", req)
+        if url.endswith("/metrics") and "9997" in url:
+            return _http_response(litellm_body)
+        raise ConnectionRefusedError("down")
+
+    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen):
+        data = collector._collect_llm()
+
+    assert data is not None
+    assert data["backend"] == "litellm"
+    assert data["model"] == "llama-3.1-8b"
+
+
+def test_collect_llm_auto_vllm_beats_litellm():
+    """auto mode: both vLLM and LiteLLM up → vLLM wins (direct engine)."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1, llm_backend="auto")
+    collector.vllm_url = "http://127.0.0.1:9998"
+    collector.litellm_url = "http://127.0.0.1:9997"
+    collector.llama_url = "http://127.0.0.1:9999"
+
+    calls: list = []
+
+    def fake_urlopen(req, timeout=None):
+        url = getattr(req, "full_url", req)
+        calls.append(url)
+        if url.endswith("/metrics"):
+            if "9998" in url:
+                return _http_response(VLLM_METRICS_SAMPLE.encode())
+            if "9997" in url:
+                return _http_response(LITELLM_METRICS_SAMPLE.encode())
+        raise ConnectionRefusedError(f"no route for {url}")
+
+    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen):
+        data = collector._collect_llm()
+
+    assert data is not None
+    assert data["backend"] == "vllm"
+    # LiteLLM was NOT scraped (vLLM wins before it)
+    assert not any("9997" in c for c in calls)
+
+
+def test_collect_llm_auto_litellm_down_falls_through_to_llama():
+    """auto mode: vLLM + LiteLLM down, llama up → llama returned."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1, llm_backend="auto")
+    collector.vllm_url = "http://127.0.0.1:9998"
+    collector.litellm_url = "http://127.0.0.1:9997"
+    collector.llama_url = "http://127.0.0.1:9999"
+
+    llama_body = LLAMA_METRICS_SAMPLE.encode()
+
+    def fake_urlopen(req, timeout=None):
+        url = getattr(req, "full_url", req)
+        if "9999" in url:
+            if url.endswith("/metrics"):
+                return _http_response(llama_body)
+            if url.endswith("/props"):
+                return _http_response(
+                    b'{"model_path": "/models/x.gguf", "total_slots": 1}')
+            if url.endswith("/slots"):
+                return _http_response(b"[]")
+            if url.endswith("/health"):
+                return _http_response(b'{"status":"ok"}')
+            return _http_response(b"{}")
+        raise ConnectionRefusedError("down")
+
+    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen):
+        data = collector._collect_llm()
+
+    assert data is not None
+    assert data["backend"] == "llama"
+
+
+def test_collect_llm_pinned_litellm_skips_others():
+    """--llm-backend litellm: only the proxy is scraped, even if others up."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1, llm_backend="litellm")
+    collector.vllm_url = "http://127.0.0.1:9998"
+    collector.litellm_url = "http://127.0.0.1:9997"
+    collector.llama_url = "http://127.0.0.1:9999"
+
+    calls: list = []
+
+    def fake_urlopen(req, timeout=None):
+        url = getattr(req, "full_url", req)
+        calls.append(url)
+        if url.endswith("/metrics") and "9997" in url:
+            return _http_response(LITELLM_METRICS_SAMPLE.encode())
+        raise ConnectionRefusedError("down")
+
+    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen):
+        data = collector._collect_llm()
+
+    assert data is not None
+    assert data["backend"] == "litellm"
+    assert all("9997" in c for c in calls)
+
+
+def test_defaults_vllm_port_5001():
+    """The default vLLM host port is 5001 (operator config)."""
+    from app import DEFAULT_VLLM_URL
+
+    assert DEFAULT_VLLM_URL == "http://127.0.0.1:5001"
+
+
+# ---------------------------------------------------------------------------
+# AMD GPU collector tests (amd-smi / rocm-smi / sysfs)
+# ---------------------------------------------------------------------------
+
+# Fixture reconstructed from the amd-smi CLI source + ROCm 7.14 docs
+# (docs/research/amd-smi.md): monitor --json is an array keyed by "gpu",
+# numerics wrapped as {"value": N, "unit": ...}, VRAM in MB, "N/A" for
+# unavailable sensors (hotspot is N/A on many datacenter cards).
+AMD_SMI_MONITOR_JSON = json.dumps([
+    {
+        "gpu": 0,
+        "power_usage": {"value": 49, "unit": "W"},
+        "hotspot_temperature": {"value": 27, "unit": "C"},
+        "memory_temperature": {"value": 29, "unit": "C"},
+        "gfx": {"value": 2, "unit": "%"},
+        "gfx_clock": {"value": 43, "unit": "MHz"},
+        "vram_used": {"value": 283, "unit": "MB"},
+        "vram_total": {"value": 196592, "unit": "MB"},
+    },
+    {
+        "gpu": 1,
+        "power_usage": {"value": 42, "unit": "W"},
+        "hotspot_temperature": "N/A",
+        "memory_temperature": {"value": 30, "unit": "C"},
+        "gfx": {"value": 0, "unit": "%"},
+        "gfx_clock": {"value": 47, "unit": "MHz"},
+        "vram_used": "N/A",
+        "vram_total": {"value": 196592, "unit": "MB"},
+    },
+])
+
+# Real rocm-smi 5.7.0 --csv header/row (llama-swap test fixture shape):
+# VRAM columns are BYTES (unlike amd-smi's MB).
+ROCM_SMI_CSV_SAMPLE = (
+    "device,GPU ID,Temperature (Sensor edge) (C),"
+    "Temperature (Sensor junction) (C),Temperature (Sensor memory) (C),"
+    "Average Graphics Package Power (W),GPU use (%),GPU memory use (%),"
+    "Memory Activity,VRAM Total Memory (B),VRAM Total Used Memory (B)\n"
+    "card0,0x7551,38.0,38.0,39.0,1068.0,51.0,20.0,10.0,"
+    "21458059264,27856896\n"
+)
+
+
+@pytest.fixture(autouse=True)
+def reset_amd_state():
+    """Reset lspci name cache + AMD negative cache around every test."""
+    import app as app_mod
+
+    original_cache = app_mod._lspci_name_cache
+    original_absent = app_mod._amd_absent_since
+    app_mod._lspci_name_cache = None
+    app_mod._amd_absent_since = None
+    yield
+    app_mod._lspci_name_cache = original_cache
+    app_mod._amd_absent_since = original_absent
+
+
+def _amd_smi_mock(stdout: str, returncode: int = 0):
+    return MagicMock(returncode=returncode, stdout=stdout)
+
+
+def test_amd_unwrap():
+    from app import _amd_unwrap
+
+    assert _amd_unwrap({"value": 49, "unit": "W"}) == 49.0
+    assert _amd_unwrap(7) == 7.0
+    assert _amd_unwrap("N/A") is None
+    assert _amd_unwrap(None) is None
+    assert _amd_unwrap({"value": "N/A"}) is None
+    assert _amd_unwrap(True) is None  # bool is not a metric
+
+
+def test_parse_lspci_device_name():
+    from app import _parse_lspci_device
+
+    vm = (
+        "Slot:\t01:00.0\n"
+        "Class:\tVGA compatible controller\n"
+        "Vendor:\tAdvanced Micro Devices, Inc. [AMD/ATI]\n"
+        "Device:\tNavi 31 [Radeon RX 7900 XTX]\n"
+        "SVendor:\tXFX\n"
+    )
+    assert _parse_lspci_device(vm) == "Radeon RX 7900 XTX"
+    # No brackets → raw remainder
+    assert _parse_lspci_device("Device: GA102\n") == "GA102"
+    assert _parse_lspci_device("nothing here\n") == ""
+
+
+def test_gpu_amd_smi_happy_path():
+    from app import _gpu_amd_smi
+
+    with (
+        patch("shutil.which", return_value="/usr/bin/amd-smi"),
+        patch("subprocess.run", return_value=_amd_smi_mock(AMD_SMI_MONITOR_JSON)),
+        patch("app._sysfs_pci_bus_id", return_value=None),
+    ):
+        gpus = _gpu_amd_smi()
+
+    assert len(gpus) == 2
+    g0, g1 = gpus
+    assert g0["index"] == 0
+    assert g0["utilization_pct"] == 2.0
+    assert g0["memory_used_gb"] == round(283 / 1024, 1)
+    assert g0["memory_total_gb"] == round(196592 / 1024, 1)
+    assert g0["memory_pct"] == round(283 / 196592 * 100, 1)
+    assert g0["temperature_c"] == 27.0  # hotspot preferred
+    assert g0["graphics_clock_mhz"] == 43.0
+    assert g0["power_w"] == 49.0
+    assert g0["name"] == "AMD GPU"
+    assert g0["board_vendor"] == "unknown"
+    assert g0["throttle"] == {"hw_thermal_slowdown": False,
+                              "sw_thermal_slowdown": False}
+
+    # GPU 1: hotspot N/A → memory_temperature fallback; vram_used N/A →
+    # memory keys omitted (not 0), row still kept (util present)
+    assert g1["temperature_c"] == 30.0
+    assert "memory_used_gb" not in g1
+    assert "memory_pct" not in g1
+    assert g1["utilization_pct"] == 0.0
+
+
+def test_gpu_amd_smi_binary_missing():
+    from app import _gpu_amd_smi
+
+    with (
+        patch("shutil.which", return_value=None),
+        patch("subprocess.run") as mock_run,
+    ):
+        gpus = _gpu_amd_smi()
+
+    assert gpus == []
+    mock_run.assert_not_called()
+
+
+def test_gpu_amd_smi_failure_modes():
+    from app import _gpu_amd_smi
+
+    with patch("shutil.which", return_value="/usr/bin/amd-smi"):
+        # Non-zero exit (no AMD GPUs / driver not loaded)
+        with patch("subprocess.run", return_value=_amd_smi_mock("", 1)):
+            assert _gpu_amd_smi() == []
+        # Unparseable output
+        with patch("subprocess.run", return_value=_amd_smi_mock("not json")):
+            assert _gpu_amd_smi() == []
+        # Empty list
+        with patch("subprocess.run", return_value=_amd_smi_mock("[]")):
+            assert _gpu_amd_smi() == []
+        # All-N/A row is dropped
+        with patch("subprocess.run", return_value=_amd_smi_mock(
+                json.dumps([{"gpu": 0, "gfx": "N/A",
+                             "vram_used": "N/A"}]))):
+            assert _gpu_amd_smi() == []
+
+
+def test_gpu_rocm_smi_parses_csv_by_header_name():
+    from app import _gpu_rocm_smi
+
+    with (
+        patch("shutil.which", return_value=None),
+        patch("os.path.isfile", return_value=True),
+        patch("os.access", return_value=True),
+        patch("subprocess.run",
+              return_value=_amd_smi_mock(ROCM_SMI_CSV_SAMPLE)),
+        patch("app._sysfs_pci_bus_id", return_value=None),
+    ):
+        gpus = _gpu_rocm_smi()
+
+    assert len(gpus) == 1
+    g = gpus[0]
+    assert g["utilization_pct"] == 51.0
+    # BYTES → GiB (unlike amd-smi's MB)
+    assert g["memory_used_gb"] == round(27856896 / 1024**3, 1)
+    assert g["memory_total_gb"] == round(21458059264 / 1024**3, 1)  # 20.0
+    assert g["memory_pct"] == round(27856896 / 21458059264 * 100, 1)
+    assert g["temperature_c"] == 38.0  # first "Temperature (Sensor..." col
+    assert g["power_w"] == 1068.0
+
+
+def test_gpu_rocm_smi_binary_missing():
+    from app import _gpu_rocm_smi
+
+    with (
+        patch("shutil.which", return_value=None),
+        patch("os.path.isfile", return_value=False),
+        patch("subprocess.run") as mock_run,
+    ):
+        assert _gpu_rocm_smi() == []
+    mock_run.assert_not_called()
+
+
+def test_gpu_amd_sysfs_last_resort(tmp_path):
+    from app import _gpu_amd_sysfs
+
+    dev = tmp_path / "card0" / "device"
+    dev.mkdir(parents=True)
+    (dev / "gpu_busy_percent").write_text("67\n")
+    (dev / "mem_info_vram_used").write_text(str(8 * 1024**3) + "\n")
+    (dev / "mem_info_vram_total").write_text(str(16 * 1024**3) + "\n")
+    (dev / "temperature1").write_text("55250\n")  # milli-°C
+
+    # A non-amdgpu card (no VRAM meminfo) must be excluded.
+    other = tmp_path / "card1" / "device"
+    other.mkdir(parents=True)
+    (other / "gpu_busy_percent").write_text("3\n")
+
+    with patch("app._sysfs_pci_bus_id", return_value=None):
+        gpus = _gpu_amd_sysfs(drm_dir=str(tmp_path))
+
+    assert len(gpus) == 1
+    g = gpus[0]
+    assert g["index"] == 0
+    assert g["utilization_pct"] == 67
+    assert g["memory_used_gb"] == 8.0
+    assert g["memory_total_gb"] == 16.0
+    assert g["memory_pct"] == 50.0
+    assert g["temperature_c"] == round(55250 / 1000, 1)  # 55.2
+
+
+def test_gpu_amd_sysfs_missing_dir():
+    from app import _gpu_amd_sysfs
+
+    assert _gpu_amd_sysfs(drm_dir="/nonexistent-drm-dir") == []
+
+
+def test_gpu_amd_chain_falls_through_to_sysfs():
+    """amd-smi missing → rocm-smi missing → sysfs result wins."""
+    from app import _gpu_amd
+
+    with (
+        patch("shutil.which", return_value=None),
+        patch("os.path.isfile", return_value=False),
+        patch("subprocess.run") as mock_run,
+        patch("app._gpu_amd_sysfs") as mock_sysfs,
+    ):
+        mock_sysfs.return_value = [{"index": 0, "name": "AMD GPU"}]
+        gpus = _gpu_amd()
+
+    assert gpus == [{"index": 0, "name": "AMD GPU"}]
+    mock_run.assert_not_called()
+    mock_sysfs.assert_called_once()
+
+
+def test_collect_gpu_falls_back_to_amd():
+    from app import collect_gpu_metrics
+
+    with (
+        patch("app._init_platform", return_value="desktop"),
+        patch("app._gpu_pynvml", return_value=[]),
+        patch("app._gpu_cli", return_value=[]),
+        patch("app._gpu_amd") as mock_amd,
+    ):
+        mock_amd.return_value = [{"index": 0, "name": "AMD GPU"}]
+        result = collect_gpu_metrics()
+
+    assert result == [{"index": 0, "name": "AMD GPU", "vendor": "amd"}]
+    mock_amd.assert_called_once()
+
+
+def test_collect_gpu_mixed_vendors_merges_and_renumbers():
+    """NVIDIA + AMD on one box: both are reported, indices 0..n-1."""
+    from app import collect_gpu_metrics
+
+    nvidia = [
+        {"index": 0, "name": "RTX 4090", "utilization_pct": 10.0},
+        {"index": 1, "name": "RTX 4090", "utilization_pct": 20.0},
+    ]
+    amd = [
+        {"index": 0, "name": "RX 7900 XTX"},
+        {"index": 1, "name": "RX 7900 XTX"},
+    ]
+    with (
+        patch("app._init_platform", return_value="desktop"),
+        patch("app._gpu_pynvml", return_value=nvidia),
+        patch("app._gpu_cli") as mock_cli,
+        patch("app._gpu_amd", return_value=amd),
+    ):
+        result = collect_gpu_metrics()
+
+    mock_cli.assert_not_called()
+    assert [g["index"] for g in result] == [0, 1, 2, 3]
+    assert [g["vendor"] for g in result] == [
+        "nvidia", "nvidia", "amd", "amd"]
+    assert [g["name"] for g in result] == [
+        "RTX 4090", "RTX 4090", "RX 7900 XTX", "RX 7900 XTX"]
+    # Merged entries are copies — source dicts untouched
+    assert "vendor" not in nvidia[0]
+    assert nvidia[0]["index"] == 0
+    assert amd[0]["index"] == 0
+
+
+def test_merge_gpu_lists_offset_uses_max_index():
+    """If a pynvml index is skipped the AMD offset is max+1, not count."""
+    from app import _merge_gpu_lists
+
+    nvidia = [{"index": 0}, {"index": 2}]  # device 1 failed to init
+    amd = [{"index": 0}]
+    merged = _merge_gpu_lists(nvidia, amd)
+    assert [g["index"] for g in merged] == [0, 1, 2]
+
+
+def test_merge_gpu_lists_empty_sides():
+    from app import _merge_gpu_lists
+
+    assert _merge_gpu_lists([], []) == []
+    assert _merge_gpu_lists([{"index": 5}], []) == [
+        {"index": 0, "vendor": "nvidia"}]
+    assert _merge_gpu_lists([], [{"index": 3}]) == [
+        {"index": 0, "vendor": "amd"}]
+
+
+def test_gpu_amd_negative_cache_skips_reprobe():
+    """No AMD GPU → amd-smi is not re-run every poll; re-probe after TTL."""
+    import app as app_mod
+
+    calls = {"n": 0}
+
+    def fake_amd_smi():
+        calls["n"] += 1
+        return []
+
+    with (
+        patch.object(app_mod, "_gpu_amd_smi", side_effect=fake_amd_smi),
+        patch.object(app_mod, "_gpu_rocm_smi", return_value=[]) as mock_rocm,
+        patch.object(app_mod, "_gpu_amd_sysfs", return_value=[]) as mock_sysfs,
+    ):
+        assert app_mod._gpu_amd() == []
+        assert calls["n"] == 1
+        rocm_calls = mock_rocm.call_count
+        sysfs_calls = mock_sysfs.call_count
+        # Second poll within the window: negative-cached, nothing runs
+        assert app_mod._gpu_amd() == []
+        assert calls["n"] == 1
+        assert mock_rocm.call_count == rocm_calls
+        assert mock_sysfs.call_count == sysfs_calls
+        # TTL elapses → re-probe (driver may have been loaded)
+        app_mod._amd_absent_since -= app_mod._AMD_NEGATIVE_REPROBE_S + 1
+        assert app_mod._gpu_amd() == []
+        assert calls["n"] == 2
+
+
+def test_gpu_amd_negative_cache_cleared_on_success():
+    import app as app_mod
+
+    results = iter([[], [{"index": 0}], []])
+    with (
+        patch.object(app_mod, "_gpu_amd_smi", side_effect=lambda: next(results)),
+        patch.object(app_mod, "_gpu_rocm_smi", return_value=[]),
+        patch.object(app_mod, "_gpu_amd_sysfs", return_value=[]),
+    ):
+        assert app_mod._gpu_amd() == []
+        assert app_mod._amd_absent_since is not None
+        # GPU appears → negative cache cleared…
+        app_mod._amd_absent_since -= 1000.0  # force re-probe due
+        assert app_mod._gpu_amd() == [{"index": 0}]
+        assert app_mod._amd_absent_since is None
+        # …so the next poll probes again (no cache on the success path)
+        assert app_mod._gpu_amd() == []
+
+
+# ---------------------------------------------------------------------------
+# config.yaml + CLI resolution
+# ---------------------------------------------------------------------------
+
+def test_load_config_valid(tmp_path):
+    from app import load_config
+
+    p = tmp_path / "config.yaml"
+    p.write_text(
+        "port: 8888\n"
+        "poll_interval: 2.5\n"
+        "llm_backend: litellm\n"
+        "llama_enabled: false\n"
+        "litellm_token: sk-test\n"
+        "upstreams:\n"
+        "  - name: athena\n"
+        "    url: http://athena:5001\n"
+        "unknown_key: 1\n"
+    )
+    cfg = load_config(str(p))
+    assert cfg["port"] == 8888
+    assert cfg["poll_interval"] == 2.5
+    assert cfg["llm_backend"] == "litellm"
+    assert cfg["llama_enabled"] is False
+    assert cfg["litellm_token"] == "sk-test"
+    assert cfg["upstreams"][0]["name"] == "athena"
+
+
+def test_load_config_missing(tmp_path, monkeypatch):
+    from app import load_config
+
+    monkeypatch.chdir(tmp_path)  # no config.yaml here
+    assert load_config(None) == {}
+    # not explicit: a missing path is a silent no-config case
+    assert load_config(str(tmp_path / "nope.yaml")) == {}
+
+
+def test_load_config_malformed_exits(tmp_path):
+    from app import load_config
+
+    p = tmp_path / "bad.yaml"
+    p.write_text("port: [unclosed\n  bad: : :\n")
+    with pytest.raises(SystemExit):
+        load_config(str(p))
+
+
+def test_load_config_not_a_mapping_exits(tmp_path):
+    from app import load_config
+
+    p = tmp_path / "list.yaml"
+    p.write_text("- a\n- b\n")
+    with pytest.raises(SystemExit):
+        load_config(str(p))
+
+
+def test_config_explicit_missing_exits(tmp_path):
+    from app import load_config
+
+    with pytest.raises(SystemExit):
+        load_config(str(tmp_path / "nope.yaml"), explicit=True)
+
+
+def test_load_config_invalid_value_exits(tmp_path):
+    from app import load_config
+
+    for bad in ("port: notanint\n", "poll_interval: -1\n",
+               "llm_backend: quantum\n", "llama_enabled: maybe\n"):
+        p = tmp_path / "badval.yaml"
+        p.write_text(bad)
+        with pytest.raises(SystemExit):
+            load_config(str(p))
+
+
+def _ns(**kw):
+    base = dict(host=None, port=None, poll_interval=None, llama_url=None,
+                vllm_url=None, litellm_url=None, litellm_token=None,
+                llm_backend=None, no_llama=False, upstream=[])
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+def test_config_precedence_cli_wins():
+    from app import resolve_settings
+
+    # CLI beats config
+    assert resolve_settings(_ns(port=9999), {"port": 8888})["port"] == 9999
+    # config fills what CLI left unset
+    assert resolve_settings(_ns(), {"port": 8888})["port"] == 8888
+    # built-in default when neither provides a value
+    assert resolve_settings(_ns(), {})["port"] == 5000
+    assert resolve_settings(_ns(), {})["poll_interval"] == 1.0
+
+
+def test_no_llama_flag_overrides_config():
+    from app import resolve_settings
+
+    # flag wins when present (even against config true)
+    assert resolve_settings(_ns(no_llama=True),
+                           {"llama_enabled": True})["llama_enabled"] is False
+    # config false sticks when the flag is absent
+    assert resolve_settings(_ns(),
+                           {"llama_enabled": False})["llama_enabled"] is False
+    # config true / default
+    assert resolve_settings(_ns(),
+                           {"llama_enabled": True})["llama_enabled"] is True
+    assert resolve_settings(_ns(), {})["llama_enabled"] is True
+
+
+def test_upstream_cli_merge_dedupe_cli_wins():
+    from app import merge_upstreams
+
+    merged = merge_upstreams(
+        [{"name": "a", "url": "http://cfg-a"},
+         {"name": "b", "url": "http://cfg-b"}],
+        ["a=http://cli-a", "c=http://cli-c"])
+    assert {u["name"]: u["url"] for u in merged} == {
+        "a": "http://cli-a", "b": "http://cfg-b", "c": "http://cli-c"}
+    # order: config order first, then CLI-only names in CLI order
+    assert [u["name"] for u in merged] == ["a", "b", "c"]
+
+
+def test_upstream_entry_malformed_skipped():
+    from app import merge_upstreams
+
+    merged = merge_upstreams(
+        [{"name": "good", "url": "http://g"},
+         {"name": "", "url": "http://x"},
+         {"name": "nourl"},
+         "notadict"],
+        ["badspec", "=nourl", "ok=http://ok"])
+    assert [u["name"] for u in merged] == ["good", "ok"]
+
+
+# ---------------------------------------------------------------------------
+# collect_upstream_metrics
+# ---------------------------------------------------------------------------
+
+def test_collect_upstream_happy_path():
+    import app as app_mod
+    from app import collect_upstream_metrics
+
+    orig = app_mod._upstream_last_good
+    app_mod._upstream_last_good = {}
+    try:
+        payload = {
+            "timestamp": 1.0, "cpu": 12.5, "cpu_per_core": [1.0],
+            "memory": {"percent": 50.0}, "gpus": [], "swap": None,
+            "host_health": {}, "llm_enabled": True, "llm": None,
+            "systems": [{"name": "nested"}], "app_level_key": "x",
+        }
+        with patch("app.urllib.request.urlopen",
+                   side_effect=make_llama_server(
+                       {"/api/metrics": json.dumps(payload).encode()})):
+            # trailing slash on the configured URL is normalized away
+            out = collect_upstream_metrics("http://127.0.0.1:9996/", "mock")
+        assert out is not None
+        assert out["status"] == "up"
+        assert out["name"] == "mock"
+        m = out["metrics"]
+        assert m["cpu"] == 12.5
+        assert m["memory"]["percent"] == 50.0
+        assert "systems" not in m        # no recursion
+        assert "app_level_key" not in m  # strict sanitizer
+    finally:
+        app_mod._upstream_last_good = orig
+
+
+def test_collect_upstream_unreachable_returns_none():
+    import app as app_mod
+    from app import collect_upstream_metrics
+
+    orig = app_mod._upstream_last_good
+    app_mod._upstream_last_good = {}
+    try:
+        with patch("app.urllib.request.urlopen",
+                   side_effect=ConnectionRefusedError("down")):
+            assert collect_upstream_metrics(
+                "http://127.0.0.1:9996", "mock") is None
+    finally:
+        app_mod._upstream_last_good = orig
+
+
+def test_collect_upstream_stale_hold_then_expiry():
+    import app as app_mod
+    from app import collect_upstream_metrics
+
+    clock = _FakeClock()
+    payload = {"cpu": 5.0, "gpus": []}
+    orig = app_mod._upstream_last_good
+    app_mod._upstream_last_good = {}
+    try:
+        with patch("app.urllib.request.urlopen",
+                   side_effect=make_llama_server(
+                       {"/api/metrics": json.dumps(payload).encode()})), \
+             patch("app.time.monotonic", clock):
+            good = collect_upstream_metrics("http://127.0.0.1:9996", "mock")
+            assert good is not None and good["status"] == "up"
+            clock.advance(1.0)
+            with patch("app.urllib.request.urlopen",
+                       side_effect=ConnectionRefusedError("down")):
+                stale = collect_upstream_metrics(
+                    "http://127.0.0.1:9996", "mock")
+            assert stale is not None and stale["status"] == "stale"
+            assert stale["metrics"]["cpu"] == 5.0
+            clock.advance(20.0)  # beyond the 15 s hold
+            with patch("app.urllib.request.urlopen",
+                       side_effect=ConnectionRefusedError("down")):
+                assert collect_upstream_metrics(
+                    "http://127.0.0.1:9996", "mock") is None
+    finally:
+        app_mod._upstream_last_good = orig
+
+
+# ---------------------------------------------------------------------------
+# MetricsCollector: upstream threads + snapshot systems array
+# ---------------------------------------------------------------------------
+
+def _wait_for_snapshot_with(collector, pred, timeout=5.0):
+    """Poll get_latest until a snapshot satisfies *pred* (or timeout)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        data = collector.get_latest(timeout=0.5)
+        if data is not None:
+            m = json.loads(data)
+            if pred(m):
+                return m
+    return None
+
+
+def test_snapshot_systems_array():
+    from app import MetricsCollector
+
+    payload = {"cpu": 42.0, "cpu_per_core": [1.0, 2.0],
+              "memory": {"percent": 33.0},
+              "gpus": [{"index": 0, "utilization_pct": 7}],
+              "swap": None, "host_health": {}, "llm_enabled": True,
+              "llm": None, "systems": [{"name": "should-not-nest"}],
+              "app_level": 1}
+    collector = MetricsCollector(poll_interval=0.1)
+    collector._queue = queue.Queue(maxsize=3)
+    collector.llama_enabled = False
+    collector.start_upstreams(
+        [{"name": "mock", "url": "http://127.0.0.1:9996"}])
+    collector.start()
+    try:
+        with patch("app.urllib.request.urlopen",
+                   side_effect=make_llama_server(
+                       {"/api/metrics": json.dumps(payload).encode()})):
+            metrics = _wait_for_snapshot_with(
+                collector,
+                lambda m: any(s["name"] == "mock" and s["status"] == "up"
+                             for s in m["systems"]))
+            assert metrics is not None
+            by_name = {s["name"]: s for s in metrics["systems"]}
+            # local entry first, status up, metrics match the top-level keys
+            assert metrics["systems"][0]["name"] == "local"
+            assert by_name["local"]["status"] == "up"
+            assert by_name["local"]["metrics"]["cpu"] == metrics["cpu"]
+            assert by_name["local"]["metrics"]["memory"] == metrics["memory"]
+            # upstream entry sanitized
+            assert by_name["mock"]["status"] == "up"
+            assert by_name["mock"]["metrics"]["cpu"] == 42.0
+            assert by_name["mock"]["metrics"]["gpus"][0]["utilization_pct"] == 7
+            assert "systems" not in by_name["mock"]["metrics"]
+            assert "app_level" not in by_name["mock"]["metrics"]
+            # `systems` never nests
+            assert "systems" not in by_name["local"]["metrics"]
+    finally:
+        collector.running = False
+        collector.join(timeout=2)
+
+
+def test_collector_upstream_thread_populates_latest():
+    from app import MetricsCollector
+
+    payload = {"cpu": 7.5, "gpus": []}
+    collector = MetricsCollector(poll_interval=0.1)
+    collector._queue = queue.Queue(maxsize=3)
+    collector.llama_enabled = False
+    collector.start_upstreams(
+        [{"name": "mock", "url": "http://127.0.0.1:9996"}])
+    collector.start()
+    try:
+        with patch("app.urllib.request.urlopen",
+                   side_effect=make_llama_server(
+                       {"/api/metrics": json.dumps(payload).encode()})):
+            deadline = time.time() + 5
+            while time.time() < deadline and not (
+                    collector._upstream_latest.get("mock") or {}).get(
+                        "status") == "up":
+                time.sleep(0.05)
+            latest = collector._upstream_latest.get("mock")
+            assert latest is not None
+            assert latest["status"] == "up"
+            assert latest["metrics"]["cpu"] == 7.5
+    finally:
+        collector.running = False
+        collector.join(timeout=2)
+
+
+def test_snapshot_upstream_down_after_hold_expiry():
+    import app as app_mod
+    from app import MetricsCollector
+
+    payload = {"cpu": 7.5, "gpus": []}
+    up = {"ok": True}
+
+    def fake_urlopen(req, timeout=None):
+        if not up["ok"]:
+            raise ConnectionRefusedError("down")
+        return _http_response(json.dumps(payload).encode())
+
+    clock = _FakeClock()
+    orig = app_mod._upstream_last_good
+    app_mod._upstream_last_good = {}
+    collector = MetricsCollector(poll_interval=0.05)
+    collector._queue = queue.Queue(maxsize=3)
+    collector.llama_enabled = False
+    try:
+        with patch("app.urllib.request.urlopen", side_effect=fake_urlopen), \
+             patch("app.time.monotonic", clock):
+            collector.start_upstreams(
+                [{"name": "mock", "url": "http://127.0.0.1:9996"}])
+            collector.start()
+            # first fetch lands (up)
+            deadline = time.time() + 5
+            while time.time() < deadline and (
+                    collector._upstream_latest.get("mock") or {}).get(
+                        "status") != "up":
+                time.sleep(0.05)
+            assert (collector._upstream_latest.get("mock") or {}).get(
+                "status") == "up"
+            # upstream goes down; within the hold window -> stale
+            up["ok"] = False
+            clock.advance(1.0)
+            deadline = time.time() + 5
+            while time.time() < deadline and (
+                    collector._upstream_latest.get("mock") or {}).get(
+                        "status") != "stale":
+                time.sleep(0.05)
+            assert (collector._upstream_latest.get("mock") or {}).get(
+                "status") == "stale"
+            # beyond the 15 s hold -> None -> snapshot entry "down"
+            clock.advance(20.0)
+            deadline = time.time() + 5
+            while time.time() < deadline and (
+                    collector._upstream_latest.get("mock") is not None):
+                time.sleep(0.05)
+            assert collector._upstream_latest["mock"] is None
+            metrics = _wait_for_snapshot_with(
+                collector,
+                lambda m: any(s["name"] == "mock" and s["status"] == "down"
+                             and s["metrics"] is None
+                             for s in m["systems"]))
+            assert metrics is not None
+    finally:
+        collector.running = False
+        collector.join(timeout=2)
+        app_mod._upstream_last_good = orig
+
+
+def test_start_upstreams_empty_noop():
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1)
+    collector._queue = queue.Queue(maxsize=3)
+    collector.llama_enabled = False
+    collector.start_upstreams([])
+    assert collector._upstream_names == []
+    assert collector._upstream_threads == []
+    collector.start()
+    try:
+        data = collector.get_latest(timeout=3.0)
+        assert data is not None
+        metrics = json.loads(data)
+        # systems is always present: the local entry at minimum
+        assert [s["name"] for s in metrics["systems"]] == ["local"]
+    finally:
+        collector.running = False
+        collector.join(timeout=2)
+
+
+def test_load_config_autodetect_present(tmp_path, monkeypatch):
+    from app import load_config
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.yaml").write_text(
+        "port: 5099\npoll_interval: 2.5\n"
+    )
+    # path is None -> auto-detect ./config.yaml when present
+    cfg = load_config(None)
+    assert cfg["port"] == 5099
+    assert cfg["poll_interval"] == 2.5
+
+
+def test_snapshot_upstream_initial_down():
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=1.0)
+    collector._queue = queue.Queue(maxsize=3)
+    collector.llama_enabled = False
+    # A configured upstream before any fetch has landed (no
+    # _upstream_last_good entry, thread not run / not yet fetched):
+    # _upstream_latest is empty, so _collect must report "down".
+    collector._upstream_names.append("mock")
+    metrics = collector._collect()
+    by_name = {s["name"]: s for s in metrics["systems"]}
+    assert by_name["mock"]["status"] == "down"
+    assert by_name["mock"]["metrics"] is None

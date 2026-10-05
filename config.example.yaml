@@ -1,0 +1,35 @@
+# Example configuration for the Resource Dashboard.
+#
+# Copy this file to `config.yaml` (in the working directory — it is
+# auto-detected) or pass it explicitly:
+#   python app.py --config /path/to/config.yaml
+#
+# Precedence: CLI flags > config.yaml > built-in defaults.
+# Unknown keys are warned about and ignored; invalid values exit with an
+# error. An explicitly passed --config PATH that does not exist exits.
+
+# --- Server -------------------------------------------------------------
+# host: 0.0.0.0
+# port: 5001
+# poll_interval: 1.0            # seconds; must be > 0
+
+# --- LLM backend --------------------------------------------------------
+# llama | vllm | litellm (auto-detect order: vLLM, LiteLLM, llama.cpp)
+# llm_backend: litellm
+# llama_url: http://127.0.0.1:8080
+# vllm_url: http://127.0.0.1:5001
+# litellm_url: http://127.0.0.1:4000
+# litellm_token: sk-...         # Bearer header for require_auth_for_metrics_endpoint
+# llama_enabled: true           # false == --no-llama (the flag wins when passed)
+
+# --- Upstream dashboards (multi-system consolidation) --------------------
+# Each entry points at another dashboard instance's /api/metrics endpoint.
+# The UI shows a Fleet tab (summary + fleet tokens/s chart) plus one tab
+# per system. CLI --upstream name=url entries are merged by name; CLI wins
+# on duplicates.
+#
+# upstreams:
+#   - name: athena
+#     url: http://athena.lungfish-smelt.ts.net:5001
+#   - name: modelbox
+#     url: http://192.168.5.207:5001

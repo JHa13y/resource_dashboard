@@ -2,7 +2,8 @@
 """Resource & GPU Utilization Dashboard.
 
 A lightweight Flask-based web dashboard that streams real-time CPU, memory,
-and NVIDIA GPU metrics via Server-Sent Events (SSE).
+and GPU metrics (NVIDIA pynvml/nvidia-smi, AMD amd-smi/rocm-smi/sysfs,
+JetPack sysfs) via Server-Sent Events (SSE).
 
 Usage:
     pip install -r requirements.txt
@@ -22,6 +23,7 @@ import platform
 import queue
 import re
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -229,6 +231,7 @@ def _gpu_cli() -> list[dict[str, Any]]:
 
     Used as a fallback when pynvml is unavailable or fails to initialise.
     """
+    global _nvidia_cli_missing_logged
     gpus: list[dict[str, Any]] = []
     try:
         result = subprocess.run(  # noqa: S603 – static args only
@@ -297,11 +300,451 @@ def _gpu_cli() -> list[dict[str, Any]]:
                 gpu["power_limit_w"] = power_limit_w
             gpus.append(gpu)
     except FileNotFoundError:
-        log.info("nvidia-smi not found – no GPU metrics available")
+        if not _nvidia_cli_missing_logged:
+            log.info("nvidia-smi not found – no NVIDIA GPU metrics available")
+            _nvidia_cli_missing_logged = True
     except subprocess.TimeoutExpired:
         log.warning("nvidia-smi timed out")
 
     return gpus
+
+
+# ---------------------------------------------------------------------------
+# AMD GPU Monitoring (amd-smi → rocm-smi → sysfs)
+# ---------------------------------------------------------------------------
+#
+# Evidence: docs/research/amd-smi.md. amd-smi ships with ROCm 6.x+ (the
+# amd-smi-lib package, /opt/rocm/bin); it is the official replacement for
+# rocm-smi. JSON is the most stable machine contract — CSV column order is
+# insertion-order and can shift between versions, and the human tables
+# change by platform (XCP column, dynamic GTT/VRAM header). amd-smi
+# reports VRAM in MB; legacy rocm-smi reports VRAM in BYTES (1024×). "N/A"
+# is the universal missing-value token and is treated as absent, never 0.
+
+_AMD_SMI_BIN_CANDIDATES = ("amd-smi", "/opt/rocm/bin/amd-smi")
+_ROCM_SMI_BIN_CANDIDATES = ("rocm-smi", "/opt/rocm/bin/rocm-smi")
+
+# Warn-once guard: nvidia-smi absent (e.g. pure AMD box) — the fallback
+# chain now continues to the AMD path, so the "no GPU metrics" message
+# would otherwise fire every poll.
+_nvidia_cli_missing_logged = False
+
+# lspci device-name cache (bus_id → "Radeon RX 7900 XTX" style name).
+_lspci_name_cache: dict[str, str] | None = None
+
+
+def _find_cli_binary(candidates: tuple[str, ...]) -> str | None:
+    """Resolve a CLI from PATH candidates then absolute ROCm paths."""
+    import shutil
+
+    for cand in candidates:
+        if os.path.isabs(cand):
+            if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                return cand
+        elif shutil.which(cand) is not None:
+            return cand
+    return None
+
+
+def _sysfs_pci_bus_id(card: int | str) -> str | None:
+    """PCI BDF (e.g. ``0000:66:00.0``) for a DRM card from the sysfs
+    ``device`` symlink. None on non-Linux hosts or any error."""
+    try:
+        target = os.readlink(f"/sys/class/drm/card{card}/device")
+    except OSError:
+        return None
+    return os.path.basename(target) or None
+
+
+def _parse_lspci_device(output: str) -> str:
+    """Extract the board model name from ``lspci -s <bus> -vm`` output.
+
+    Prefers the bracketed part of the ``Device:`` line (the marketing
+    name on AMD cards, e.g. ``Device: Navi 31 [Radeon RX 7900 XTX]`` →
+    ``Radeon RX 7900 XTX``); falls back to the raw remainder.
+    """
+    for line in output.splitlines():
+        if line.startswith("Device:"):
+            part = line.split("Device:", 1)[1].strip()
+            m = re.search(r"\[([^\]]+)\]", part)
+            return m.group(1).strip() if m else part
+    return ""
+
+
+def _lspci_device_name_map(bus_ids: list[str]) -> dict[str, str]:
+    global _lspci_name_cache
+    if _lspci_name_cache is None:
+        _lspci_name_cache = {}
+
+    mapping: dict[str, str] = {}
+    for bus_id in bus_ids:
+        if bus_id in _lspci_name_cache:
+            mapping[bus_id] = _lspci_name_cache[bus_id]
+            continue
+        try:
+            result = subprocess.run(  # noqa: S603 – static args only
+                ["lspci", "-s", bus_id, "-vm"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            name = _parse_lspci_device(result.stdout)
+        except FileNotFoundError:
+            break
+        except subprocess.TimeoutExpired:
+            break
+        _lspci_name_cache[bus_id] = name
+        mapping[bus_id] = name
+
+    return mapping
+
+
+def _amd_unwrap(val: Any) -> float | None:
+    """Unwrap an amd-smi JSON leaf: numerics arrive as
+    ``{"value": N, "unit": "W"}`` (scalars pass through); ``"N/A"``,
+    None and malformed values → None."""
+    if isinstance(val, dict):
+        val = val.get("value")
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        return None
+    return float(val)
+
+
+def _amd_smi_entry_to_gpu(entry: dict[str, Any], idx: int) -> dict[str, Any] | None:
+    """Map one ``amd-smi monitor --json`` object to the dashboard GPU dict.
+
+    Field map (monitor keys, VRAM in MB): ``gfx`` → utilization %,
+    ``vram_used``/``vram_total`` → memory, ``hotspot_temperature`` (fall
+    back to ``memory_temperature`` — ``edge`` is N/A on datacenter cards),
+    ``gfx_clock`` → MHz, ``power_usage`` → W. Rows with no usable data
+    (e.g. secondary XCP rows on partitioned MI300X) are dropped.
+    """
+    util = _amd_unwrap(entry.get("gfx"))
+    vram_used = _amd_unwrap(entry.get("vram_used"))
+    vram_total = _amd_unwrap(entry.get("vram_total"))
+    temp = _amd_unwrap(entry.get("hotspot_temperature"))
+    if temp is None:
+        temp = _amd_unwrap(entry.get("memory_temperature"))
+    clock = _amd_unwrap(entry.get("gfx_clock"))
+    power = _amd_unwrap(entry.get("power_usage"))
+
+    if util is None and vram_used is None:
+        return None
+
+    bus_id = _sysfs_pci_bus_id(idx)
+    board_vendor = "unknown"
+    name = "AMD GPU"
+    if bus_id:
+        vendor_map = _lspci_vendor_map([bus_id]).get(bus_id)
+        if vendor_map:
+            board_vendor = vendor_map
+        name_map = _lspci_device_name_map([bus_id]).get(bus_id)
+        if name_map:
+            name = name_map
+
+    gpu: dict[str, Any] = {
+        "index": idx,
+        "throttle": {
+            "hw_thermal_slowdown": False,
+            "sw_thermal_slowdown": False,
+        },
+        "name": name,
+        "board_vendor": board_vendor,
+    }
+    if bus_id:
+        gpu["pci_bus_id"] = bus_id
+    if util is not None:
+        gpu["utilization_pct"] = util
+    if vram_used is not None:
+        gpu["memory_used_gb"] = round(vram_used / 1024, 1)
+    if vram_total is not None:
+        gpu["memory_total_gb"] = round(vram_total / 1024, 1)
+    if vram_used is not None and vram_total:
+        gpu["memory_pct"] = round(vram_used / vram_total * 100, 1)
+    if temp is not None:
+        gpu["temperature_c"] = round(temp, 1)
+    if clock is not None:
+        gpu["graphics_clock_mhz"] = round(clock, 1)
+    if power is not None:
+        gpu["power_w"] = round(power, 1)
+    return gpu
+
+
+def _gpu_amd_smi() -> list[dict[str, Any]]:
+    """Collect AMD GPU metrics via ``amd-smi monitor --json`` (ROCm 6.x+).
+
+    One-shot per poll (no watch mode — the dashboard owns the cadence).
+    Returns [] when the tool is missing, fails, or no AMD GPU is found;
+    never raises.
+    """
+    binary = _find_cli_binary(_AMD_SMI_BIN_CANDIDATES)
+    if binary is None:
+        return []
+    try:
+        result = subprocess.run(  # noqa: S603 – static args only
+            [binary, "monitor", "--power-usage", "--temperature",
+             "--gfx", "--vram-usage", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except FileNotFoundError:
+        return []
+    except subprocess.TimeoutExpired:
+        log.warning("amd-smi timed out")
+        return []
+    if result.returncode != 0:
+        return []  # no AMD GPUs / driver not loaded
+
+    try:
+        payload = json.loads(result.stdout)
+    except ValueError:
+        log.warning("amd-smi returned unparseable JSON")
+        return []
+    if not isinstance(payload, list) or not payload:
+        return []
+
+    gpus: list[dict[str, Any]] = []
+    for pos, entry in enumerate(payload):
+        if not isinstance(entry, dict):
+            continue
+        idx = entry.get("gpu")
+        if not isinstance(idx, int) or isinstance(idx, bool):
+            idx = pos
+        gpu = _amd_smi_entry_to_gpu(entry, idx)
+        if gpu is not None:
+            gpus.append(gpu)
+    return gpus
+
+
+def _gpu_rocm_smi() -> list[dict[str, Any]]:
+    """Legacy fallback (ROCm 5.x / pre-amd-smi builds): parse
+    ``rocm-smi --showuse --showmeminfo vram --showtemperatures --csv``.
+
+    Columns are located by header NAME, never position — the legacy tool
+    uses entirely different names and reports VRAM in BYTES (amd-smi
+    uses MB). ``device`` values are ``card0``/``card1``… Never raises.
+    """
+    binary = _find_cli_binary(_ROCM_SMI_BIN_CANDIDATES)
+    if binary is None:
+        return []
+    try:
+        result = subprocess.run(  # noqa: S603 – static args only
+            [binary, "--showuse", "--showmeminfo", "vram",
+             "--showtemperatures", "--csv"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except FileNotFoundError:
+        return []
+    except subprocess.TimeoutExpired:
+        log.warning("rocm-smi timed out")
+        return []
+    if result.returncode != 0 or not result.stdout.strip():
+        return []
+
+    rows = [r for r in csv.reader(io.StringIO(result.stdout))
+            if r and not r[0].lstrip().startswith("#")]
+    if len(rows) < 2:
+        return []
+    header = [h.strip() for h in rows[0]]
+
+    def col(pred) -> int | None:
+        for i, h in enumerate(header):
+            if pred(h):
+                return i
+        return None
+
+    i_util = col(lambda h: h == "GPU use (%)")
+    i_vram_total = col(lambda h: h == "VRAM Total Memory (B)")
+    i_vram_used = col(lambda h: h == "VRAM Total Used Memory (B)")
+    i_temp = col(lambda h: h.startswith("Temperature (Sensor"))
+    i_power = col(lambda h: h.endswith("Graphics Package Power (W)"))
+
+    gpus: list[dict[str, Any]] = []
+    for idx, row in enumerate(rows[1:]):
+        if not row or not row[0].strip():
+            continue
+
+        def fval(i: int | None) -> float | None:
+            if i is None or i >= len(row):
+                return None
+            try:
+                return float(row[i])
+            except ValueError:
+                return None  # "N/A" and friends
+
+        util = fval(i_util)
+        vram_used_b = fval(i_vram_used)
+        vram_total_b = fval(i_vram_total)
+        if util is None and vram_used_b is None:
+            continue
+        temp = fval(i_temp)
+        power = fval(i_power)
+
+        dev = row[0].strip()  # e.g. "card0"
+        bus_id = _sysfs_pci_bus_id(dev)
+        board_vendor = "unknown"
+        name = "AMD GPU"
+        if bus_id:
+            vendor_map = _lspci_vendor_map([bus_id]).get(bus_id)
+            if vendor_map:
+                board_vendor = vendor_map
+            name_map = _lspci_device_name_map([bus_id]).get(bus_id)
+            if name_map:
+                name = name_map
+
+        gpu: dict[str, Any] = {
+            "index": idx,
+            "throttle": {
+                "hw_thermal_slowdown": False,
+                "sw_thermal_slowdown": False,
+            },
+            "name": name,
+            "board_vendor": board_vendor,
+        }
+        if bus_id:
+            gpu["pci_bus_id"] = bus_id
+        if util is not None:
+            gpu["utilization_pct"] = util
+        if vram_used_b is not None:
+            gpu["memory_used_gb"] = round(vram_used_b / 1024**3, 1)
+        if vram_total_b is not None:
+            gpu["memory_total_gb"] = round(vram_total_b / 1024**3, 1)
+        if vram_used_b is not None and vram_total_b:
+            gpu["memory_pct"] = round(vram_used_b / vram_total_b * 100, 1)
+        if temp is not None:
+            gpu["temperature_c"] = round(temp, 1)
+        if power is not None:
+            gpu["power_w"] = round(power, 1)
+        gpus.append(gpu)
+    return gpus
+
+
+def _gpu_amd_sysfs(
+    drm_dir: str = "/sys/class/drm",
+) -> list[dict[str, Any]]:
+    """Last resort when no AMD SMI tool is installed: amdgpu sysfs
+    attributes (``gpu_busy_percent``, ``mem_info_vram_used/total`` bytes,
+    ``temperature1`` milli-°C). No clock or power data here. The
+    amdgpu discriminator is the co-presence of all three attributes
+    (i915 has gpu_busy_percent but no VRAM meminfo). Never raises."""
+    try:
+        cards = sorted(
+            d for d in os.listdir(drm_dir)
+            if re.fullmatch(r"card\d+", d)
+            and os.path.exists(f"{drm_dir}/{d}/device/gpu_busy_percent")
+            and os.path.exists(f"{drm_dir}/{d}/device/mem_info_vram_used")
+            and os.path.exists(f"{drm_dir}/{d}/device/mem_info_vram_total")
+        )
+    except OSError:
+        return []
+
+    gpus: list[dict[str, Any]] = []
+    for card in cards:
+        dev = f"{drm_dir}/{card}/device"
+        try:
+            idx = int(card.removeprefix("card"))
+        except ValueError:
+            continue
+        util = _read_int_file(f"{dev}/gpu_busy_percent")
+        vram_used_b = _read_int_file(f"{dev}/mem_info_vram_used")
+        vram_total_b = _read_int_file(f"{dev}/mem_info_vram_total")
+        temp_milli = _read_int_file(f"{dev}/temperature1")
+        if util is None and vram_used_b is None:
+            continue
+
+        bus_id = _sysfs_pci_bus_id(card)
+        board_vendor = "unknown"
+        name = "AMD GPU"
+        if bus_id:
+            vendor_map = _lspci_vendor_map([bus_id]).get(bus_id)
+            if vendor_map:
+                board_vendor = vendor_map
+            name_map = _lspci_device_name_map([bus_id]).get(bus_id)
+            if name_map:
+                name = name_map
+
+        gpu: dict[str, Any] = {
+            "index": idx,
+            "throttle": {
+                "hw_thermal_slowdown": False,
+                "sw_thermal_slowdown": False,
+            },
+            "name": name,
+            "board_vendor": board_vendor,
+        }
+        if bus_id:
+            gpu["pci_bus_id"] = bus_id
+        if util is not None:
+            gpu["utilization_pct"] = util
+        if vram_used_b is not None:
+            gpu["memory_used_gb"] = round(vram_used_b / 1024**3, 1)
+        if vram_total_b is not None:
+            gpu["memory_total_gb"] = round(vram_total_b / 1024**3, 1)
+        if vram_used_b is not None and vram_total_b:
+            gpu["memory_pct"] = round(vram_used_b / vram_total_b * 100, 1)
+        if temp_milli is not None:
+            gpu["temperature_c"] = round(temp_milli / 1000, 1)
+        gpus.append(gpu)
+    return gpus
+
+
+# Negative-cache for the AMD probe on mixed/NVIDIA-only boxes: amd-smi is
+# a subprocess, so once it reports no AMD GPU we don't re-run it every
+# second — but we DO re-probe periodically so a freshly loaded amdgpu
+# driver (or hotplug) is picked up without a dashboard restart.
+_AMD_NEGATIVE_REPROBE_S = 30.0
+_amd_absent_since: float | None = None
+
+
+def _gpu_amd() -> list[dict[str, Any]]:
+    """AMD GPU metrics: amd-smi (preferred) → rocm-smi (legacy) → sysfs.
+
+    When no AMD GPU is found the result is negative-cached for
+    ``_AMD_NEGATIVE_REPROBE_S`` seconds (see above). Never raises."""
+    global _amd_absent_since
+    if _amd_absent_since is not None:
+        if time.monotonic() - _amd_absent_since < _AMD_NEGATIVE_REPROBE_S:
+            return []
+        _amd_absent_since = None  # re-probe due
+
+    gpus = _gpu_amd_smi()
+    if not gpus:
+        gpus = _gpu_rocm_smi()
+    if not gpus:
+        gpus = _gpu_amd_sysfs()
+    if not gpus:
+        _amd_absent_since = time.monotonic()
+    else:
+        _amd_absent_since = None
+    return gpus
+
+
+def _merge_gpu_lists(nvidia: list[dict[str, Any]],
+                     amd: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge per-vendor GPU lists for mixed-vendor machines.
+
+    Both vendors number their cards from 0 (and the AMD tiers report
+    card indices independently), and the frontend keys its DOM and charts
+    by ``index`` — so the merged list is renumbered 0..n-1 (NVIDIA cards
+    first, in their original order). Each card also gets a ``vendor``
+    tag ("nvidia" / "amd") for clarity and future per-vendor rendering.
+    """
+    merged: list[dict[str, Any]] = []
+    for gpu in nvidia:
+        gpu = dict(gpu)
+        gpu["vendor"] = "nvidia"
+        merged.append(gpu)
+    offset = (max((g["index"] for g in nvidia), default=-1) + 1) if nvidia else 0
+    for gpu in amd:
+        gpu = dict(gpu)
+        gpu["vendor"] = "amd"
+        merged.append(gpu)
+    for i, gpu in enumerate(merged):
+        gpu["index"] = i
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -634,10 +1077,15 @@ def collect_gpu_metrics() -> list[dict[str, Any]]:
             log.info("GPU mode: jetson (SoC: %s)", _JETSON_SOC)
             _jetson_mode_logged = True
         return collect_jetson_gpu_metrics()
-    gpus = _gpu_pynvml()
-    if not gpus:
-        gpus = _gpu_cli()
-    return gpus
+    nvidia = _gpu_pynvml()
+    if not nvidia:
+        nvidia = _gpu_cli()
+    # Mixed-vendor boxes (NVIDIA + AMD) are a supported configuration:
+    # probe the AMD chain regardless of what NVIDIA returned and merge.
+    # On NVIDIA-only boxes the AMD probe is negative-cached (30 s) so the
+    # amd-smi subprocess is not spawned every second.
+    amd = _gpu_amd()
+    return _merge_gpu_lists(nvidia, amd)
 
 
 # ---------------------------------------------------------------------------
@@ -648,7 +1096,10 @@ def collect_gpu_metrics() -> list[dict[str, Any]]:
 DEFAULT_LLAMA_URL = "http://127.0.0.1:5001"
 
 # Base URL of the vLLM server (overridable via --vllm-url).
-DEFAULT_VLLM_URL = "http://127.0.0.1:8000"
+DEFAULT_VLLM_URL = "http://127.0.0.1:5001"
+
+# Base URL of the LiteLLM proxy (overridable via --litellm-url).
+DEFAULT_LITELLM_URL = "http://127.0.0.1:4000"
 
 # How often (seconds) to re-fetch /props; model info only changes on reload.
 _LLAMA_PROPS_TTL = 30.0
@@ -1371,6 +1822,14 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
 
 # Stale-hold: last successful vLLM scrape (monotonic ts + dict).
 _VLLM_STALE_MAX_AGE_S = 15.0
+
+# Rate window (all LLM backends): the gap between two successful
+# scrapes must be within 0.5 s (avoid dividing tiny deltas by tiny
+# times) and 15 s (== the stale-hold window). A longer gap means the
+# scrape was down; the LiteLLM collector holds the last computed rate
+# instead of omitting it, so the UI never flashes "–" on recovery.
+_RATE_MAX_GAP_S = 15.0
+
 _vllm_last_good: tuple[float, dict[str, Any]] | None = None
 
 # Previous successful scrape's cumulative counters + histogram sums, used
@@ -1650,7 +2109,7 @@ def collect_vllm_metrics(base_url: str) -> dict[str, Any] | None:
         out["spec_decode_accepted_tokens_total"] = round(spec_accepted, 1)
 
     # --- Rates (Δ counters / elapsed; window guards) ---
-    rate_ok = prev is not None and 0.5 <= elapsed <= 5.0
+    rate_ok = prev is not None and 0.5 <= elapsed <= _RATE_MAX_GAP_S
     # Each rate is computed only when the previous scrape has that counter
     # (a version rename mid-flight may lack it): omit the rate key otherwise.
     if rate_ok and gen_total is not None and prev.get("gen") is not None:
@@ -1806,6 +2265,517 @@ def collect_vllm_metrics(base_url: str) -> dict[str, Any] | None:
 
 
 # ---------------------------------------------------------------------------
+# LiteLLM Monitoring
+# ---------------------------------------------------------------------------
+
+# Stale-hold: last successful LiteLLM scrape (monotonic ts + dict).
+_LITELLM_STALE_MAX_AGE_S = 15.0
+_litellm_last_good: tuple[float, dict[str, Any]] | None = None
+
+# Previous successful scrape's cumulative counters + histogram sums, used
+# to compute rates and windowed means from per-scrape deltas.
+_litellm_prev: dict[str, Any] | None = None
+
+# Warn-once guard for LLM auto mode: the first time LiteLLM wins, tell the
+# operator it is the active backend and how to pin the choice.
+_litellm_tie_warned = False
+
+
+def collect_litellm_metrics(
+    base_url: str, token: str | None = None
+) -> dict[str, Any] | None:
+    """Scrape a LiteLLM proxy ``/metrics`` and build the dashboard snapshot.
+
+    Returns ``None`` when the server is unreachable, or the body carries
+    no ``litellm_`` series. Never raises. Mirrors the vLLM collector
+    conventions: 15 s stale-hold on failure, Δ-counter rates with a
+    0.5–5 s scrape window, windowed means for histograms.
+
+    ``token`` adds an ``Authorization: Bearer`` header when the proxy
+    requires auth for its metrics endpoint
+    (``require_auth_for_metrics_endpoint``).
+
+    Metric names verified against the LiteLLM proxy prometheus callback
+    (docs.litellm.ai/docs/proxy/prometheus). Counters are exposed with the
+    prometheus_client ``_total`` suffix; the bare name is tried as a
+    fallback for custom/older builds. Token counters are DISJOINT
+    (input + output), unlike vLLM's nested cached ⊂ prompt accounting.
+
+    ``gen_tokens_per_s_by_model``: per-model gen tokens/s grouped by the
+    client-facing alias (requested_model → litellm_model_name → model);
+    multiple deployments of one model are summed. Used by the UI's
+    per-model chart lines (shown only when 2+ models are present).
+    """
+    global _litellm_last_good, _litellm_prev
+
+    def _stale_or_none() -> dict[str, Any] | None:
+        if _litellm_last_good is not None:
+            ts, held = _litellm_last_good
+            if time.monotonic() - ts <= _LITELLM_STALE_MAX_AGE_S:
+                out = dict(held)
+                out["status"] = "stale"
+                return out
+        return None
+
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    try:
+        req = urllib.request.Request(
+            base_url.rstrip("/") + "/metrics", headers=headers)
+        with urllib.request.urlopen(req, timeout=2) as r:
+            body = r.read().decode()
+    except Exception:  # noqa: BLE001 – collector must never raise
+        return _stale_or_none()
+
+    # Endpoint up but no litellm_ series (e.g. a different service, or the
+    # prometheus callback not configured): keep the <=15 s stale hold.
+    metrics = _parse_prometheus_labeled(body, "litellm_")
+    if not any(k.startswith("litellm_") for k in metrics):
+        return _stale_or_none()
+
+    out: dict[str, Any] = {"status": "up"}
+    now = time.monotonic()
+    prev = _litellm_prev
+    elapsed = now - prev["ts"] if prev is not None else 0.0
+
+    # --- Model name: requested_model is the client-facing alias; the
+    # literal "None" label means unresolved in LiteLLM — skip it. ---
+    model_name = None
+    for label in ("requested_model", "litellm_model_name", "model"):
+        vals: set[str] | None = None
+        for entry in metrics.values():
+            v = entry.get("labels", {}).get(label)
+            if v:
+                vals = v if vals is None else vals | v
+        if vals:
+            candidates = sorted(v for v in vals if v and v != "None")
+            if candidates:
+                model_name = candidates[0]
+                break
+    if model_name:
+        out["model"] = model_name
+
+    # --- Gauges ---
+    # requests in flight across workers (pod-queue-depth gauge)
+    val = _vllm_sum(_vllm_get_entry(metrics, "litellm_in_flight_requests"))
+    if val is not None:
+        out["requests_processing"] = round(val, 1)
+
+    # --- Counters (cumulative; input/output are DISJOINT) ---
+    gen_total = _vllm_sum(_vllm_get_entry(metrics,
+        "litellm_output_tokens_metric_total",
+        "litellm_output_tokens_metric"))
+    prompt_total = _vllm_sum(_vllm_get_entry(metrics,
+        "litellm_input_tokens_metric_total",
+        "litellm_input_tokens_metric"))
+    cached_total = _vllm_sum(_vllm_get_entry(metrics,
+        "litellm_input_cached_tokens_metric_total",
+        "litellm_input_cached_tokens_metric"))
+    req_total = _vllm_sum(_vllm_get_entry(metrics,
+        "litellm_proxy_total_requests_metric_total",
+        "litellm_proxy_total_requests_metric"))
+    req_failed = _vllm_sum(_vllm_get_entry(metrics,
+        "litellm_proxy_failed_requests_metric_total",
+        "litellm_proxy_failed_requests_metric"))
+    spend = _vllm_sum(_vllm_get_entry(metrics,
+        "litellm_spend_metric_total",
+        "litellm_spend_metric"))
+
+    if gen_total is not None:
+        out["gen_tokens_total"] = round(gen_total, 1)
+    if prompt_total is not None:
+        out["prompt_tokens_total"] = round(prompt_total, 1)
+    if req_total is not None:
+        out["requests_completed_total"] = round(req_total, 1)
+    if req_failed is not None:
+        out["requests_failed_total"] = round(req_failed, 1)
+    if spend is not None:
+        out["spend_usd"] = round(spend, 4)
+
+    # --- Per-model gen totals (grouped by client-facing alias) ---
+    # Grouped by the client-facing alias (requested_model →
+    # litellm_model_name → model); several deployments of the same model
+    # (different model_id) are summed. The literal "None" label means
+    # unresolved in LiteLLM — skip it.
+    gen_by_model: dict[str, float] = {}
+    entry = _vllm_get_entry(metrics,
+        "litellm_output_tokens_metric_total",
+        "litellm_output_tokens_metric")
+    if entry is not None:
+        for labelset, val in entry["series"].items():
+            labels = dict(labelset)
+            name = None
+            for lab in ("requested_model", "litellm_model_name", "model"):
+                v = labels.get(lab)
+                if v and v != "None":
+                    name = v
+                    break
+            if name is not None:
+                gen_by_model[name] = gen_by_model.get(name, 0.0) + val
+
+    # --- Rates (Δ counters / elapsed; window guards) ---
+    # The gap between two successful scrapes must be within
+    # 0.5–_RATE_MAX_GAP_S (== the 15 s stale-hold window). A longer
+    # gap means the scrape was down (e.g. right after an outage): the
+    # last computed rate is held instead of omitted, so the UI never
+    # flashes "–" on recovery.
+    rate_ok = prev is not None and 0.5 <= elapsed <= _RATE_MAX_GAP_S
+    if rate_ok:
+        gen_rate: float | None = None
+        prompt_rate: float | None = None
+        if gen_total is not None and prev.get("gen") is not None:
+            if gen_total < prev["gen"]:
+                gen_rate = 0.0  # counter reset
+            else:
+                gen_rate = round(
+                    max(0.0, gen_total - prev["gen"]) / elapsed, 1)
+        if prompt_total is not None and prev.get("prompt") is not None:
+            if prompt_total < prev["prompt"]:
+                prompt_rate = 0.0  # counter reset
+            else:
+                prompt_rate = round(
+                    max(0.0, prompt_total - prev["prompt"]) / elapsed, 1)
+        prev_by_model = prev.get("gen_by_model") or {}
+        per_model_rates: dict[str, float] = {}
+        for name, total in gen_by_model.items():
+            p = prev_by_model.get(name)
+            if p is None:
+                continue  # new model: no baseline yet
+            if total < p:
+                per_model_rates[name] = 0.0  # counter reset
+            else:
+                per_model_rates[name] = round(
+                    max(0.0, total - p) / elapsed, 1)
+        last_rate: dict[str, Any] = {
+            "gen": gen_rate, "prompt": prompt_rate,
+            "per_model": per_model_rates or None,
+        }
+    else:
+        last_rate = (prev or {}).get("last_rate")
+
+    if last_rate is not None:
+        if last_rate["gen"] is not None:
+            out["gen_tokens_per_s"] = last_rate["gen"]
+        if last_rate["prompt"] is not None:
+            out["prompt_tokens_per_s"] = last_rate["prompt"]
+        if last_rate.get("per_model"):
+            out["gen_tokens_per_s_by_model"] = last_rate["per_model"]
+
+    # --- Prefix (provider-side prompt) cache hit rate (lifetime ratio) ---
+    if (cached_total is not None and prompt_total is not None
+            and prompt_total > 0):
+        out["prefix_cache_hit_pct"] = round(
+            100.0 * cached_total / prompt_total, 1)
+
+    # --- Latency ---
+    # TTFT: windowed mean (Δsum/Δcount); streaming requests only; omit when
+    # Δcount <= 0 (no streaming traffic in the window).
+    ttft_sum = _vllm_sum(_vllm_get_entry(metrics,
+        "litellm_llm_api_time_to_first_token_metric_sum"))
+    ttft_count = _vllm_sum(_vllm_get_entry(metrics,
+        "litellm_llm_api_time_to_first_token_metric_count"))
+    if rate_ok and ttft_sum is not None and ttft_count is not None:
+        d_count = ttft_count - prev.get("ttft_count", 0)  # type: ignore[union-attr]
+        if d_count > 0:
+            d_sum = max(0.0, ttft_sum - prev.get("ttft_sum", 0))  # type: ignore[union-attr]
+            out["ttft_seconds"] = round(d_sum / d_count, 1)
+
+    # ITL: per-output-token latency gauge (seconds) → ms; max across
+    # deployments/keys.
+    val = _vllm_max(_vllm_get_entry(metrics,
+        "litellm_deployment_latency_per_output_token"))
+    if val is not None:
+        out["itl_ms"] = round(val * 1000, 1)
+
+    # E2E (proxy arrival → end of processing): lifetime mean (sum/count).
+    e2e_sum = _vllm_sum(_vllm_get_entry(metrics,
+        "litellm_request_total_latency_metric_sum"))
+    e2e_count = _vllm_sum(_vllm_get_entry(metrics,
+        "litellm_request_total_latency_metric_count"))
+    if e2e_sum is not None and e2e_count is not None and e2e_count > 0:
+        out["e2e_latency_seconds"] = round(e2e_sum / e2e_count, 1)
+
+    # Upstream LLM API call latency: lifetime mean (excludes proxy auth +
+    # queue overhead).
+    api_sum = _vllm_sum(_vllm_get_entry(metrics,
+        "litellm_llm_api_latency_metric_sum"))
+    api_count = _vllm_sum(_vllm_get_entry(metrics,
+        "litellm_llm_api_latency_metric_count"))
+    if api_sum is not None and api_count is not None and api_count > 0:
+        out["llm_api_latency_seconds"] = round(api_sum / api_count, 1)
+
+    # --- Usage (derived) ---
+    if gen_total is not None or prompt_total is not None:
+        usage: dict[str, Any] = {}
+        total = 0
+        if prompt_total is not None:
+            total += int(round(prompt_total))
+        if gen_total is not None:
+            total += int(round(gen_total))
+        usage["total_tokens"] = total
+        if gen_total is not None:
+            usage["gen_tokens"] = int(round(gen_total))
+        if (cached_total is not None and prompt_total is not None
+                and prompt_total > 0):
+            usage["prompt_cached_pct"] = round(
+                100.0 * cached_total / prompt_total, 1)
+        if spend is not None:
+            usage["total_spend_usd"] = round(spend, 4)
+        # uptime from process_start_time_seconds (cross-host clock, clamp ≥ 0)
+        proc_start = metrics.get("process_start_time_seconds")
+        if proc_start is not None and proc_start.get("series"):
+            start_val = next(iter(proc_start["series"].values()))
+            usage["uptime_s"] = max(0, int(time.time() - start_val))
+        out["usage"] = usage
+
+    # --- Update previous state ---
+    new_prev: dict[str, Any] = {"ts": now}
+    for key, val in (("gen", gen_total), ("prompt", prompt_total),
+                     ("ttft_sum", ttft_sum), ("ttft_count", ttft_count),
+                     ("e2e_sum", e2e_sum), ("e2e_count", e2e_count)):
+        if val is not None:
+            new_prev[key] = val
+    if gen_by_model:
+        new_prev["gen_by_model"] = gen_by_model
+    if last_rate is not None:
+        new_prev["last_rate"] = last_rate
+    _litellm_prev = new_prev
+
+    _litellm_last_good = (now, out)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Upstream dashboard aggregation (multi-system consolidation)
+# ---------------------------------------------------------------------------
+
+# 15 s stale-hold per upstream (mirrors _LITELLM_STALE_MAX_AGE_S): a
+# failed fetch keeps the last good entry flagged "stale" for 15 s, then
+# the entry drops to "down".
+_UPSTREAM_STALE_MAX_AGE_S = 15.0
+
+# Strict sanitizer key list: only per-system keys are forwarded from an
+# upstream snapshot. `systems` is explicitly excluded (no recursion) and
+# any other app-level key is dropped (a newer upstream's extra keys are
+# silently ignored; an older upstream without `systems` works fine).
+_UPSTREAM_KEYS = ("timestamp", "cpu", "cpu_per_core", "memory", "gpus",
+                 "swap", "host_health", "llm_enabled", "llm")
+
+# Last good entry per upstream name: {name: (monotonic ts, entry dict)}.
+# Each name is touched by exactly one fetch thread -> no locking needed.
+_upstream_last_good: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+def collect_upstream_metrics(url: str, name: str) -> dict[str, Any] | None:
+    """Fetch one upstream dashboard's ``/api/metrics`` and sanitize it
+    into a per-system entry.
+
+    Returns ``{"name", "status": "up"|"stale", "metrics"}`` or ``None``
+    (never fetched yet, or the 15 s stale-hold expired). Never raises.
+    Mirrors the LLM collector conventions: 2 s timeout, per-name 15 s
+    stale-hold, strict sanitizer (no ``systems`` recursion).
+    """
+    def _stale_or_none() -> dict[str, Any] | None:
+        held = _upstream_last_good.get(name)
+        if held is not None:
+            ts, entry = held
+            if time.monotonic() - ts <= _UPSTREAM_STALE_MAX_AGE_S:
+                out = dict(entry)
+                out["status"] = "stale"
+                return out
+        return None
+
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/api/metrics",
+                                    timeout=2) as r:
+            payload = json.loads(r.read().decode())
+    except Exception:  # noqa: BLE001 - collector must never raise
+        return _stale_or_none()
+
+    if not isinstance(payload, dict):
+        return _stale_or_none()
+
+    metrics = {k: payload[k] for k in _UPSTREAM_KEYS if k in payload}
+    out = {"name": name, "status": "up", "metrics": metrics}
+    _upstream_last_good[name] = (time.monotonic(), out)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Configuration (config.yaml + CLI resolution)
+# ---------------------------------------------------------------------------
+
+# Built-in defaults (used when neither CLI nor config provides a value).
+_CONFIG_DEFAULTS = {
+    "host": "0.0.0.0",
+    "port": 5000,
+    "poll_interval": 1.0,
+    "llm_backend": "auto",
+    "llama_enabled": True,
+    "llama_url": DEFAULT_LLAMA_URL,
+    "vllm_url": DEFAULT_VLLM_URL,
+    "litellm_url": DEFAULT_LITELLM_URL,
+    "litellm_token": None,
+}
+_CONFIG_BACKENDS = ("auto", "llama", "vllm", "litellm")
+_CONFIG_KNOWN_KEYS = frozenset(set(_CONFIG_DEFAULTS) | {"upstreams"})
+
+
+def load_config(path: str | None = None,
+                explicit: bool = False) -> dict[str, Any]:
+    """Load a YAML config file into a dict.
+
+    * auto-detected (``path is None``): ``./config.yaml`` is used only
+      when present; absent -> ``{}`` (silent).
+    * explicit ``--config PATH`` absent -> log error + ``sys.exit(1)``
+      (user intent - fail fast).
+    * malformed YAML / wrong top-level type -> log error + exit 1.
+    * unknown keys -> warn + ignore (forward compatibility).
+    * invalid known keys -> log error + exit 1.
+    """
+    if path is None:
+        if not os.path.isfile("config.yaml"):
+            return {}
+        path = "config.yaml"
+    if not os.path.isfile(path):
+        if explicit:
+            log.error("Config file not found: %s", path)
+            sys.exit(1)
+        return {}
+    try:
+        import yaml
+    except ImportError:
+        if explicit:
+            log.error("PyYAML is required to read %s "
+                     "(pip install PyYAML)", path)
+            sys.exit(1)
+        log.warning("PyYAML not installed - ignoring config file %s",
+                    path)
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+    except yaml.YAMLError as exc:
+        log.error("Malformed YAML in %s: %s", path, exc)
+        sys.exit(1)
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        log.error("Config file %s must be a YAML mapping", path)
+        sys.exit(1)
+    for key in data:
+        if key not in _CONFIG_KNOWN_KEYS:
+            log.warning("Unknown config key %r in %s - ignoring", key, path)
+
+    def _fail(msg: str) -> None:
+        log.error("Invalid config in %s: %s", path, msg)
+        sys.exit(1)
+
+    if "port" in data and (
+            isinstance(data["port"], bool)
+            or not isinstance(data["port"], int)):
+        _fail("port must be an integer")
+    if "poll_interval" in data:
+        pi = data["poll_interval"]
+        if (isinstance(pi, bool) or not isinstance(pi, (int, float))
+                or pi <= 0):
+            _fail("poll_interval must be a number > 0")
+    if "llm_backend" in data and data["llm_backend"] not in _CONFIG_BACKENDS:
+        _fail(f"llm_backend must be one of {', '.join(_CONFIG_BACKENDS)}")
+    for key in ("host", "llama_url", "vllm_url", "litellm_url"):
+        if key in data and not isinstance(data[key], str):
+            _fail(f"{key} must be a string")
+    if "llama_enabled" in data and not isinstance(
+            data["llama_enabled"], bool):
+        _fail("llama_enabled must be true/false")
+    if "litellm_token" in data and data["litellm_token"] is not None \
+            and not isinstance(data["litellm_token"], str):
+        _fail("litellm_token must be a string or null")
+    if "upstreams" in data and not isinstance(data["upstreams"], list):
+        _fail("upstreams must be a list of {name, url} entries")
+    return data
+
+
+def merge_upstreams(config_upstreams: list | None,
+                    cli_upstreams: list[str] | None) -> list[dict[str, str]]:
+    """Merge config + CLI upstream entries.
+
+    Malformed entries (missing/empty ``name`` or ``url``) -> warn + skip;
+    duplicate names within one source -> warn, last wins; a CLI entry
+    overrides a config entry with the same name. Order: config order,
+    then CLI-only names in CLI order.
+    """
+    def _clean(entries: list | None,
+               source: str) -> dict[str, dict[str, str]]:
+        out: dict[str, dict[str, str]] = {}
+        for e in entries or []:
+            name = e.get("name") if isinstance(e, dict) else None
+            url = e.get("url") if isinstance(e, dict) else None
+            if (not isinstance(name, str) or not name
+                    or not isinstance(url, str) or not url):
+                log.warning("Skipping malformed upstream entry %r (%s)",
+                            e, source)
+                continue
+            if name in out:
+                log.warning("Duplicate upstream name %r (%s) - last wins",
+                            name, source)
+            out[name] = {"name": name, "url": url.rstrip("/")}
+        return out
+
+    cfg = _clean(config_upstreams, "config")
+    cli: dict[str, dict[str, str]] = {}
+    cli_order: list[str] = []
+    for spec in cli_upstreams or []:
+        if "=" not in spec:
+            log.warning("Skipping malformed --upstream %r "
+                       "(expected name=url)", spec)
+            continue
+        name, url = spec.split("=", 1)
+        name, url = name.strip(), url.strip()
+        if not name or not url:
+            log.warning("Skipping malformed --upstream %r "
+                       "(empty name or url)", spec)
+            continue
+        if name in cli:
+            log.warning("Duplicate --upstream name %r - last wins", name)
+        cli[name] = {"name": name, "url": url.rstrip("/")}
+        if name not in cli_order:
+            cli_order.append(name)
+
+    merged = {**cfg, **cli}
+    seen: list[str] = []
+    for n in list(cfg.keys()) + cli_order:
+        if n not in seen:
+            seen.append(n)
+    return [merged[n] for n in seen]
+
+
+def resolve_settings(args: argparse.Namespace,
+                    config: dict[str, Any]) -> dict[str, Any]:
+    """Resolve CLI > config > built-in defaults into a settings dict."""
+    def pick(key: str, cli_value: Any) -> Any:
+        return cli_value if cli_value is not None else config.get(
+            key, _CONFIG_DEFAULTS[key])
+
+    llama_enabled = config.get("llama_enabled", True)
+    if args.no_llama:
+        llama_enabled = False  # flag wins when present
+
+    return {
+        "host": pick("host", args.host),
+        "port": pick("port", args.port),
+        "poll_interval": pick("poll_interval", args.poll_interval),
+        "llama_url": pick("llama_url", args.llama_url),
+        "vllm_url": pick("vllm_url", args.vllm_url),
+        "litellm_url": pick("litellm_url", args.litellm_url),
+        "litellm_token": pick("litellm_token", args.litellm_token),
+        "llm_backend": pick("llm_backend", args.llm_backend),
+        "llama_enabled": llama_enabled,
+        "upstreams": merge_upstreams(config.get("upstreams"),
+                                    args.upstream),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Swap usage + I/O rate (T6)
 # ---------------------------------------------------------------------------
 
@@ -1931,6 +2901,8 @@ class MetricsCollector(threading.Thread):
         llama_enabled: bool = True,
         vllm_url: str = DEFAULT_VLLM_URL,
         llm_backend: str = "auto",
+        litellm_url: str = DEFAULT_LITELLM_URL,
+        litellm_token: str | None = None,
     ) -> None:
         super().__init__(daemon=True)
         self.poll_interval = poll_interval
@@ -1938,9 +2910,29 @@ class MetricsCollector(threading.Thread):
         self.llama_enabled = llama_enabled
         self.vllm_url = vllm_url
         self.llm_backend = llm_backend
+        self.litellm_url = litellm_url
+        self.litellm_token = litellm_token
         # Bounded queue – maxsize entries; oldest dropped when full.
         self._queue: queue.Queue[str] = queue.Queue(maxsize=30)
         self.running = True
+        # The LLM scrape runs on its own 1 s cadence, decoupled from
+        # the main cycle (which includes GPU/health probes that can
+        # make the cycle exceed the rate window). This keeps the
+        # token-rate window ~poll_interval even when the main cycle
+        # is slow.
+        self._llm_latest: dict[str, Any] | None = None
+        self._llm_ready = threading.Event()
+        self._llm_stop = threading.Event()
+        self._llm_thread = threading.Thread(target=self._llm_loop,
+                                           daemon=True)
+        # Upstream dashboard aggregation: one fetch thread per upstream
+        # (started from __main__ via start_upstreams; the collector is
+        # already running by then). _upstream_latest is initialized here
+        # because _collect() runs from import time, before start_upstreams.
+        self._upstream_latest: dict[str, dict[str, Any] | None] = {}
+        self._upstream_names: list[str] = []
+        self._upstream_stop = threading.Event()
+        self._upstream_threads: list[threading.Thread] = []
 
         # Seed psutil (first cpu_percent call returns 0.0 and must be discarded)
         psutil.cpu_percent()
@@ -1965,16 +2957,56 @@ class MetricsCollector(threading.Thread):
             except queue.Empty:
                 break
 
+    def _llm_loop(self) -> None:
+        """LLM scrape on its own cadence (decoupled from the main
+        cycle, which includes GPU/health probes). Keeps the token-rate
+        window ~poll_interval even when the main cycle is slow."""
+        while self.running:
+            try:
+                self._llm_latest = self._collect_llm()
+            except Exception:  # noqa: BLE001
+                log.exception("Error collecting LLM metrics")
+            self._llm_ready.set()
+            self._llm_stop.wait(self.poll_interval)
+
+    def start_upstreams(self, entries: list[dict[str, str]]) -> None:
+        """Spawn one daemon fetch thread per configured upstream (a no-op
+        for an empty list; names already started are skipped). Called
+        from __main__ after config resolution; the collector is already
+        running."""
+        for entry in entries:
+            name, url = entry["name"], entry["url"]
+            if name in self._upstream_names:
+                continue
+            t = threading.Thread(target=self._upstream_loop,
+                                args=(name, url), daemon=True)
+            self._upstream_threads.append(t)
+            self._upstream_names.append(name)
+            t.start()
+
+    def _upstream_loop(self, name: str, url: str) -> None:
+        """Fetch one upstream's /api/metrics on the main poll cadence.
+        No ready-wait: upstreams may be slow to come up; the UI shows
+        "down" until the first fetch lands."""
+        while self.running:
+            try:
+                self._upstream_latest[name] = collect_upstream_metrics(
+                    url, name)
+            except Exception:  # noqa: BLE001
+                log.exception("Error collecting upstream %s", name)
+            self._upstream_stop.wait(self.poll_interval)
+
     def _collect_llm(self) -> dict[str, Any] | None:
         """Stateless LLM backend selection (re-evaluated every cycle).
 
-        auto semantics: try vLLM first, fall through to llama. The
-        per-collector 15 s stale-hold IS the hysteresis: a <15 s blip
-        keeps the current backend flagged stale; a real outage falls
-        through to the other backend, and recovery flips back on the
-        next cycle. Pinned backend skips the other branch entirely.
+        auto semantics: try vLLM first, then the LiteLLM proxy, fall
+        through to llama.cpp. The per-collector 15 s stale-hold IS the
+        hysteresis: a <15 s blip keeps the current backend flagged
+        stale; a real outage falls through to the next backend, and
+        recovery flips back on the next cycle. A pinned backend skips
+        the other branches entirely.
         """
-        global _llm_tie_warned
+        global _llm_tie_warned, _litellm_tie_warned
         if not self.llama_enabled:
             return None
         if self.llm_backend in ("auto", "vllm"):
@@ -1993,6 +3025,19 @@ class MetricsCollector(threading.Thread):
                         "--llm-backend llama (logged once).",
                         self.vllm_url)
                 return data
+        if self.llm_backend in ("auto", "litellm"):
+            data = collect_litellm_metrics(self.litellm_url,
+                                           self.litellm_token)
+            if data is not None:
+                data["backend"] = "litellm"
+                if self.llm_backend == "auto" and not _litellm_tie_warned:
+                    _litellm_tie_warned = True
+                    log.warning(
+                        "LLM auto mode: using LiteLLM proxy at %s. If "
+                        "llama.cpp is also reachable and you want it "
+                        "instead, pin --llm-backend llama (logged once).",
+                        self.litellm_url)
+                return data
         if self.llm_backend in ("auto", "llama"):
             data = collect_llama_metrics(self.llama_url)
             if data is not None:
@@ -2007,7 +3052,7 @@ class MetricsCollector(threading.Thread):
 
         vm = psutil.virtual_memory()
 
-        return {
+        metrics = {
             "timestamp": time.time(),
             "cpu": round(cpu_overall, 1),
             "cpu_per_core": [round(c, 1) for c in cpu_per_core],
@@ -2023,10 +3068,27 @@ class MetricsCollector(threading.Thread):
             # Stable signal for the frontend: the LLM section is on by
             # default; --no-llama skips scraping entirely and hides the card.
             "llm_enabled": self.llama_enabled,
-            "llm": self._collect_llm(),
+            "llm": self._llm_latest,
         }
+        # Multi-system consolidation: the local system first (same values
+        # as the top-level keys), then one entry per configured upstream.
+        # `list()` snapshot: start_upstreams may still be appending.
+        systems = [{"name": "local", "status": "up",
+                   "metrics": dict(metrics)}]
+        for name in list(self._upstream_names):
+            entry = self._upstream_latest.get(name)
+            systems.append(entry if entry is not None else
+                           {"name": name, "status": "down",
+                            "metrics": None})
+        metrics["systems"] = systems
+        return metrics
 
     def run(self) -> None:
+        self._llm_thread.start()
+        # Wait for the first LLM cycle so the first snapshot is
+        # complete (matches the previous inline behavior); capped so a
+        # hanging probe cannot stall startup forever.
+        self._llm_ready.wait(timeout=10)
         while self.running:
             try:
                 metrics = self._collect()
@@ -2098,32 +3160,68 @@ def api_metrics() -> Response:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Resource & GPU Utilization Dashboard")
-    parser.add_argument("--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=5000, help="Port number (default: 5000)")
-    parser.add_argument("--llama-url", default=DEFAULT_LLAMA_URL,
+    parser.add_argument("--config", default=None,
+                        help="YAML config file (default: ./config.yaml when "
+                             "present). CLI arguments override config values, "
+                             "which override built-in defaults.")
+    parser.add_argument("--host", default=None, help="Bind address (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=None, help="Port number (default: 5000)")
+    parser.add_argument("--poll-interval", type=float, default=None,
+                        help="Poll interval in seconds (default: 1.0)")
+    parser.add_argument("--llama-url", default=None,
                         help="Base URL of llama.cpp llama-server (expects /metrics enabled via --metrics). "
                              "The default http://127.0.0.1:5001 works when the dashboard and "
                              "llama-server run on the same host; pass a remote URL otherwise, "
                              "e.g. http://<llama-host>:5001")
-    parser.add_argument("--vllm-url", default=DEFAULT_VLLM_URL,
+    parser.add_argument("--vllm-url", default=None,
                         help="Base URL of a vLLM server (expects /metrics). "
-                             "The default http://127.0.0.1:8000 works when the dashboard and "
+                             "The default http://127.0.0.1:5001 works when the dashboard and "
                              "vLLM run on the same host; pass a remote URL otherwise, "
                              "e.g. http://<vllm-host>:8000")
-    parser.add_argument("--llm-backend", default="auto", choices=["auto", "llama", "vllm"],
+    parser.add_argument("--litellm-url", default=None,
+                        help="Base URL of a LiteLLM proxy (expects /metrics with the "
+                             "prometheus callback enabled). "
+                             "The default http://127.0.0.1:4000 works when the dashboard and "
+                             "the proxy run on the same host; pass a remote URL otherwise, "
+                             "e.g. http://<litellm-host>:4000")
+    parser.add_argument("--litellm-token", default=None,
+                        help="Bearer token for the LiteLLM /metrics endpoint "
+                             "(only needed when require_auth_for_metrics_endpoint is set)")
+    parser.add_argument("--llm-backend", default=None,
+                        choices=["auto", "llama", "vllm", "litellm"],
                         help="LLM backend selection (default: auto). "
-                             "auto tries vLLM first, then llama.cpp; "
-                             "pin to 'llama' or 'vllm' to skip the other.")
+                             "auto tries vLLM first, then the LiteLLM proxy, "
+                             "then llama.cpp; pin to 'llama', 'vllm' or 'litellm' "
+                             "to skip the others.")
     parser.add_argument("--no-llama", action="store_true",
                         help="disable the LLM section (enabled by default)")
+    parser.add_argument("--upstream", action="append", default=[],
+                        metavar="NAME=URL",
+                        help="Upstream dashboard to consolidate (repeatable; also "
+                             "available as config.yaml `upstreams`). Each upstream "
+                             "runs this same app, e.g. NAME=http://host:5000")
     args = parser.parse_args()
 
-    collector.llama_url = args.llama_url
-    collector.llama_enabled = not args.no_llama
-    collector.vllm_url = args.vllm_url
-    collector.llm_backend = args.llm_backend
+    config = load_config(args.config, explicit=args.config is not None)
+    settings = resolve_settings(args, config)
 
-    llm_status = "disabled" if args.no_llama else f"backend={args.llm_backend}, vllm={args.vllm_url}, llama={args.llama_url}"
-    log.info("Starting Resource Dashboard on http://%s:%d (LLM: %s)",
-             args.host, args.port, llm_status)
-    app.run(host=args.host, port=args.port, debug=False)
+    collector.poll_interval = settings["poll_interval"]
+    collector.llama_url = settings["llama_url"]
+    collector.llama_enabled = settings["llama_enabled"]
+    collector.vllm_url = settings["vllm_url"]
+    collector.litellm_url = settings["litellm_url"]
+    collector.litellm_token = settings["litellm_token"]
+    collector.llm_backend = settings["llm_backend"]
+    collector.start_upstreams(settings["upstreams"])
+
+    llm_status = "disabled" if not settings["llama_enabled"] else (
+        f"backend={settings['llm_backend']}, vllm={settings['vllm_url']}, "
+        f"litellm={settings['litellm_url']}, llama={settings['llama_url']}")
+    up_status = (f", upstreams={', '.join(u['name'] for u in settings['upstreams'])}"
+                if settings["upstreams"] else "")
+    log.info("Starting Resource Dashboard on http://%s:%d (LLM: %s%s)",
+             settings["host"], settings["port"], llm_status, up_status)
+    # threaded=True: the dev server is single-threaded by default, so a client
+    # holding the long-lived SSE /events stream would make every other request
+    # (incl. /api/metrics from an aggregating dashboard) queue or 503.
+    app.run(host=settings["host"], port=settings["port"], debug=False, threaded=True)

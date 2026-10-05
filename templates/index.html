@@ -295,6 +295,74 @@
         height: 6px;
       }
     }
+
+    /* ---- System tabs (multi-system consolidation) ---- */
+    .sys-tabs {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: center;
+      margin-bottom: 16px;
+    }
+
+    .sys-tab {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--card-bg);
+      color: var(--muted);
+      border: 1px solid transparent;
+      border-radius: 999px;
+      padding: 6px 14px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    .sys-tab.active {
+      color: var(--text);
+      border-color: var(--accent);
+      background: rgba(99,102,241,.15);
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      display: inline-block;
+      flex: none;
+    }
+
+    .dot.up { background: var(--green); }
+    .dot.stale { background: var(--yellow); }
+    .dot.down { background: var(--red); }
+
+    /* ---- Fleet summary strip ---- */
+    .fleet-row {
+      display: grid;
+      grid-template-columns: 2fr 1fr 1fr 1fr 1.2fr;
+      gap: 8px;
+      align-items: center;
+      padding: 6px 0;
+      border-bottom: 1px solid rgba(255,255,255,.06);
+      font-size: 0.85rem;
+    }
+
+    .fleet-row.head {
+      color: var(--muted);
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .fleet-name {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 600;
+    }
+
+    .fleet-val { text-align: right; }
   </style>
 </head>
 <body>
@@ -306,6 +374,21 @@
 
   <h1>⚡ Resource Dashboard-{{ hostname }}</h1>
   <p class="subtitle" id="clock"></p>
+
+  <!-- System tabs (multi-system consolidation; Fleet is the default view) -->
+  <div class="sys-tabs" id="sys-tabs"></div>
+
+  <!-- Fleet (summary) view: shown while the Fleet tab is selected -->
+  <div class="gpu-section" id="fleet-section" style="margin-top:16px;">
+    <div class="card">
+      <h2>Fleet tokens/s</h2>
+      <div id="fleet-strip"></div>
+      <div class="chart-wrap" style="margin-top:16px;"><canvas id="fleetChart"></canvas></div>
+    </div>
+  </div>
+
+  <!-- Per-system detail sections (hidden while the Fleet tab is selected) -->
+  <div id="detail-sections" style="display:none;">
 
   <!-- GPU section -->
   <div class="gpu-section" style="margin-top:16px;">
@@ -347,13 +430,22 @@
           <div class="gauge-label">spec accept (lifetime)</div>
         </div>
       </div>
-      <!-- vLLM sub-lines (hidden for llama.cpp backend) -->
+      <!-- vLLM sub-lines (hidden for other backends) -->
       <div id="vllm-details" style="display:none;margin-top:10px;font-size:0.85rem;color:#94a3b8;">
         <span id="vllm-ttft">TTFT –</span>
         <span id="vllm-itl"> · ITL –</span>
         <span id="vllm-e2e"> · E2E –</span>
         <span id="vllm-prefix-cache"> · prefix cache –</span>
         <span id="vllm-kv-config"> · KV –</span>
+      </div>
+      <!-- LiteLLM sub-lines (hidden for other backends) -->
+      <div id="litellm-details" style="display:none;margin-top:10px;font-size:0.85rem;color:#94a3b8;">
+        <span id="litellm-ttft">TTFT –</span>
+        <span id="litellm-itl"> · ITL –</span>
+        <span id="litellm-e2e"> · E2E –</span>
+        <span id="litellm-api"> · API –</span>
+        <span id="litellm-prefix"> · prefix cache –</span>
+        <span id="litellm-failed"> · failed –</span>
       </div>
       <div class="llama-slots" id="llama-slots-container">
         <!-- Slot bars injected by JS -->
@@ -422,11 +514,332 @@
     </div>
   </div>
 
+  </div><!-- /detail-sections -->
+
 <script>
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
 /* ------------------------------------------------------------------ */
 const MAX_POINTS = 60;
+
+/* ------------------------------------------------------------------ */
+/* Multi-system consolidation (Fleet + per-system tabs)                */
+/* ------------------------------------------------------------------ */
+const sysState = {
+  selected: 'fleet',
+  // name -> {status, metrics, backend, backendChanged, hist}
+  systems: new Map(),
+};
+
+function freshHist() {
+  return { labels: [], gen: [], prompt: [], perModel: {} };
+}
+
+/* Per-system line colors (stable: color = position in the sorted
+   system list, same pattern as MODEL_LINE_COLORS). */
+const SYSTEM_LINE_COLORS = ['#a78bfa', '#f472b6', '#fbbf24', '#34d399',
+  '#fb7185', '#60a5fa', '#4ade80', '#facc15'];
+
+function dotClass(status) {
+  return status === 'up' ? 'up' : status === 'stale' ? 'stale' : 'down';
+}
+
+/* Tab row: Fleet + one tab per system, each with a status dot. */
+function updateTabs(systems) {
+  const container = document.getElementById('sys-tabs');
+  const names = ['fleet', ...systems.map(s => s.name)];
+  for (const child of [...container.children]) {
+    if (!names.includes(child.dataset.sys)) child.remove();
+  }
+  for (const name of names) {
+    let tab = [...container.children].find(el => el.dataset.sys === name);
+    if (!tab) {
+      tab = document.createElement('button');
+      tab.className = 'sys-tab';
+      tab.dataset.sys = name;
+      tab.innerHTML = '<span class="dot down"></span>' +
+        '<span class="sys-tab-label"></span>';
+      tab.addEventListener('click', () => selectSystem(name));
+      container.appendChild(tab);
+    }
+    const status = name === 'fleet' ? 'up'
+      : ((systems.find(s => s.name === name) || {}).status || 'down');
+    tab.querySelector('.dot').className = `dot ${dotClass(status)}`;
+    tab.querySelector('.sys-tab-label').textContent =
+      name === 'fleet' ? 'Fleet' : name;
+    tab.classList.toggle('active', name === sysState.selected);
+  }
+}
+
+/* Per-system state update + trend-buffer push (one SSE tick).
+   Buffers grow on up + non-stale ticks; freeze on stale (entry status
+   or inner LLM status — held values are not new data); gap on down
+   (labels advance, values null). A backend change resets the system's
+   history. */
+function updateSystemEntry(name, status, metrics) {
+  let s = sysState.systems.get(name);
+  if (!s) {
+    s = { status: null, metrics: null, backend: null,
+         backendChanged: false, hist: freshHist() };
+    sysState.systems.set(name, s);
+  }
+  s.status = status;
+  s.metrics = metrics;
+  const llm = metrics && metrics.llm;
+  if (llm) {
+    const backend = llm.backend || 'llama';
+    if (s.backend !== null && s.backend !== backend) {
+      s.hist = freshHist();
+      s.backendChanged = true;
+    }
+    s.backend = backend;
+  }
+  const h = s.hist;
+  if (status === 'down') {
+    // Gap tick: labels advance, values null (no new models added).
+    h.labels.push(nowLabel());
+    h.gen.push(null);
+    h.prompt.push(null);
+    for (const k of Object.keys(h.perModel)) h.perModel[k].push(null);
+  } else if (status === 'stale' || !llm || llm.status === 'stale') {
+    return; // freeze: held/missing values are not new data
+  } else {
+    h.labels.push(nowLabel());
+    h.gen.push(llm.gen_tokens_per_s ?? null);
+    h.prompt.push(llm.prompt_tokens_per_s ?? null);
+    const byModel = llm.gen_tokens_per_s_by_model;
+    if (byModel && Object.keys(byModel).length > 1) {
+      for (const model of Object.keys(byModel)) {
+        (h.perModel[model] = h.perModel[model] || [])
+          .push(byModel[model] ?? null);
+      }
+    }
+  }
+  if (h.labels.length > MAX_POINTS) {
+    h.labels.shift();
+    h.gen.shift();
+    h.prompt.shift();
+    for (const k of Object.keys(h.perModel)) h.perModel[k].shift();
+  }
+}
+
+/* Fleet summary strip: one row per system
+   (name + status dot + CPU % + mem % + GPU % max + LLM gen tokens/s). */
+function updateFleetStrip(systems) {
+  const strip = document.getElementById('fleet-strip');
+  strip.innerHTML = '';
+  const head = document.createElement('div');
+  head.className = 'fleet-row head';
+  head.innerHTML = '<span>System</span><span class="fleet-val">CPU</span>' +
+    '<span class="fleet-val">Mem</span><span class="fleet-val">GPU</span>' +
+    '<span class="fleet-val">Gen tok/s</span>';
+  strip.appendChild(head);
+  for (const s of systems) {
+    const mm = s.metrics || {};
+    const utils = (mm.gpus || []).map(g => g.utilization_pct)
+      .filter(v => v != null);
+    const gpuVal = utils.length ? Math.max(...utils) : null;
+    const row = document.createElement('div');
+    row.className = 'fleet-row';
+    row.innerHTML =
+      `<span class="fleet-name"><span class="dot ${dotClass(s.status)}"></span>${s.name}</span>` +
+      `<span class="fleet-val">${mm.cpu != null ? `${mm.cpu}%` : '–'}</span>` +
+      `<span class="fleet-val">${mm.memory && mm.memory.percent != null ? `${mm.memory.percent}%` : '–'}</span>` +
+      `<span class="fleet-val">${gpuVal != null ? `${gpuVal}%` : '–'}</span>` +
+      `<span class="fleet-val">${mm.llm && mm.llm.gen_tokens_per_s != null ? mm.llm.gen_tokens_per_s : '–'}</span>`;
+    strip.appendChild(row);
+  }
+}
+
+let fleetChart = null;
+function ensureFleetChart() {
+  if (fleetChart) return fleetChart;
+  const ctx = document.getElementById('fleetChart').getContext('2d');
+  fleetChart = new Chart(ctx, {
+    type: 'line',
+    data: { labels: [], datasets: [] },
+    options: {
+      ...chartDefaults,
+      scales: {
+        ...chartDefaults.scales,
+        y: {
+          ...chartDefaults.scales.y,
+          max: null, // tokens/s is unbounded – autoscale
+          title: { display: true, text: 'tokens/s', color: '#22d3ee', font: { size: 11 } },
+        },
+      },
+    },
+  });
+  return fleetChart;
+}
+
+/* Fleet tokens/s: total = filled area, per-system = non-filled lines
+   over it (order: -1). Series are tail-aligned: buffers grow only on
+   non-stale ticks, so shorter buffers align to the most recent points.
+   Total = sum of the non-null values at each index; an all-null index
+   is null (a gap, not a misleading flatline at zero). */
+function syncFleetChart() {
+  const chart = ensureFleetChart();
+  const names = [...sysState.systems.keys()].sort();
+  const series = {};
+  let maxLen = 0;
+  for (const n of names) {
+    const gen = sysState.systems.get(n).hist.gen;
+    series[n] = gen;
+    if (gen.length > maxLen) maxLen = gen.length;
+  }
+  const capped = Math.min(maxLen, MAX_POINTS);
+  let labels = [];
+  for (const n of names) {
+    const h = sysState.systems.get(n).hist;
+    if (maxLen > 0 && h.labels.length === maxLen) { labels = h.labels; break; }
+  }
+  chart.data.labels = labels.length ? labels.slice(-capped) : [];
+  const total = new Array(capped).fill(null);
+  for (let i = 0; i < capped; i++) {
+    let sum = null;
+    for (const n of names) {
+      const gen = series[n];
+      const idx = gen.length - capped + i;
+      if (idx >= 0 && gen[idx] != null) sum = (sum == null ? 0 : sum) + gen[idx];
+    }
+    total[i] = sum;
+  }
+  const datasets = [{
+    label: 'Total',
+    data: total,
+    borderColor: '#22d3ee',
+    borderWidth: 2,
+    pointRadius: 0,
+    tension: 0.35,
+    fill: { target: 'origin', above: hexToRgba('#22d3ee', 0.15) },
+    order: 0,
+  }];
+  names.forEach((n, i) => {
+    const gen = series[n];
+    const pad = capped - Math.min(gen.length, capped);
+    datasets.push({
+      label: n,
+      data: (pad > 0 ? new Array(pad).fill(null) : []).concat(gen.slice(-capped)),
+      borderColor: SYSTEM_LINE_COLORS[i % SYSTEM_LINE_COLORS.length],
+      borderWidth: 1.5,
+      pointRadius: 0,
+      tension: 0.35,
+      fill: false,
+      order: -1, // draw over the total area
+    });
+  });
+  chart.data.datasets = datasets;
+  chart.options.plugins.legend = {
+    display: names.length > 0,
+    position: 'bottom',
+    labels: { color: '#94a3b8', boxWidth: 12, font: { size: 10 } },
+  };
+  chart.update('none');
+}
+
+/* Restore the LLM trend chart from a per-system history buffer
+   (tab switch / backend-switch reset). Per-model arrays are
+   tail-aligned with leading nulls. */
+function restoreLlamaChart(hist) {
+  const chart = ensureLlamaChart();
+  chart.data.labels = hist.labels.slice();
+  chart.data.datasets = chart.data.datasets.filter(ds => !ds._perModel);
+  chart.data.datasets[0].data = hist.gen.slice();
+  const models = hist.perModel && Object.keys(hist.perModel).length > 1
+    ? Object.keys(hist.perModel).sort() : [];
+  models.forEach((model, mi) => {
+    const arr = hist.perModel[model];
+    const pad = chart.data.labels.length - arr.length;
+    chart.data.datasets.push({
+      label: model,
+      data: (pad > 0 ? new Array(pad).fill(null) : []).concat(arr.slice()),
+      borderColor: MODEL_LINE_COLORS[mi % MODEL_LINE_COLORS.length],
+      borderWidth: 1.5,
+      pointRadius: 0,
+      tension: 0.35,
+      fill: false,
+      order: -1, // draw over the total area
+      _perModel: true,
+    });
+  });
+  chart.options.plugins.legend = {
+    display: models.length > 0,
+    position: 'bottom',
+    labels: { color: '#94a3b8', boxWidth: 12, font: { size: 10 } },
+  };
+  chart.update('none');
+}
+
+/* Push one LLM trend tick to the chart (selected system only).
+   Skipped while stale: values are held, not new data. */
+function pushLlamaChartTick(llm) {
+  if (!llm || llm.status === 'stale') return;
+  const chart = ensureLlamaChart();
+  chart.data.labels.push(nowLabel());
+  chart.data.datasets[0].data.push(llm.gen_tokens_per_s ?? null);
+  syncLlamaModelDatasets(chart, llm.gen_tokens_per_s_by_model);
+  if (chart.data.labels.length > MAX_POINTS) {
+    chart.data.labels.shift();
+    chart.data.datasets.forEach(ds => ds.data.shift());
+  }
+  chart.update('none');
+}
+
+/* CPU/mem/GPU trend charts reset on tab switch (v1 behavior; per-system
+   buffers for those are a v2 candidate). GPU cards are rebuilt on the
+   next tick for the newly selected system. */
+function resetDetailCharts() {
+  if (cpuChart) {
+    cpuChart.data.labels = [];
+    cpuChart.data.datasets.forEach(ds => ds.data = []);
+    cpuChart.update('none');
+  }
+  memChart.data.labels = [];
+  memChart.data.datasets[0].data = [];
+  memChart.update('none');
+  document.getElementById('gpu-container').innerHTML = '';
+  for (const k of Object.keys(gpuCharts)) delete gpuCharts[k];
+}
+
+/* Tab switch: Fleet <-> per-system. Restores the selected system's
+   buffers (never a reset) and re-renders all cards from its retained
+   metrics. */
+function selectSystem(name) {
+  if (name === sysState.selected) return;
+  sysState.selected = name;
+  const isFleet = name === 'fleet';
+  document.getElementById('fleet-section').style.display =
+    isFleet ? '' : 'none';
+  document.getElementById('detail-sections').style.display =
+    isFleet ? 'none' : '';
+  if (isFleet) {
+    const systems = [...sysState.systems.keys()].map(k => ({
+      name: k, status: sysState.systems.get(k).status,
+      metrics: sysState.systems.get(k).metrics,
+    }));
+    updateTabs(systems);
+    updateFleetStrip(systems);
+    syncFleetChart();
+    return;
+  }
+  const s = sysState.systems.get(name);
+  resetDetailCharts();
+  restoreLlamaChart(s ? s.hist : freshHist());
+  if (s && s.metrics) {
+    const sm = s.metrics;
+    updateSystem(sm);
+    updateGPUs(sm.gpus || []);
+    const llamaSec = document.getElementById('llama-section');
+    if (llamaSec) llamaSec.style.display =
+      sm.llm_enabled === false ? 'none' : '';
+    updateLLMCard(sm.llm);
+    updateLLMUsage(sm);
+    updateLLMProcess(sm);
+    updateSwap(sm);
+    updateHostHealth(sm);
+  }
+}
 
 function colorFor(pct) {
   if (pct == null) return '#94a3b8';
@@ -635,16 +1048,43 @@ source.onopen = () => setConnected(true);
 
 source.onmessage = (e) => {
   const m = JSON.parse(e.data);
-  updateSystem(m);
-  updateGPUs(m.gpus || []);
-  /* --no-llama: hide the section. Absent key = enabled (older builds). */
-  const llamaSec = document.getElementById('llama-section');
-  if (llamaSec) llamaSec.style.display = m.llm_enabled === false ? 'none' : '';
-  updateLLM(m.llm);
-  updateLLMUsage(m);
-  updateLLMProcess(m);
-  updateSwap(m);
-  updateHostHealth(m);
+  /* Multi-system: per-system state + trend buffers first. The fallback
+     covers a version-skewed payload without `systems`. */
+  const systems = Array.isArray(m.systems) && m.systems.length
+    ? m.systems : [{ name: 'local', status: 'up', metrics: m }];
+  for (const s of systems) {
+    updateSystemEntry(s.name, s.status, s.metrics);
+  }
+  updateTabs(systems);
+  if (sysState.selected === 'fleet') {
+    updateFleetStrip(systems);
+    syncFleetChart();
+  } else {
+    const s = sysState.systems.get(sysState.selected);
+    if (s && s.backendChanged) {
+      // Backend switched for this system: its buffer was reset; align
+      // the chart with it (a restore of the fresh buffer = a clear).
+      s.backendChanged = false;
+      restoreLlamaChart(s.hist);
+    }
+    if (s && s.metrics) {
+      const sm = s.metrics;
+      updateSystem(sm);
+      updateGPUs(sm.gpus || []);
+      /* --no-llama: hide the section. Absent key = enabled. */
+      const llamaSec = document.getElementById('llama-section');
+      if (llamaSec) llamaSec.style.display =
+        sm.llm_enabled === false ? 'none' : '';
+      updateLLMCard(sm.llm);
+      pushLlamaChartTick(sm.llm);
+      updateLLMUsage(sm);
+      updateLLMProcess(sm);
+      updateSwap(sm);
+      updateHostHealth(sm);
+    }
+    // metrics == null (system down, hold expired): keep the last
+    // rendered state; the tab's red dot carries the down signal.
+  }
 };
 
 /* ------------------------------------------------------------------ */
@@ -717,9 +1157,12 @@ function updateGPUs(gpus) {
 
       const vendor = (typeof gpu.board_vendor === 'string' ? gpu.board_vendor : '').trim();
       const isVendor = !!vendor && vendor.toLowerCase() !== 'unknown' && !/^0x[0-9a-f]+$/i.test(vendor);
+      // On mixed-vendor boxes make the chip vendor explicit on AMD cards
+      // (NVIDIA is the historical default and stays unadorned).
+      const chip = gpu.vendor === 'amd' ? 'AMD · ' : '';
       const title = isVendor
-        ? `GPU ${gpu.index} · ${vendor} · ${gpu.name || `GPU ${gpu.index}`}`
-        : `GPU ${gpu.index}: ${gpu.name || `GPU ${gpu.index}`}`;
+        ? `GPU ${gpu.index} · ${chip}${vendor} · ${gpu.name || `GPU ${gpu.index}`}`
+        : `GPU ${gpu.index}: ${chip}${gpu.name || `GPU ${gpu.index}`}`;
 
       card.innerHTML = `
         <div class="gpu-header">
@@ -869,6 +1312,60 @@ function ensureLlamaChart() {
   return llamaChart;
 }
 
+/* Per-model line colors (stable: color = position in sorted model list) */
+const MODEL_LINE_COLORS = ['#a78bfa', '#f472b6', '#fbbf24', '#34d399',
+  '#fb7185', '#60a5fa', '#4ade80', '#facc15'];
+
+/* Add/remove per-model line datasets on the shared LLM chart.
+   byModel: {model: gen tokens/s} from the LiteLLM payload. Per-model
+   lines are shown only when 2+ models are present (single-model keeps
+   the plain area). Datasets are tagged _perModel so the backend-switch
+   reset can clear them. order: -1 draws the lines over the total area. */
+function syncLlamaModelDatasets(chart, byModel) {
+  const models = (byModel && Object.keys(byModel).length > 1)
+    ? Object.keys(byModel).sort() : [];
+
+  // Remove per-model datasets for models no longer present
+  const stale = [];
+  chart.data.datasets.forEach((ds, i) => {
+    if (ds._perModel && !models.includes(ds.label)) stale.push(i);
+  });
+  for (const i of stale.reverse()) chart.data.datasets.splice(i, 1);
+
+  // Add missing per-model datasets (backfilled with nulls)
+  models.forEach((model, mi) => {
+    let ds = chart.data.datasets.find(d => d._perModel && d.label === model);
+    if (!ds) {
+      ds = {
+        label: model,
+        data: new Array(chart.data.labels.length).fill(null),
+        borderColor: MODEL_LINE_COLORS[mi % MODEL_LINE_COLORS.length],
+        borderWidth: 1.5,
+        pointRadius: 0,
+        tension: 0.35,
+        fill: false,
+        order: -1, // draw over the total area
+        _perModel: true,
+      };
+      chart.data.datasets.push(ds);
+    } else {
+      ds.borderColor = MODEL_LINE_COLORS[mi % MODEL_LINE_COLORS.length];
+    }
+  });
+
+  // Push this tick's value into every per-model dataset
+  for (const ds of chart.data.datasets) {
+    if (ds._perModel) ds.data.push(byModel[ds.label] ?? null);
+  }
+
+  // Legend only while per-model lines are visible
+  chart.options.plugins.legend = {
+    display: models.length > 0,
+    position: 'bottom',
+    labels: { color: '#94a3b8', boxWidth: 12, font: { size: 10 } },
+  };
+}
+
 function updateLlamaSlots(slots) {
   const container = document.getElementById('llama-slots-container');
   const seen = new Set();
@@ -919,10 +1416,9 @@ function updateLlamaSlots(slots) {
     slots.length === 0 ? '' : 'none';
 }
 
-/* Track current backend to clear chart history on switch */
-let _llmCurrentBackend = null;
-
-function updateLLM(m) {
+/* LLM card gauges only. Trend-chart handling is per-system
+   (sysState + restoreLlamaChart / pushLlamaChartTick). */
+function updateLLMCard(m) {
   const statusEl = document.getElementById('llama-status');
   const modelEl = document.getElementById('llama-model');
   const backendLabel = document.getElementById('llm-backend-label');
@@ -940,23 +1436,15 @@ function updateLLM(m) {
     document.getElementById('llama-peak-ctx').style.display = 'none';
     document.getElementById('llama-spec-gauge').style.display = 'none';
     document.getElementById('vllm-details').style.display = 'none';
+    document.getElementById('litellm-details').style.display = 'none';
     updateLlamaSlots([]);
-    _llmCurrentBackend = null;
     return; // keep gauges / chart history as-is
   }
 
-  /* Backend subtitle + chart history reset on switch */
+  /* Backend subtitle (per-system tracking lives in sysState) */
   const backend = m.backend || 'llama';
-  backendLabel.textContent = backend === 'vllm' ? '· vLLM' : '· llama.cpp';
-  if (_llmCurrentBackend !== null && _llmCurrentBackend !== backend) {
-    // Backend switched: clear chart history
-    if (llamaChart) {
-      llamaChart.data.labels = [];
-      llamaChart.data.datasets[0].data = [];
-      llamaChart.update('none');
-    }
-  }
-  _llmCurrentBackend = backend;
+  backendLabel.textContent = backend === 'vllm' ? '· vLLM'
+    : backend === 'litellm' ? '· LiteLLM' : '· llama.cpp';
 
   /* vLLM details block visibility */
   document.getElementById('vllm-details').style.display = backend === 'vllm' ? '' : 'none';
@@ -1017,7 +1505,7 @@ function updateLLM(m) {
     ctxEl.textContent = m.context_tokens_max != null ? m.context_tokens_max : '–';
     ctxEl.style.color = '';
     ctxLabelEl.textContent = 'Context high-water (tokens)';
-  } else {
+  } else if (backend === 'vllm') {
     // vLLM: KV cache % replaces context high-water
     document.getElementById('llama-prompt-label').textContent = 'Prompt tokens/s (last 5 reqs)';
     busyEl.textContent = `${m.requests_processing ?? 0}/${m.requests_waiting ?? 0}`;
@@ -1025,6 +1513,16 @@ function updateLLM(m) {
     ctxEl.textContent = kvPct != null ? `${kvPct}%` : '–';
     ctxEl.style.color = kvPct != null ? colorFor(kvPct) : '';
     ctxLabelEl.textContent = 'KV cache %';
+  } else {
+    // LiteLLM: provider-side prompt-cache % replaces context high-water
+    document.getElementById('llama-prompt-label').textContent = 'Prompt tokens/s';
+    busyEl.textContent = `${m.requests_processing ?? 0} in flight`;
+    const pcPct = m.prefix_cache_hit_pct;
+    ctxEl.textContent = pcPct != null ? `${pcPct}%` : '–';
+    ctxEl.style.color = '';
+    ctxEl.title = pcPct != null ? '' :
+        'No cached-token reports from the provider (prompt caching not in use)';
+    ctxLabelEl.textContent = 'Prompt cache % (provider)';
   }
 
   /* Spec-decode accept rate (lifetime); hidden when spec decode is off */
@@ -1061,9 +1559,9 @@ function updateLLM(m) {
   /* Per-slot context usage (llama only) */
   updateLlamaSlots(backend === 'llama' && Array.isArray(m.slots) ? m.slots : []);
 
-  /* vLLM has no slots: keep the llama-specific note hidden
+  /* vLLM / LiteLLM have no slots: keep the llama-specific note hidden
      (updateLlamaSlots([]) would otherwise reveal it). */
-  if (backend === 'vllm') {
+  if (backend !== 'llama') {
     document.getElementById('llama-slots-note').style.display = 'none';
   }
 
@@ -1090,17 +1588,22 @@ function updateLLM(m) {
     }
   }
 
-  /* Gen tokens/s trend (skip while stale: values are held, not new data) */
-  if (m.status !== 'stale') {
-    const chart = ensureLlamaChart();
-    chart.data.labels.push(nowLabel());
-    chart.data.datasets[0].data.push(m.gen_tokens_per_s ?? null);
-    if (chart.data.labels.length > MAX_POINTS) {
-      chart.data.labels.shift();
-      chart.data.datasets[0].data.shift();
-    }
-    chart.update('none');
+  /* LiteLLM sub-lines */
+  if (backend === 'litellm') {
+    const ttftEl = document.getElementById('litellm-ttft');
+    const itlEl = document.getElementById('litellm-itl');
+    const e2eEl = document.getElementById('litellm-e2e');
+    const apiEl = document.getElementById('litellm-api');
+    const pcEl = document.getElementById('litellm-prefix');
+    const failEl = document.getElementById('litellm-failed');
+    ttftEl.textContent = m.ttft_seconds != null ? `TTFT ${m.ttft_seconds}s` : 'TTFT –';
+    itlEl.textContent = m.itl_ms != null ? ` · ITL ${m.itl_ms}ms` : ' · ITL –';
+    e2eEl.textContent = m.e2e_latency_seconds != null ? ` · E2E ${m.e2e_latency_seconds}s` : ' · E2E –';
+    apiEl.textContent = m.llm_api_latency_seconds != null ? ` · API ${m.llm_api_latency_seconds}s` : ' · API –';
+    pcEl.textContent = m.prefix_cache_hit_pct != null ? ` · prefix cache ${m.prefix_cache_hit_pct}%` : '';
+    failEl.textContent = m.requests_failed_total != null ? ` · failed ${fmtTok(m.requests_failed_total)}` : '';
   }
+
 }
 
 /* ------------------------------------------------------------------ */
@@ -1208,6 +1711,9 @@ function updateLLMUsage(m) {
   }
   if (usage.prompt_cached_pct != null) {
     parts.push(`${usage.prompt_cached_pct}% prompt cached`);
+  }
+  if (usage.total_spend_usd != null) {
+    parts.push(`spend $${usage.total_spend_usd.toFixed(2)}`);
   }
   const up = fmtUptime(usage.uptime_s);
   if (up != null) parts.push(`up ${up}`);
