@@ -503,6 +503,40 @@ def test_fleet_projection_local_not_reembedded():
         collector.join(timeout=2)
 
 
+def test_fleet_projection_local_llms_carry_name():
+    """T5 CHANGES r1: the local projection's llms entries carry `name`
+    (the UI keys the per-target trend buffers by name; a nameless entry
+    would key the buffer by JS `undefined` and leave the local LLM card
+    chart permanently empty)."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1)
+    collector.llama_enabled = True
+    # Populate _llm_latest the way the LLM thread would (this test calls
+    # _collect() directly without starting the threads).
+    collector._llm_latest = [
+        {"name": "primary", "status": "up", "backend": "llama",
+         "gen_tokens_per_s": 100.0},
+        {"name": "second", "status": "up", "backend": "strata",
+         "gen_tokens_per_s": 50.0},
+    ]
+    with patch("app.collect_gpu_metrics", return_value=[]), \
+         patch("app.collect_swap_metrics", return_value=None), \
+         patch("app.collect_host_health_metrics",
+               return_value={"psi_mem_avg10": None, "d_state_procs": 0}):
+        snapshot = collector._collect()
+    local = snapshot["systems"][0]
+    lm = local["metrics"]
+    # The local projection's llms entries carry name (so the UI keys the
+    # per-target trend buffers by the real target name, not `undefined`).
+    assert len(lm["llms"]) == 2
+    assert [e["name"] for e in lm["llms"]] == ["primary", "second"]
+    # name is the only addition to the slim llms projection.
+    for e in lm["llms"]:
+        assert set(e.keys()) == {"status", "name", "gen_tokens_per_s",
+                                 "backend"}
+
+
 def test_fleet_projection_peer_full():
     """T5: a peer system's systems[].metrics is a full projection
     sufficient for the detail tab (cpu, memory, gpus, llms, llm_enabled,

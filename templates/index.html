@@ -887,12 +887,17 @@ function selectSystem(name) {
   const s = sysState.systems.get(name);
   resetDetailCharts();
   if (s && s.metrics) {
-    const sm = s.metrics;
-    updateSystem(sm);
-    updateGPUs(sm.gpus || []);
-    renderLLMCards();
-    updateSwap(sm);
-    updateHostHealth(sm);
+    // Local system: detail data is the top-level payload (its
+    // systems[].metrics is a slim fleet projection). Peers: their
+    // systems[].metrics (full projection).
+    const sm = detailMetrics(name);
+    if (sm) {
+      updateSystem(sm);
+      updateGPUs(sm.gpus || []);
+      renderLLMCards();
+      updateSwap(sm);
+      updateHostHealth(sm);
+    }
   }
 }
 
@@ -1160,12 +1165,14 @@ function updateSystem(m) {
   // Charts
   const label = nowLabel();
 
-  /* CPU chart – (re)build if core count is new/changed (e.g. CPU hotplug) */
-  const perCore = Array.isArray(m.cpu_per_core) && m.cpu_per_core.length > 0
-    ? m.cpu_per_core
-    : [0];
-  if (!cpuChart || perCore.length !== cpuCoreCount) {
-    buildCpuChart(perCore.length);
+  /* CPU chart – (re)build if core count is new/changed (e.g. CPU hotplug).
+     Peers have no cpu_per_core (dropped by design): render only the
+     "All CPUs" line, not a misleading flat-zero per-core line. */
+  const hasPerCore = Array.isArray(m.cpu_per_core) && m.cpu_per_core.length > 0;
+  const perCore = hasPerCore ? m.cpu_per_core : [];
+  const coreCount = hasPerCore ? perCore.length : 0;
+  if (!cpuChart || coreCount !== cpuCoreCount) {
+    buildCpuChart(coreCount);
   }
   cpuChart.data.labels.push(label);
   cpuChart.data.datasets[0].data.push(m.cpu);

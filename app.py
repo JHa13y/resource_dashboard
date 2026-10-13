@@ -4182,6 +4182,7 @@ class MetricsCollector(threading.Thread):
             "gpus": [{"utilization_pct": g.get("utilization_pct")}
                     for g in metrics.get("gpus", [])],
             "llms": [{"status": e.get("status"),
+                     "name": e.get("name"),
                      "gen_tokens_per_s": e.get("gen_tokens_per_s"),
                      "backend": e.get("backend")}
                     for e in metrics.get("llms", [])],
