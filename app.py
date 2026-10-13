@@ -369,11 +369,16 @@ def _find_cli_binary(candidates: tuple[str, ...]) -> str | None:
     return None
 
 
-def _sysfs_pci_bus_id(card: int | str) -> str | None:
+def _sysfs_pci_bus_id(card: int | str,
+                      drm_dir: str = "/sys/class/drm") -> str | None:
     """PCI BDF (e.g. ``0000:66:00.0``) for a DRM card from the sysfs
-    ``device`` symlink. None on non-Linux hosts or any error."""
+    ``device`` symlink. ``card`` may be a global card number (int) or a
+    full ``cardN`` name (str, as reported by rocm-smi). None on
+    non-Linux hosts or any error."""
+    name = (card if isinstance(card, str) and card.startswith("card")
+            else f"card{card}")
     try:
-        target = os.readlink(f"/sys/class/drm/card{card}/device")
+        target = os.readlink(f"{drm_dir}/{name}/device")
     except OSError:
         return None
     return os.path.basename(target) or None
@@ -435,6 +440,174 @@ def _lspci_device_name_map(bus_ids: list[str]) -> dict[str, str]:
     return mapping
 
 
+# ---------------------------------------------------------------------------
+# AMD gpu index → PCI BDF resolution (T3)
+#
+# amd-smi's ``gpu`` field is a *vendor-local* index (0..n-1 within AMD).
+# Passing it as a global ``/sys/class/drm/cardN`` number mis-resolves on
+# mixed-vendor boxes: DRM numbers cards across all vendors, so on the
+# live box the second R9700 (AMD gpu 1) resolved to the RTX 3090's DRM
+# node and reported the NVIDIA card's BDF + board vendor. The BDF must
+# come from the tool's own data, in this fallback order:
+#   (a) ``amd-smi list --json`` (carries ``bus_id``) — resolved once and
+#       cached; failures negative-cached for _AMD_BDF_NEGATIVE_TTL (same
+#       no-stall pattern as the T2 lspci caches);
+#   (b) else rocm-smi's own ``cardN`` string (its ``device`` column, a
+#       global DRM number) → sysfs;
+#   (c) else ``/sys/class/drm/card*`` filtered by ``device/vendor ==
+#       0x1002`` (AMD only), mapped in card-number order — a vendor-local
+#       index is never mistaken for a global ``cardN``.
+# ---------------------------------------------------------------------------
+
+_amd_bdf_map: dict[int, str] | None = None  # gpu index → bus_id (positive)
+_rocm_cards_cache: list[str] | None = None  # rocm-smi device column, in order
+# Failed BDF lookups (source → monotonic ts); a hung/missing tool is not
+# re-run on every poll (same TTL as _LSPCI_NEGATIVE_TTL).
+_amd_bdf_negative: dict[str, float] = {}
+_AMD_BDF_NEGATIVE_TTL = 300.0
+
+
+def _amd_smi_list_bus_ids() -> dict[int, str] | None:
+    """``gpu index → bus_id`` from ``amd-smi list --json`` (the tool's
+    own data). Resolved once and cached; failures (and lists with no
+    usable bus_id) are negative-cached for _AMD_BDF_NEGATIVE_TTL.
+    None on any failure. Never raises."""
+    global _amd_bdf_map
+    if _amd_bdf_map is not None:
+        return _amd_bdf_map
+    now = time.monotonic()
+    failed_at = _amd_bdf_negative.get("list")
+    if failed_at is not None and (now - failed_at) < _AMD_BDF_NEGATIVE_TTL:
+        return None
+    binary = _find_cli_binary(_AMD_SMI_BIN_CANDIDATES)
+    if binary is None:
+        _amd_bdf_negative["list"] = now
+        return None
+    try:
+        result = subprocess.run(  # noqa: S603 – static args only
+            [binary, "list", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        _amd_bdf_negative["list"] = now
+        return None
+    if result.returncode != 0:
+        _amd_bdf_negative["list"] = now
+        return None
+    try:
+        payload = json.loads(result.stdout)
+    except ValueError:
+        _amd_bdf_negative["list"] = now
+        return None
+    if not isinstance(payload, list):
+        _amd_bdf_negative["list"] = now
+        return None
+    mapping: dict[int, str] = {}
+    for entry in payload:
+        if not isinstance(entry, dict):
+            continue
+        idx = entry.get("gpu")
+        if not isinstance(idx, int) or isinstance(idx, bool):
+            continue
+        bus = entry.get("bus_id")
+        if isinstance(bus, str) and bus.strip():
+            mapping[idx] = bus.strip()
+    if not mapping:
+        _amd_bdf_negative["list"] = now
+        return None
+    _amd_bdf_map = mapping
+    return mapping
+
+
+def _rocm_smi_card_names() -> list[str] | None:
+    """rocm-smi's own ``cardN`` device strings in device order (its
+    ``device`` column, e.g. ``["card2", "card3"]``) — global DRM
+    numbers, never vendor-local indices. Resolved once and cached;
+    failures negative-cached for _AMD_BDF_NEGATIVE_TTL. None on any
+    failure. Never raises."""
+    global _rocm_cards_cache
+    if _rocm_cards_cache is not None:
+        return _rocm_cards_cache
+    now = time.monotonic()
+    failed_at = _amd_bdf_negative.get("rocm")
+    if failed_at is not None and (now - failed_at) < _AMD_BDF_NEGATIVE_TTL:
+        return None
+    binary = _find_cli_binary(_ROCM_SMI_BIN_CANDIDATES)
+    if binary is None:
+        _amd_bdf_negative["rocm"] = now
+        return None
+    try:
+        result = subprocess.run(  # noqa: S603 – static args only
+            [binary, "--showuse", "--csv"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        _amd_bdf_negative["rocm"] = now
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        _amd_bdf_negative["rocm"] = now
+        return None
+    rows = [r for r in csv.reader(io.StringIO(result.stdout))
+            if r and not r[0].lstrip().startswith("#")]
+    names = [r[0].strip() for r in rows[1:] if r and r[0].strip()]
+    if not names:
+        _amd_bdf_negative["rocm"] = now
+        return None
+    _rocm_cards_cache = names
+    return names
+
+
+def _sysfs_amd_card_bdfs(drm_dir: str = "/sys/class/drm") -> list[tuple[str, str]]:
+    """``(cardN name, BDF)`` for every DRM card whose ``device/vendor``
+    is ``0x1002`` (AMD), sorted by global card number. Mapping a
+    vendor-local AMD index onto this filtered list is what keeps it from
+    being mistaken for a global ``cardN``. [] on non-Linux or error."""
+    try:
+        entries = os.listdir(drm_dir)
+    except OSError:
+        return []
+    out: list[tuple[str, str]] = []
+    for name in entries:
+        if not re.fullmatch(r"card\d+", name):
+            continue
+        try:
+            with open(f"{drm_dir}/{name}/device/vendor") as f:
+                vendor = int(f.read().strip(), 16)
+        except (OSError, ValueError):
+            continue
+        if vendor != 0x1002:
+            continue
+        bdf = _sysfs_pci_bus_id(name, drm_dir)
+        if bdf:
+            out.append((name, bdf))
+    out.sort(key=lambda t: int(t[0].removeprefix("card")))
+    return out
+
+
+def _amd_gpu_bus_id(gpu_idx: int,
+                    drm_dir: str = "/sys/class/drm") -> str | None:
+    """Resolve an amd-smi vendor-local ``gpu`` index to a PCI BDF via
+    the fallback chain in the header above (a → b → c). A vendor-local
+    index is never passed as a global ``cardN``. None when no source can
+    resolve it (non-Linux hosts no-op cleanly). Never raises."""
+    mapping = _amd_smi_list_bus_ids()
+    if mapping is not None and gpu_idx in mapping:
+        return mapping[gpu_idx]
+    cards = _rocm_smi_card_names()
+    if cards is not None and 0 <= gpu_idx < len(cards):
+        bdf = _sysfs_pci_bus_id(cards[gpu_idx])
+        if bdf:
+            return bdf
+    amd_cards = _sysfs_amd_card_bdfs(drm_dir)
+    if 0 <= gpu_idx < len(amd_cards):
+        return amd_cards[gpu_idx][1]
+    return None
+
+
 def _amd_unwrap(val: Any) -> float | None:
     """Unwrap an amd-smi JSON leaf: numerics arrive as
     ``{"value": N, "unit": "W"}`` (scalars pass through); ``"N/A"``,
@@ -467,7 +640,9 @@ def _amd_smi_entry_to_gpu(entry: dict[str, Any], idx: int) -> dict[str, Any] | N
     if util is None and vram_used is None:
         return None
 
-    bus_id = _sysfs_pci_bus_id(idx)
+    # The vendor-local ``gpu`` index is resolved to a BDF from the tool's
+    # own data (T3) — never passed as a global ``/sys/class/drm/cardN``.
+    bus_id = _amd_gpu_bus_id(idx)
     board_vendor = "unknown"
     name = "AMD GPU"
     if bus_id:
@@ -758,6 +933,20 @@ def _gpu_amd() -> list[dict[str, Any]]:
     return gpus
 
 
+def _normalize_bdf(bdf: str) -> str:
+    """Canonical form for BDF comparison: 4-digit zero-padded domain,
+    lowercase, zero-padded bus/device — ``00000000:61:00.0`` and
+    ``0000:61:00.0`` are the same device (the domain width is
+    inconsistent across vendors in the payload)."""
+    m = re.fullmatch(
+        r"([0-9a-fA-F]{1,8}):([0-9a-fA-F]{1,2}):([0-9a-fA-F]{1,3})\.([0-9a-fA-F])",
+        bdf.strip())
+    if not m:
+        return bdf.strip().lower()
+    return (f"{int(m.group(1), 16):04x}:{m.group(2).lower().zfill(2)}:"
+            f"{m.group(3).lower().zfill(2)}.{m.group(4).lower()}")
+
+
 def _merge_gpu_lists(nvidia: list[dict[str, Any]],
                      amd: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Merge per-vendor GPU lists for mixed-vendor machines.
@@ -767,6 +956,12 @@ def _merge_gpu_lists(nvidia: list[dict[str, Any]],
     by ``index`` — so the merged list is renumbered 0..n-1 (NVIDIA cards
     first, in their original order). Each card also gets a ``vendor``
     tag ("nvidia" / "amd") for clarity and future per-vendor rendering.
+
+    Colliding-BDF guard: no two entries in one payload may claim the same
+    (normalized) PCI BDF — a collision means a mis-resolved card (e.g. an AMD
+    card mapped onto an NVIDIA DRM node). It is flagged (a warning names both
+    cards) and the duplicate is dropped; two cards on one device are
+    never silently rendered.
     """
     merged: list[dict[str, Any]] = []
     for gpu in nvidia:
@@ -778,9 +973,27 @@ def _merge_gpu_lists(nvidia: list[dict[str, Any]],
         gpu = dict(gpu)
         gpu["vendor"] = "amd"
         merged.append(gpu)
-    for i, gpu in enumerate(merged):
+    seen: dict[str, dict[str, Any]] = {}
+    kept: list[dict[str, Any]] = []
+    for gpu in merged:
+        bdf = gpu.get("pci_bus_id")
+        if not bdf:
+            kept.append(gpu)
+            continue
+        norm = _normalize_bdf(str(bdf))
+        if norm in seen:
+            other = seen[norm]
+            log.warning(
+                "GPU BDF collision: %s (vendor=%s) and %s (vendor=%s) "
+                "both claim %s — dropping the duplicate",
+                gpu.get("name"), gpu.get("vendor"),
+                other.get("name"), other.get("vendor"), bdf)
+            continue
+        seen[norm] = gpu
+        kept.append(gpu)
+    for i, gpu in enumerate(kept):
         gpu["index"] = i
-    return merged
+    return kept
 
 
 # ---------------------------------------------------------------------------

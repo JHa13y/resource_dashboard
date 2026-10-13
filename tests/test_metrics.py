@@ -4153,6 +4153,24 @@ ROCM_SMI_CSV_SAMPLE = (
     "21458059264,27856896\n"
 )
 
+# Real ``amd-smi list --json`` shape: the tool's own ``bus_id`` per gpu.
+AMD_SMI_LIST_JSON = json.dumps([
+    {"gpu": 0, "bus_id": "0000:2d:00.0"},
+    {"gpu": 1, "bus_id": "0000:61:00.0"},
+])
+
+
+def _fake_drm(drm_dir, cards):
+    """Build a fake ``/sys/class/drm`` layout: ``{cardN: (vendor_hex, bdf)}``.
+    Mirrors sysfs: each ``cardN/device`` is a symlink to a real directory
+    named after the BDF, with a ``vendor`` file behind it."""
+    for name, (vendor, bdf) in cards.items():
+        card = drm_dir / name
+        card.mkdir(parents=True)
+        (card / bdf).mkdir()
+        (card / bdf / "vendor").write_text(vendor + "\n")
+        os.symlink(bdf, card / "device")
+
 
 @pytest.fixture(autouse=True)
 def reset_amd_state():
@@ -4163,15 +4181,24 @@ def reset_amd_state():
     original_absent = app_mod._amd_absent_since
     original_lspci_neg = app_mod._lspci_negative
     original_name_neg = app_mod._lspci_name_negative
+    original_bdf_map = app_mod._amd_bdf_map
+    original_bdf_neg = app_mod._amd_bdf_negative
+    original_rocm_cards = app_mod._rocm_cards_cache
     app_mod._lspci_name_cache = None
     app_mod._amd_absent_since = None
     app_mod._lspci_negative = {}
     app_mod._lspci_name_negative = {}
+    app_mod._amd_bdf_map = None
+    app_mod._amd_bdf_negative = {}
+    app_mod._rocm_cards_cache = None
     yield
     app_mod._lspci_name_cache = original_cache
     app_mod._amd_absent_since = original_absent
     app_mod._lspci_negative = original_lspci_neg
     app_mod._lspci_name_negative = original_name_neg
+    app_mod._amd_bdf_map = original_bdf_map
+    app_mod._amd_bdf_negative = original_bdf_neg
+    app_mod._rocm_cards_cache = original_rocm_cards
 
 
 def _amd_smi_mock(stdout: str, returncode: int = 0):
@@ -4425,6 +4452,142 @@ def test_merge_gpu_lists_empty_sides():
         {"index": 0, "vendor": "nvidia"}]
     assert _merge_gpu_lists([], [{"index": 3}]) == [
         {"index": 0, "vendor": "amd"}]
+
+
+def test_amd_bdf_resolved_from_amd_smi_bus_id():
+    """(a): ``amd-smi list --json`` bus_id is used; the vendor-local gpu
+    index is never passed as a global cardN (no sysfs fallback runs)."""
+    from app import (_AMD_SMI_BIN_CANDIDATES, _ROCM_SMI_BIN_CANDIDATES,
+                     _amd_gpu_bus_id)
+
+    def fake_find_cli(candidates):
+        if candidates == _AMD_SMI_BIN_CANDIDATES:
+            return "/usr/bin/amd-smi"
+        return None
+
+    with (
+        patch("app._find_cli_binary", side_effect=fake_find_cli),
+        patch("subprocess.run", return_value=_amd_smi_mock(AMD_SMI_LIST_JSON)),
+        patch("app._sysfs_pci_bus_id") as mock_sysfs,
+    ):
+        assert _amd_gpu_bus_id(0) == "0000:2d:00.0"
+        assert _amd_gpu_bus_id(1) == "0000:61:00.0"
+        # (a) satisfied → no sysfs fallback ran, so the vendor-local
+        # index was never passed as a global cardN.
+        mock_sysfs.assert_not_called()
+
+
+def test_amd_bdf_fallback_rocm_cardn():
+    """(b): amd-smi unavailable → rocm-smi's own cardN string (a global
+    DRM number, e.g. "card2") is used, not a vendor-local index."""
+    from app import (_AMD_SMI_BIN_CANDIDATES, _ROCM_SMI_BIN_CANDIDATES,
+                     _amd_gpu_bus_id)
+
+    rocm_csv = (
+        "device,GPU ID,GPU use (%),VRAM Total Memory (B),"
+        "VRAM Total Used Memory (B)\n"
+        "card2,0x7551,10.0,21458059264,27856896\n"
+        "card3,0x7551,20.0,21458059264,55713792\n"
+    )
+
+    def fake_find_cli(candidates):
+        if candidates == _AMD_SMI_BIN_CANDIDATES:
+            return None  # amd-smi unavailable
+        if candidates == _ROCM_SMI_BIN_CANDIDATES:
+            return "/usr/bin/rocm-smi"
+        return None
+
+    def fake_sysfs(card, drm_dir="/sys/class/drm"):
+        return {"card2": "0000:2d:00.0",
+                "card3": "0000:61:00.0"}.get(card)
+
+    with (
+        patch("app._find_cli_binary", side_effect=fake_find_cli),
+        patch("subprocess.run", return_value=_amd_smi_mock(rocm_csv)),
+        patch("app._sysfs_pci_bus_id", side_effect=fake_sysfs) as mock_sysfs,
+        patch("app._sysfs_amd_card_bdfs", return_value=[]),
+    ):
+        assert _amd_gpu_bus_id(0) == "0000:2d:00.0"  # rocm's "card2"
+        assert _amd_gpu_bus_id(1) == "0000:61:00.0"  # rocm's "card3"
+    # rocm's own cardN strings — never the vendor-local ints 0/1:
+    called_with = [c.args[0] for c in mock_sysfs.call_args_list]
+    assert called_with == ["card2", "card3"]
+
+
+def test_amd_bdf_fallback_sysfs_vendor_filter(tmp_path):
+    """(c): both tools unavailable → ``/sys/class/drm/card*`` filtered
+    by ``device/vendor == 0x1002``; an NVIDIA card0 is not picked for
+    an AMD gpu."""
+    from app import _amd_gpu_bus_id
+
+    _fake_drm(tmp_path, {
+        "card0": ("0x10de", "0000:44:00.0"),   # NVIDIA — must be skipped
+        "card1": ("0x1002", "0000:2d:00.0"),   # AMD gpu 0
+        "card2": ("0x1002", "0000:61:00.0"),   # AMD gpu 1
+    })
+
+    with (
+        patch("app._find_cli_binary", return_value=None),
+        patch("subprocess.run") as mock_run,
+    ):
+        assert _amd_gpu_bus_id(0, drm_dir=str(tmp_path)) == "0000:2d:00.0"
+        assert _amd_gpu_bus_id(1, drm_dir=str(tmp_path)) == "0000:61:00.0"
+        mock_run.assert_not_called()  # no tool was found → no subprocess
+
+
+def test_amd_bdf_fake_drm_nvidia_card0(tmp_path):
+    """Spec-mandated: fake drm layout where card0 is NVIDIA and AMD gpu
+    indices are 0/1 — the AMD cards resolve to their own (AMD) BDFs,
+    not card0's. The old bug passed the vendor-local index as a global
+    cardN, so AMD gpu 0 resolved to the NVIDIA card."""
+    from app import _amd_gpu_bus_id, _sysfs_pci_bus_id
+
+    _fake_drm(tmp_path, {
+        "card0": ("0x10de", "0000:44:00.0"),   # NVIDIA
+        "card1": ("0x1002", "0000:2d:00.0"),   # AMD gpu 0
+        "card2": ("0x1002", "0000:61:00.0"),   # AMD gpu 1
+    })
+
+    with patch("app._find_cli_binary", return_value=None):
+        # What the old bug resolved: vendor-local index 0 → global card0
+        # (the NVIDIA card's BDF).
+        assert _sysfs_pci_bus_id(0, str(tmp_path)) == "0000:44:00.0"
+        # The fix: AMD gpu 0/1 → their own AMD BDFs.
+        assert _amd_gpu_bus_id(0, drm_dir=str(tmp_path)) == "0000:2d:00.0"
+        assert _amd_gpu_bus_id(1, drm_dir=str(tmp_path)) == "0000:61:00.0"
+
+
+def test_colliding_bdf_merge_guard(caplog):
+    """Spec-mandated: two cards claiming the same (normalized) BDF —
+    the guard flags (logs) and the payload contains no two entries with
+    the same normalized BDF. The domain width differs across vendors
+    (``00000000:`` vs ``0000:``) — normalization must catch it."""
+    from app import _merge_gpu_lists
+
+    nvidia = [{"index": 0, "name": "RTX 3090",
+               "pci_bus_id": "00000000:61:00.0"}]
+    amd = [{"index": 0, "name": "R9700",
+            "pci_bus_id": "0000:61:00.0"}]
+
+    with caplog.at_level(logging.WARNING):
+        merged = _merge_gpu_lists(nvidia, amd)
+
+    # Duplicate dropped (the first — NVIDIA — is kept), flagged with
+    # both card names.
+    assert len(merged) == 1
+    assert merged[0]["name"] == "RTX 3090"
+    assert merged[0]["vendor"] == "nvidia"
+    assert any("BDF collision" in m and "RTX 3090" in m and "R9700" in m
+               for m in caplog.messages)
+
+    # Distinct BDFs (even with mixed domain width) are both kept and
+    # renumbered dense.
+    ok = _merge_gpu_lists(
+        [{"index": 0, "name": "RTX 3090",
+          "pci_bus_id": "00000000:44:00.0"}],
+        [{"index": 0, "name": "R9700", "pci_bus_id": "0000:2d:00.0"}])
+    assert [g["index"] for g in ok] == [0, 1]
+    assert [g["vendor"] for g in ok] == ["nvidia", "amd"]
 
 
 def test_gpu_amd_negative_cache_skips_reprobe():
