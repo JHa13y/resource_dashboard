@@ -436,9 +436,12 @@ def test_midstream_subscriber_gets_current_snapshot_without_waiting():
 
 
 def test_systems_metrics_no_self_nesting():
-    """section-2 guardrail: systems[0].metrics must equal the top-level
-    keys minus `systems` — a refactor that snapshots after assembly would
-    self-nest `systems` inside systems[0].metrics and double the payload."""
+    """T5: the local system's systems[].metrics is a slim fleet projection,
+    not the full top-level re-embedding. The absolute invariant holds:
+    `systems` must not self-nest inside systems[0].metrics. The pre-T5
+    "equals the top-level minus systems" equality is intentionally relaxed
+    (the projection is a subset); the local detail data is available at
+    the top level."""
     from app import MetricsCollector
 
     collector = MetricsCollector(poll_interval=0.1)
@@ -456,14 +459,146 @@ def test_systems_metrics_no_self_nesting():
         # systems[0] is the local entry.
         local = m["systems"][0]
         assert local["name"] == "local"
-        # systems[0].metrics == top-level keys minus `systems`.
-        assert set(local["metrics"].keys()) == (top - {"systems"})
+        # Slim fleet projection: just what the fleet strip needs.
+        assert set(local["metrics"].keys()) == {"cpu", "memory", "gpus",
+                                              "llms"}
         # The self-nesting trap: `systems` must NOT appear inside
         # systems[0].metrics.
         assert "systems" not in local["metrics"]
     finally:
         collector.stop()
         collector.join(timeout=2)
+
+
+def test_fleet_projection_local_not_reembedded():
+    """T5: the local system's systems[].metrics is a slim fleet projection,
+    not the full top-level re-embedding. The heavy/redundant fields are
+    dropped; the local detail data is available at the top level."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1)
+    collector.llama_enabled = False
+    collector.start()
+    try:
+        data = collector.get_latest(timeout=5.0)
+        assert data is not None
+        m = json.loads(data)
+        local = m["systems"][0]
+        lm = local["metrics"]
+        # Slim projection: just what the fleet strip needs.
+        assert set(lm.keys()) == {"cpu", "memory", "gpus", "llms"}
+        # The heavy/redundant fields are NOT re-embedded.
+        for k in ("cpu_per_core", "swap", "host_health", "timestamp",
+                  "llm"):
+            assert k not in lm
+        # The local detail data is available at the top level.
+        for k in ("cpu", "memory", "gpus", "swap", "host_health",
+                  "llm_enabled", "llms"):
+            assert k in m
+        # gpus in the projection are slimmed to utilization_pct only.
+        for g in lm["gpus"]:
+            assert set(g.keys()) == {"utilization_pct"}
+    finally:
+        collector.stop()
+        collector.join(timeout=2)
+
+
+def test_fleet_projection_peer_full():
+    """T5: a peer system's systems[].metrics is a full projection
+    sufficient for the detail tab (cpu, memory, gpus, llms, llm_enabled,
+    swap, host_health), dropping the fields the UI never reads from a
+    peer (timestamp, cpu_per_core, legacy llm). A peer's own `systems`
+    is dropped by the sanitizer (not in the projection key set)."""
+    import app
+
+    fake_payload = {
+        "timestamp": 1234.5,
+        "cpu": 10.0,
+        "cpu_per_core": [1.0, 2.0],
+        "memory": {"percent": 50.0, "total_gb": 16.0,
+                   "used_gb": 8.0, "available_gb": 8.0},
+        "gpus": [{"index": 0, "utilization_pct": 5.0, "name": "fake"}],
+        "swap": {"used_gb": 0.0, "total_gb": 4.0, "pct": 0.0},
+        "host_health": {"d_state_procs": 0},
+        "llm_enabled": False,
+        "llm": None,
+        "llms": [],
+        "systems": [{"name": "should-not-appear"}],
+    }
+
+    class FakeResponse:
+        def read(self):
+            return json.dumps(fake_payload).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    with patch("urllib.request.urlopen", return_value=FakeResponse()):
+        entry = app.collect_upstream_metrics("http://fake:5000", "fakepeer")
+    assert entry is not None
+    assert entry["name"] == "fakepeer"
+    assert entry["status"] == "up"
+    pm = entry["metrics"]
+    # Full projection for the detail tab.
+    for k in ("cpu", "memory", "gpus", "llms", "llm_enabled", "swap",
+             "host_health"):
+        assert k in pm
+    # Dropped fields the UI never reads from a peer.
+    for k in ("timestamp", "cpu_per_core", "llm"):
+        assert k not in pm
+    # No self-nesting: the peer's own `systems` is dropped by the
+    # sanitizer (not in the projection key set).
+    assert "systems" not in pm
+    # Full gpus/llms are kept (the peer detail tab renders them).
+    assert pm["gpus"] == fake_payload["gpus"]
+    assert pm["llms"] == fake_payload["llms"]
+
+
+def test_fleet_projection_no_self_nesting():
+    """T5: for both the local system and a peer, systems[].metrics does
+    not contain `systems` (the section-2 trap, asserted in the
+    projection context)."""
+    import app
+    from app import MetricsCollector
+
+    # Local system: the projection is built before metrics["systems"]
+    # is assigned, so it can never self-nest.
+    collector = MetricsCollector(poll_interval=0.1)
+    collector.llama_enabled = False
+    collector.start()
+    try:
+        data = collector.get_latest(timeout=5.0)
+        assert data is not None
+        m = json.loads(data)
+        for s in m["systems"]:
+            assert "systems" not in s["metrics"]
+    finally:
+        collector.stop()
+        collector.join(timeout=2)
+
+    # Peer system: the sanitizer drops the peer's own `systems`.
+    fake_payload = {"cpu": 1.0, "memory": {"percent": 1.0},
+                   "gpus": [], "llms": [], "llm_enabled": False,
+                   "swap": None, "host_health": None,
+                   "systems": [{"name": "nested"}]}
+
+    class FakeResponse:
+        def read(self):
+            return json.dumps(fake_payload).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    with patch("urllib.request.urlopen", return_value=FakeResponse()):
+        entry = app.collect_upstream_metrics("http://fake:5000", "fakepeer")
+    assert entry is not None
+    assert "systems" not in entry["metrics"]
 
 
 # ---------------------------------------------------------------------------

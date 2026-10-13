@@ -3326,6 +3326,14 @@ _UPSTREAM_STALE_MAX_AGE_S = 15.0
 _UPSTREAM_KEYS = ("timestamp", "cpu", "cpu_per_core", "memory", "gpus",
                  "swap", "host_health", "llm_enabled", "llm", "llms")
 
+# Keys the UI consumes for a PEER system's detail tab + fleet strip
+# (a subset of _UPSTREAM_KEYS, so unknown keys are still dropped by the
+# sanitizer). `timestamp`, `cpu_per_core`, and legacy `llm` are dropped:
+# the UI never reads them from a peer's metrics. Full `gpus`/`llms` are
+# kept (the peer detail tab renders them; a peer has no top-level copy).
+_PEER_PROJECTION_KEYS = ("cpu", "memory", "gpus", "llms", "llm_enabled",
+                       "swap", "host_health")
+
 # Last good entry per upstream name: {name: (monotonic ts, entry dict)}.
 # Each name is touched by exactly one fetch thread -> no locking needed.
 _upstream_last_good: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -3360,7 +3368,10 @@ def collect_upstream_metrics(url: str, name: str) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         return _stale_or_none()
 
-    metrics = {k: payload[k] for k in _UPSTREAM_KEYS if k in payload}
+    # Sanitize (drop unknown keys) then project to what the UI consumes
+    # for a peer's detail tab + fleet strip. `_PEER_PROJECTION_KEYS` is a
+    # subset of `_UPSTREAM_KEYS`, so unknown keys are still dropped.
+    metrics = {k: payload[k] for k in _PEER_PROJECTION_KEYS if k in payload}
     out = {"name": name, "status": "up", "metrics": metrics}
     _upstream_last_good[name] = (time.monotonic(), out)
     return out
@@ -4155,11 +4166,28 @@ class MetricsCollector(threading.Thread):
                           if primary is not None
                           and primary.get("status") != "down"
                           else None)
-        # Multi-system consolidation: the local system first (same values
-        # as the top-level keys), then one entry per configured upstream.
-        # `list()` snapshot: start_upstreams may still be appending.
+        # Multi-system consolidation: the local system first, then one
+        # entry per configured upstream. `list()` snapshot: start_upstreams
+        # may still be appending.
+        #
+        # The local system's data is already in the top-level keys, so its
+        # systems[].metrics is a SLIM fleet projection (cpu, memory, gpu
+        # utilization, llm gen) — just what the fleet strip needs. The local
+        # detail tab reads the top-level payload (templates/index.html), so
+        # the redundant full re-embedding is gone. Built before
+        # metrics["systems"] is assigned, so it can never self-nest `systems`.
+        local_projection = {
+            "cpu": metrics["cpu"],
+            "memory": metrics["memory"],
+            "gpus": [{"utilization_pct": g.get("utilization_pct")}
+                    for g in metrics.get("gpus", [])],
+            "llms": [{"status": e.get("status"),
+                     "gen_tokens_per_s": e.get("gen_tokens_per_s"),
+                     "backend": e.get("backend")}
+                    for e in metrics.get("llms", [])],
+        }
         systems = [{"name": "local", "status": "up",
-                   "metrics": dict(metrics)}]
+                   "metrics": local_projection}]
         for name in list(self._upstream_names):
             entry = self._upstream_latest.get(name)
             systems.append(entry if entry is not None else

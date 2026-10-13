@@ -527,6 +527,18 @@ const sysState = {
   systems: new Map(),
 };
 
+// The most recent top-level payload. The LOCAL system's detail data is
+// this payload (its systems[].metrics is a slim fleet projection, not
+// the full re-embedding); peers use their systems[].metrics (full
+// projection). See detailMetrics().
+let lastPayload = null;
+
+function detailMetrics(name) {
+  if (name === 'local') return lastPayload;
+  const s = sysState.systems.get(name);
+  return s ? s.metrics : null;
+}
+
 function freshHist() {
   return { labels: [], gen: [], prompt: [], perModel: {} };
 }
@@ -1091,6 +1103,7 @@ source.onopen = () => setConnected(true);
 
 source.onmessage = (e) => {
   const m = JSON.parse(e.data);
+  lastPayload = m;
   /* Multi-system: per-system state + trend buffers first. The fallback
      covers a version-skewed payload without `systems`. */
   const systems = Array.isArray(m.systems) && m.systems.length
@@ -1105,15 +1118,20 @@ source.onmessage = (e) => {
   } else {
     const s = sysState.systems.get(sysState.selected);
     if (s && s.metrics) {
-      const sm = s.metrics;
-      updateSystem(sm);
-      updateGPUs(sm.gpus || []);
-      // Card reconcile + gauge/chart refresh from the per-target buffers
-      // (backend-switch resets are visible in the buffers already —
-      // updateSystemEntry applied them before this call).
-      renderLLMCards();
-      updateSwap(sm);
-      updateHostHealth(sm);
+      // Local system: detail data is the top-level payload (its
+      // systems[].metrics is a slim fleet projection). Peers: their
+      // systems[].metrics (full projection).
+      const sm = detailMetrics(sysState.selected);
+      if (sm) {
+        updateSystem(sm);
+        updateGPUs(sm.gpus || []);
+        // Card reconcile + gauge/chart refresh from the per-target buffers
+        // (backend-switch resets are visible in the buffers already —
+        // updateSystemEntry applied them before this call).
+        renderLLMCards();
+        updateSwap(sm);
+        updateHostHealth(sm);
+      }
     }
     // metrics == null (system down, hold expired): keep the last
     // rendered state; the tab's red dot carries the down signal.
@@ -1742,8 +1760,12 @@ function renderLLMCards() {
     llmCards.clear();
     llmCardsOwner = sys;
   }
-  const entries = s.metrics.llm_enabled === false ? []
-    : normalizeLlms(s.metrics, sys);
+  // Local system: LLM entries come from the top-level payload (its
+  // systems[].metrics is a slim fleet projection). Peers: their
+  // systems[].metrics (full projection).
+  const dm = detailMetrics(sys);
+  const entries = (dm && dm.llm_enabled === false) ? []
+    : (dm ? normalizeLlms(dm, sys) : []);
   const wanted = new Map(entries.map(e => [e.name, e]));
   for (const [name, card] of [...llmCards]) {
     if (!wanted.has(name)) {
