@@ -115,59 +115,40 @@ def test_gpu_cli_not_found():
 
 
 # ---------------------------------------------------------------------------
-# lspci vendor lookup tests
+# PCI vendor-ID → name map tests (pci.ids-independent board/GPU vendor)
 # ---------------------------------------------------------------------------
 
-def test_lspci_vendor_map_parses_subsystem():
-    from app import _parse_lspci_subsystem
+def test_vendor_id_name_maps_known_ids():
+    from app import _vendor_id_name
 
-    # Machine-readable ``lspci -vm`` format uses a tab-separated SVendor line
-    lspci_vm = (
-        "Slot:\t01:00.0\n"
-        "Class:\tVGA compatible controller\n"
-        "Vendor:\tNVIDIA Corporation\n"
-        "Device:\tGA102 [GeForce RTX 3080]\n"
-        "SVendor:\tGigabyte Technology Co., Ltd\n"
-        "SDevice:\tDevice 1234\n"
-    )
-    assert _parse_lspci_subsystem(lspci_vm) == "Gigabyte"
-
-    # Verbose ``lspci -v`` format has a Subsystem line instead
-    lspci_subsys = (
-        "01:00.0 VGA compatible controller: NVIDIA Corporation GA102 [GeForce RTX 3080]\n"
-        "        Subsystem: Gigabyte Technology Co., Ltd Device 1234\n"
-    )
-    assert _parse_lspci_subsystem(lspci_subsys) == "Gigabyte"
-
-    # Test Dell format
-    lspci_dell = (
-        "02:00.0 VGA compatible controller: NVIDIA Corporation AD102 [GeForce RTX 4070 Ti]\n"
-        "        Subsystem: Dell Device 5678\n"
-    )
-    assert _parse_lspci_subsystem(lspci_dell) == "Dell"
-
-    # Neither SVendor nor Subsystem present → empty string so caller fallbacks kick in
-    lspci_none = (
-        "Slot:\t01:00.0\n"
-        "Class:\tVGA compatible controller\n"
-        "Vendor:\tNVIDIA Corporation\n"
-        "Device:\tGA102 [GeForce RTX 3080]\n"
-    )
-    assert _parse_lspci_subsystem(lspci_none) == ""
+    # Known GPU vendor IDs map to their names.
+    assert _vendor_id_name("0x10de") == "NVIDIA"
+    assert _vendor_id_name("0x1002") == "AMD"
+    # Known board vendor IDs map to their names.
+    assert _vendor_id_name("0x1028") == "Gigabyte"
+    assert _vendor_id_name("0x1043") == "Dell"
+    assert _vendor_id_name("0x1458") == "MSI"
+    assert _vendor_id_name("0x144d") == "ASRock"
+    # Case-insensitive (sysfs reports lowercase hex).
+    assert _vendor_id_name("0x10DE") == "NVIDIA"
+    # Absent / empty ID → "unknown".
+    assert _vendor_id_name(None) == "unknown"
+    assert _vendor_id_name("") == "unknown"
+    # Unknown ID → the raw ID string (deterministic, pci.ids-independent).
+    assert _vendor_id_name("0x9999") == "0x9999"
 
 
-def test_lspci_vendor_map_not_found():
-    from app import _lspci_vendor_map
+def test_sysfs_pci_vendor_name_missing_device():
+    """A BDF with no sysfs device node (non-Linux host, or a device that
+    isn't present) resolves to ``unknown`` — the sysfs read fails cleanly
+    and the fallback kicks in. Never raises."""
+    from app import _sysfs_pci_vendor_name
 
-    import app as app_mod
-    original = app_mod._lspci_cache
-    try:
-        app_mod._lspci_cache = None  # force fresh call
-        with patch("subprocess.run", side_effect=FileNotFoundError()):
-            mapping = _lspci_vendor_map(["0000:01:00.0"])
-        assert mapping == {}
-    finally:
-        app_mod._lspci_cache = original
+    # A BDF that doesn't correspond to a real device node.
+    assert _sysfs_pci_vendor_name("0000:ff:ff.0") == "unknown"
+    # A malformed BDF also resolves to ``unknown``.
+    assert _sysfs_pci_vendor_name("not-a-bdf") == "unknown"
+    assert _sysfs_pci_vendor_name("") == "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -196,9 +177,11 @@ def test_gpu_pynvml_basic():
         if "app" in sys.modules:
             del sys.modules["app"]
         import app as app_mod
-        # Seed the lspci cache so _gpu_pynvml picks up a vendor name
-        app_mod._lspci_cache = {"0000:01:00.0": "Dell"}
-        result = app_mod._gpu_pynvml()
+        # Mock the sysfs vendor-ID read so the board vendor is resolved
+        # from the hardcoded map (pci.ids-independent).
+        with patch.object(app_mod, "_sysfs_pci_vendor_id",
+                         return_value="0x10de"):
+            result = app_mod._gpu_pynvml()
 
     assert len(result) == 1
     gpu = result[0]
@@ -209,7 +192,7 @@ def test_gpu_pynvml_basic():
     assert gpu["throttle"]["hw_thermal_slowdown"] is True
     assert gpu["name"] == "NVIDIA A100-SXM4-80GB"
     assert gpu["pci_bus_id"] == "0000:01:00.0"
-    assert gpu["board_vendor"] == "Dell"
+    assert gpu["board_vendor"] == "NVIDIA"
 
 
 def test_gpu_pynvml_not_installed():
@@ -4341,40 +4324,28 @@ def _fake_drm(drm_dir, cards):
 
 @pytest.fixture(autouse=True)
 def reset_amd_state():
-    """Reset lspci name cache + AMD negative cache around every test."""
+    """Reset AMD BDF/product-name caches around every test."""
     import app as app_mod
 
-    original_cache = app_mod._lspci_name_cache
     original_absent = app_mod._amd_absent_since
-    original_lspci_neg = app_mod._lspci_negative
-    original_name_neg = app_mod._lspci_name_negative
     original_bdf_map = app_mod._amd_bdf_map
     original_bdf_neg = app_mod._amd_bdf_negative
     original_rocm_cards = app_mod._rocm_cards_cache
     original_product_names = app_mod._amd_product_names
     original_product_ts = app_mod._amd_product_names_ts
-    original_lspci_missing = app_mod._lspci_missing_logged
-    app_mod._lspci_name_cache = None
     app_mod._amd_absent_since = None
-    app_mod._lspci_negative = {}
-    app_mod._lspci_name_negative = {}
     app_mod._amd_bdf_map = None
     app_mod._amd_bdf_negative = {}
     app_mod._rocm_cards_cache = None
     app_mod._amd_product_names = {}
     app_mod._amd_product_names_ts = None
-    app_mod._lspci_missing_logged = False
     yield
-    app_mod._lspci_name_cache = original_cache
     app_mod._amd_absent_since = original_absent
-    app_mod._lspci_negative = original_lspci_neg
-    app_mod._lspci_name_negative = original_name_neg
     app_mod._amd_bdf_map = original_bdf_map
     app_mod._amd_bdf_negative = original_bdf_neg
     app_mod._rocm_cards_cache = original_rocm_cards
     app_mod._amd_product_names = original_product_names
     app_mod._amd_product_names_ts = original_product_ts
-    app_mod._lspci_missing_logged = original_lspci_missing
 
 
 def _amd_smi_mock(stdout: str, returncode: int = 0):
@@ -4392,20 +4363,19 @@ def test_amd_unwrap():
     assert _amd_unwrap(True) is None  # bool is not a metric
 
 
-def test_parse_lspci_device_name():
-    from app import _parse_lspci_device
+def test_bdf_sysfs_form_handles_8_digit_domain():
+    from app import _bdf_sysfs_form
 
-    vm = (
-        "Slot:\t01:00.0\n"
-        "Class:\tVGA compatible controller\n"
-        "Vendor:\tAdvanced Micro Devices, Inc. [AMD/ATI]\n"
-        "Device:\tNavi 31 [Radeon RX 7900 XTX]\n"
-        "SVendor:\tXFX\n"
-    )
-    assert _parse_lspci_device(vm) == "Radeon RX 7900 XTX"
-    # No brackets → raw remainder
-    assert _parse_lspci_device("Device: GA102\n") == "GA102"
-    assert _parse_lspci_device("nothing here\n") == ""
+    # 4-digit domain → unchanged (lowercased).
+    assert _bdf_sysfs_form("0000:2d:00.0") == "0000:2d:00.0"
+    # 8-digit domain → truncated to 4 digits (the sysfs form).
+    assert _bdf_sysfs_form("00000000:2d:00.0") == "0000:2d:00.0"
+    # Uppercase → lowercased.
+    assert _bdf_sysfs_form("0000:2D:00.0") == "0000:2d:00.0"
+    # Malformed / empty / None → None.
+    assert _bdf_sysfs_form("not-a-bdf") is None
+    assert _bdf_sysfs_form("") is None
+    assert _bdf_sysfs_form(None) is None
 
 
 def test_gpu_amd_smi_happy_path():
@@ -4765,62 +4735,56 @@ def test_colliding_bdf_merge_guard(caplog):
     assert [g["vendor"] for g in ok] == ["nvidia", "amd"]
 
 
-def test_parse_lspci_device_takes_last_device_line():
-    """The host's ``lspci -vm`` has TWO ``Device:`` lines: the first is
-    the BDF/slot, the second is the product name. The parser must take
-    the LAST one (the product name), not the first (the BDF)."""
-    from app import _parse_lspci_device
+def test_sysfs_pci_vendor_id_reads_vendor_file(tmp_path):
+    """The raw PCI vendor ID is read from the sysfs ``vendor`` file
+    (pci.ids-independent). A fake device layout with a ``vendor`` file
+    behind the BDF is resolved to the raw ID string."""
+    from app import _sysfs_pci_vendor_id
 
-    two_device_lines = (
-        "Device:\t2d:00.0\n"
-        "Class:\tVGA compatible controller\n"
-        "Vendor:\tAdvanced Micro Devices, Inc. [AMD/ATI]\n"
-        "Device:\tNavi 48 [Radeon AI PRO R9700]\n"
-        "SVendor:\tASRock Incorporation\n"
-        "SDevice:\tDevice 5413\n"
-    )
-    assert _parse_lspci_device(two_device_lines) == "Radeon AI PRO R9700"
-    # The single-``Device:``-line case (the existing repo fixture) still
-    # works — the only line is also the last line.
-    single = "Device:\tNavi 31 [Radeon RX 7900 XTX]\n"
-    assert _parse_lspci_device(single) == "Radeon RX 7900 XTX"
+    # Build a fake /sys/bus/pci/devices layout: {bdf: vendor_hex}.
+    pci_dir = tmp_path / "pci"
+    (pci_dir / "0000:2d:00.0").mkdir(parents=True)
+    (pci_dir / "0000:2d:00.0" / "vendor").write_text("0x1002\n")
+    (pci_dir / "0000:44:00.0").mkdir(parents=True)
+    (pci_dir / "0000:44:00.0" / "vendor").write_text("0x10de\n")
 
-
-def test_gpu_name_rejects_bdf_slot_shape():
-    """A BDF/slot-shaped name is rejected — not used and not positive-
-    cached — so the poisoned ``{'0000:2d:00.0': '2d:00.0'}`` entry is
-    never served. The caller falls back to the tool name / "AMD GPU"."""
-    from app import _lspci_device_name_map
-    import app as app_mod
-
-    # lspci -vm with only a BDF-shaped Device: line (the poisoned case).
-    lspci_bdf = (
-        "Device:\t2d:00.0\n"
-        "Class:\tVGA compatible controller\n"
-        "Vendor:\tAdvanced Micro Devices, Inc. [AMD/ATI]\n"
-    )
-    with patch("subprocess.run", return_value=_amd_smi_mock(lspci_bdf)):
-        mapping = _lspci_device_name_map(["0000:2d:00.0"])
-    # Rejected: not used (mapping is "" and not in the positive cache.
-    assert mapping["0000:2d:00.0"] == ""
-    assert "0000:2d:00.0" not in (app_mod._lspci_name_cache or {})
+    # The raw vendor ID is read from the vendor file.
+    assert _sysfs_pci_vendor_id("0000:2d:00.0", str(pci_dir)) == "0x1002"
+    assert _sysfs_pci_vendor_id("0000:44:00.0", str(pci_dir)) == "0x10de"
+    # The 8-digit-domain form is normalized to the sysfs form.
+    assert _sysfs_pci_vendor_id("00000000:2d:00.0", str(pci_dir)) == "0x1002"
+    # A missing device node → None.
+    assert _sysfs_pci_vendor_id("0000:ff:ff.0", str(pci_dir)) is None
 
 
-def test_gpu_name_rejects_bare_hex():
-    """A bare-hex name (a raw device id, e.g. ``5413``) is rejected —
-    not used and not positive-cached."""
-    from app import _lspci_device_name_map
-    import app as app_mod
+def test_sysfs_pci_vendor_name_unknown_id_falls_back(tmp_path):
+    """An unknown vendor ID falls back to the raw ID string (deterministic,
+    pci.ids-independent). A fake device layout with an unknown vendor ID
+    resolves to the raw ID string, not a name."""
+    from app import _sysfs_pci_vendor_name
 
-    lspci_hex = (
-        "Device:\t5413\n"
-        "Class:\tVGA compatible controller\n"
-        "Vendor:\tAdvanced Micro Devices, Inc. [AMD/ATI]\n"
-    )
-    with patch("subprocess.run", return_value=_amd_smi_mock(lspci_hex)):
-        mapping = _lspci_device_name_map(["0000:2d:00.0"])
-    assert mapping["0000:2d:00.0"] == ""
-    assert "0000:2d:00.0" not in (app_mod._lspci_name_cache or {})
+    pci_dir = tmp_path / "pci"
+    (pci_dir / "0000:2d:00.0").mkdir(parents=True)
+    (pci_dir / "0000:2d:00.0" / "vendor").write_text("0x9999\n")
+
+    # Unknown ID → the raw ID string.
+    assert _sysfs_pci_vendor_name("0000:2d:00.0", str(pci_dir)) == "0x9999"
+
+
+def test_sysfs_pci_vendor_name_known_id_maps(tmp_path):
+    """A known vendor ID is mapped to its name via the hardcoded map.
+    A fake device layout with a known vendor ID resolves to the name."""
+    from app import _sysfs_pci_vendor_name
+
+    pci_dir = tmp_path / "pci"
+    (pci_dir / "0000:2d:00.0").mkdir(parents=True)
+    (pci_dir / "0000:2d:00.0" / "vendor").write_text("0x1002\n")
+    (pci_dir / "0000:44:00.0").mkdir(parents=True)
+    (pci_dir / "0000:44:00.0" / "vendor").write_text("0x10de\n")
+
+    # Known IDs → names.
+    assert _sysfs_pci_vendor_name("0000:2d:00.0", str(pci_dir)) == "AMD"
+    assert _sysfs_pci_vendor_name("0000:44:00.0", str(pci_dir)) == "NVIDIA"
 
 
 def test_gpu_name_prefers_tool_product_name():
@@ -6163,31 +6127,21 @@ def test_cycle_duration_and_drift_logged(caplog):
     assert any(pattern.search(r.getMessage()) for r in cycle_logs)
 
 
-def test_lspci_timeout_result_cached_not_repeated():
-    """A timed-out lspci lookup is negative-cached (TTL) and not re-run
-    on the next poll — a hung lspci cannot stall the snapshot path
-    every cycle."""
-    import subprocess as sp
+def test_sysfs_pci_vendor_name_never_raises(tmp_path):
+    """The sysfs vendor-name resolution never raises — a missing device
+    node, a malformed BDF, or an absent vendor file all resolve to a
+    fallback (``unknown`` or the raw ID string) without stalling the
+    snapshot path."""
+    from app import _sysfs_pci_vendor_name
 
-    import app as app_mod
-    from app import _lspci_vendor_map
-
-    original_neg = app_mod._lspci_negative
-    original_cache = app_mod._lspci_cache
-    app_mod._lspci_negative = {}
-    app_mod._lspci_cache = None
-    try:
-        with patch("subprocess.run",
-                   side_effect=sp.TimeoutExpired(
-                       cmd="lspci", timeout=5)) as mock_run:
-            first = _lspci_vendor_map(["0000:2d:00.0", "0000:61:00.0"])
-            second = _lspci_vendor_map(["0000:2d:00.0", "0000:61:00.0"])
-        assert mock_run.call_count == 1  # 2nd poll served from negative cache
-        assert first == {}
-        assert second == {"0000:2d:00.0": "", "0000:61:00.0": ""}
-    finally:
-        app_mod._lspci_negative = original_neg
-        app_mod._lspci_cache = original_cache
+    # A BDF with no device node → "unknown" (no raise).
+    assert _sysfs_pci_vendor_name("0000:ff:ff.0", str(tmp_path)) == "unknown"
+    # A malformed BDF → "unknown" (no raise).
+    assert _sysfs_pci_vendor_name("garbage", str(tmp_path)) == "unknown"
+    # A device node with no vendor file → "unknown" (the open fails
+    # cleanly, no raise).
+    (tmp_path / "0000:2d:00.0").mkdir(parents=True)
+    assert _sysfs_pci_vendor_name("0000:2d:00.0", str(tmp_path)) == "unknown"
 
 
 def test_poll_interval_semantics_unchanged():

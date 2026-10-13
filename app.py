@@ -46,99 +46,79 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# lspci-based board vendor lookup
+# PCI vendor-ID → name map (pci.ids-independent board/GPU vendor)
 # ---------------------------------------------------------------------------
-
-_lspci_cache: dict[str, str] | None = None  # bus_id → vendor name
-# Negative cache for failed/timed-out lookups (bus_id → monotonic ts):
-# a hung or missing lspci must not stall the snapshot path on every
-# poll — the failure is served from this cache and the subprocess is
-# re-run only after _LSPICI_NEGATIVE_TTL (same pattern as
-# _AMD_NEGATIVE_REPROBE_S).
-_lspci_negative: dict[str, float] = {}
-_LSPICI_NEGATIVE_TTL = 300.0
-# Warn-once guard: a missing lspci binary is a global condition, so the
-# "not found" message is logged once (not once per device) now that a
-# per-device failure ``continue``s instead of ``break``ing the loop.
-_lspci_missing_logged = False
-
-
-def _lspci_vendor_map(bus_ids: list[str]) -> dict[str, str]:
-    global _lspci_cache
-    if _lspci_cache is None:
-        _lspci_cache = {}
-    now = time.monotonic()
-
-    mapping: dict[str, str] = {}
-    for bus_id in bus_ids:
-        # Return cached result immediately if we already have it
-        if bus_id in _lspci_cache:
-            mapping[bus_id] = _lspci_cache[bus_id]
-            continue
-        failed_at = _lspci_negative.get(bus_id)
-        if failed_at is not None and \
-                (now - failed_at) < _LSPICI_NEGATIVE_TTL:
-            mapping[bus_id] = ""  # cached failure — no subprocess
-            continue
-
-        try:
-            result = subprocess.run(  # noqa: S603 – static args only
-                ["lspci", "-s", bus_id, "-vm"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            vendor_name = _parse_lspci_subsystem(result.stdout)
-        except FileNotFoundError:
-            log.info("lspci not found – board vendor lookup unavailable "
-                     "(negative-cached %.0fs)", _LSPICI_NEGATIVE_TTL)
-            _lspci_negative.update({b: now for b in bus_ids})
-            break
-        except subprocess.TimeoutExpired:
-            log.warning("lspci timed out for %s "
-                       "(negative-cached %.0fs)",
-                       bus_id, _LSPICI_NEGATIVE_TTL)
-            _lspci_negative.update({b: now for b in bus_ids})
-            break
-
-        _lspci_cache[bus_id] = vendor_name
-        mapping[bus_id] = vendor_name
-
-    return mapping
+# The board/GPU vendor is resolved from the *raw* PCI vendor ID — read
+# from the sysfs ``vendor`` file, which carries the numeric ID without
+# consulting the ``pci.ids`` database. The ID is stable across hardware
+# generations, so a small hardcoded map covers the common cases; unknown
+# IDs fall back to the raw ID string (still deterministic and
+# pci.ids-independent).
+_VENDOR_ID_NAMES: dict[int, str] = {
+    0x10DE: "NVIDIA",
+    0x1002: "AMD",
+    0x1028: "Gigabyte",
+    0x1043: "Dell",
+    0x1458: "MSI",
+    0x144D: "ASRock",
+    0x103C: "HP",
+    0x106B: "Apple",
+    0x1569: "Gigabyte",
+}
 
 
-def _parse_lspci_subsystem(output: str) -> str:
-    """Extract the board vendor name from lspci output.
+def _bdf_sysfs_form(bdf: str) -> str | None:
+    """Normalize a PCI BDF to the 4-digit-domain sysfs form (e.g.
+    ``0000:2d:00.0``). Handles the 8-digit-domain form
+    (``00000000:2d:00.0``) that occurs in some payloads. None when the
+    BDF is malformed or empty."""
+    if not bdf:
+        return None
+    m = re.match(
+        r"^([0-9a-fA-F]{4,8}):([0-9a-fA-F]{2}):([0-9a-fA-F]{2})\.([0-7])$",
+        bdf.strip())
+    if not m:
+        return None
+    domain, bus, slot, func = m.groups()
+    return f"{domain[-4:].lower()}:{bus.lower()}:{slot.lower()}.{func}"
 
-    Handles both real-world formats::
 
-        # ``lspci -s <bus> -vm`` (machine-readable, tab-separated):
-        Slot:\t01:00.0
-        Class:\tVGA compatible controller
-        Vendor:\tNVIDIA Corporation
-        Device:\tGA102 [GeForce RTX 3080]
-        SVendor:\tGigabyte Technology Co., Ltd
-        SDevice:\tDevice 1234
+def _sysfs_pci_vendor_id(bdf: str,
+                         pci_dir: str = "/sys/bus/pci/devices") -> str | None:
+    """Raw PCI vendor ID (e.g. ``0x10de``) for a BDF from the sysfs
+    ``vendor`` file — pci.ids-independent (the file carries the numeric
+    ID, not the pci.ids-resolved name). None on non-Linux hosts or any
+    error (a missing device node is a normal, non-fatal condition)."""
+    normalized = _bdf_sysfs_form(bdf)
+    if not normalized:
+        return None
+    try:
+        with open(f"{pci_dir}/{normalized}/vendor") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
 
-        # ``lspci -s <bus> -v`` (verbose):
-        01:00.0 VGA compatible controller: NVIDIA Corporation GA102 [GeForce RTX 3080]
-                Subsystem: Dell Device 5678
 
-    An "SVendor:" line is preferred; the first token after it is returned
-    (e.g. "Gigabyte", "Dell"). If no SVendor line exists, falls back to the
-    first token after a "Subsystem:" line. Returns an empty string when
-    neither line is present so callers can apply their own fallbacks
-    (hex id / "unknown").
-    """
-    for line in output.splitlines():
-        if "SVendor:" in line:
-            vendor_part = line.split("SVendor:", 1)[1].strip()
-            return vendor_part.split()[0] if vendor_part else ""
-    for line in output.splitlines():
-        if "Subsystem:" in line:
-            vendor_part = line.split("Subsystem:", 1)[1].strip()
-            return vendor_part.split()[0] if vendor_part else ""
-    return ""
+def _vendor_id_name(vendor_id: str | None) -> str:
+    """Map a raw PCI vendor ID (e.g. ``0x10de``) to a name via the
+    hardcoded map; fall back to the raw ID string when the ID is unknown,
+    and ``unknown`` when the ID is absent. Never raises."""
+    if not vendor_id:
+        return "unknown"
+    try:
+        vid = int(vendor_id, 16)
+    except (ValueError, TypeError):
+        return vendor_id
+    return _VENDOR_ID_NAMES.get(vid, vendor_id)
+
+
+def _sysfs_pci_vendor_name(bdf: str,
+                           pci_dir: str = "/sys/bus/pci/devices") -> str:
+    """Board/GPU vendor name for a BDF, resolved from the raw PCI vendor
+    ID (the sysfs ``vendor`` file) via a hardcoded map — pci.ids-
+    independent. Falls back to the raw ID string when the ID is unknown,
+    and ``unknown`` when the ID can't be read. Never raises."""
+    return _vendor_id_name(_sysfs_pci_vendor_id(bdf, pci_dir))
 
 
 # ---------------------------------------------------------------------------
@@ -196,13 +176,9 @@ def _gpu_pynvml() -> list[dict[str, Any]]:
             except Exception:
                 name = "Unknown GPU"
 
-            # Board vendor from lspci (cached internally) or fallback to raw hex
-            board_vendor = _lspci_vendor_map([bus_id]).get(bus_id)
-            if not board_vendor:
-                try:
-                    board_vendor = f"0x{pci_info.pciSubSystemId & 0xFFFF:04X}"
-                except (NameError, AttributeError):
-                    board_vendor = "unknown"
+            # Board/GPU vendor from the raw PCI vendor ID (sysfs ``vendor``
+            # file) via a hardcoded map — pci.ids-independent.
+            board_vendor = _sysfs_pci_vendor_name(bus_id)
 
             # Throttle-reason bitmask
             throttle_bits = pynvml.nvmlDeviceGetCurrentClocksThrottleReasons(handle)
@@ -279,15 +255,10 @@ def _gpu_cli() -> list[dict[str, Any]]:
             mem_used_mb = int(row[1])
             mem_total_mb = max(int(row[2]), 1)
 
-            # Board vendor from lspci or fallback to raw hex
+            # Board/GPU vendor from the raw PCI vendor ID (sysfs ``vendor``
+            # file) via a hardcoded map — pci.ids-independent.
             bus_id = row[7].strip()
-            board_vendor = _lspci_vendor_map([bus_id]).get(bus_id)
-            if not board_vendor:
-                raw_device_id = row[9].strip()
-                try:
-                    board_vendor = f"0x{int(raw_device_id, 16) & 0xFFFF:04X}"
-                except ValueError:
-                    board_vendor = "unknown"
+            board_vendor = _sysfs_pci_vendor_name(bus_id)
 
             # Optional power fields – nvidia-smi reports "[Not Supported]"
             # (or "[N/A]") when the query is unavailable on this GPU.
@@ -353,13 +324,6 @@ _ROCM_SMI_BIN_CANDIDATES = ("rocm-smi", "/opt/rocm/bin/rocm-smi")
 # would otherwise fire every poll.
 _nvidia_cli_missing_logged = False
 
-# lspci device-name cache (bus_id → "Radeon RX 7900 XTX" style name).
-_lspci_name_cache: dict[str, str] | None = None
-# Failed/timed-out GPU-name lookups (bus_id → monotonic ts); see
-# _lspci_negative — same TTL, same no-stall guarantee.
-_lspci_name_negative: dict[str, float] = {}
-
-
 def _find_cli_binary(candidates: tuple[str, ...]) -> str | None:
     """Resolve a CLI from PATH candidates then absolute ROCm paths."""
     import shutil
@@ -410,78 +374,6 @@ def _is_implausible_gpu_name(name: str) -> bool:
     return (bool(_GPU_NAME_BDF_RE.match(name))
             or bool(_GPU_NAME_HEX_RE.match(name))
             or bool(_GPU_NAME_DEVICE_HEX_RE.match(name)))
-
-
-def _parse_lspci_device(output: str) -> str:
-    """Extract the board model name from ``lspci -s <bus> -vm`` output.
-
-    ``lspci -vm`` can emit TWO ``Device:`` lines: the first is the
-    BDF/slot (``Device: 2d:00.0``) and the second is the product name
-    (``Device: Navi 48 [Radeon AI PRO R9700]``) — so the LAST
-    ``Device:`` line is taken (the product name when both are present,
-    the only line when just one is). Prefers the bracketed part (the
-    marketing name on AMD cards); falls back to the raw remainder.
-    """
-    device_lines = [line for line in output.splitlines()
-                   if line.startswith("Device:")]
-    if not device_lines:
-        return ""
-    part = device_lines[-1].split("Device:", 1)[1].strip()
-    m = re.search(r"\[([^\]]+)\]", part)
-    return m.group(1).strip() if m else part
-
-
-def _lspci_device_name_map(bus_ids: list[str]) -> dict[str, str]:
-    global _lspci_name_cache, _lspci_missing_logged
-    if _lspci_name_cache is None:
-        _lspci_name_cache = {}
-    now = time.monotonic()
-
-    mapping: dict[str, str] = {}
-    for bus_id in bus_ids:
-        if bus_id in _lspci_name_cache:
-            mapping[bus_id] = _lspci_name_cache[bus_id]
-            continue
-        failed_at = _lspci_name_negative.get(bus_id)
-        if failed_at is not None and \
-                (now - failed_at) < _LSPICI_NEGATIVE_TTL:
-            mapping[bus_id] = ""  # cached failure — no subprocess
-            continue
-        try:
-            result = subprocess.run(  # noqa: S603 – static args only
-                ["lspci", "-s", bus_id, "-vm"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            name = _parse_lspci_device(result.stdout)
-        except FileNotFoundError:
-            if not _lspci_missing_logged:
-                log.info("lspci not found – GPU name lookup unavailable "
-                         "(negative-cached %.0fs)", _LSPICI_NEGATIVE_TTL)
-                _lspci_missing_logged = True
-            _lspci_name_negative[bus_id] = now  # this device only
-            continue
-        except subprocess.TimeoutExpired:
-            log.warning("lspci timed out for %s "
-                       "(negative-cached %.0fs)",
-                       bus_id, _LSPICI_NEGATIVE_TTL)
-            _lspci_name_negative[bus_id] = now  # this device only
-            continue
-        if name and _is_implausible_gpu_name(name):
-            # Rejected (BDF/slot, bare hex, or ``Device <hex>``): the
-            # card's address, not its name (the lspci first-``Device:``-
-            # line bug). Neither used nor positive-cached — negative-
-            # cached for the TTL so the poisoned read is not served
-            # forever and the subprocess is not re-run on every poll.
-            # The caller falls back to the tool name / "AMD GPU".
-            _lspci_name_negative[bus_id] = now
-            mapping[bus_id] = ""
-            continue
-        _lspci_name_cache[bus_id] = name
-        mapping[bus_id] = name
-
-    return mapping
 
 
 # ---------------------------------------------------------------------------
@@ -767,24 +659,16 @@ def _amd_smi_entry_to_gpu(entry: dict[str, Any], idx: int) -> dict[str, Any] | N
     # The vendor-local ``gpu`` index is resolved to a BDF from the tool's
     # own data (T3) — never passed as a global ``/sys/class/drm/cardN``.
     bus_id = _amd_gpu_bus_id(idx)
-    board_vendor = "unknown"
-    # Name: prefer the tool's own product/asic (market) name — a static
-    # device fact — over lspci, so the label is not hostage to pci.ids
-    # freshness (the R9700 is new hardware). Fall back to lspci (whose
-    # implausible names are rejected in _lspci_device_name_map), then
-    # "AMD GPU".
+    # Board/GPU vendor from the raw PCI vendor ID (sysfs ``vendor`` file)
+    # via a hardcoded map — pci.ids-independent.
+    board_vendor = _sysfs_pci_vendor_name(bus_id) if bus_id else "unknown"
+    # Name: rely on the tool's own product/asic (market) name — a static
+    # device fact — so the label is not hostage to pci.ids freshness (the
+    # R9700 is new hardware). Fall back to "AMD GPU".
     name = "AMD GPU"
     tool_name = _amd_product_name(idx)
     if tool_name:
         name = tool_name
-    if bus_id:
-        vendor_map = _lspci_vendor_map([bus_id]).get(bus_id)
-        if vendor_map:
-            board_vendor = vendor_map
-        if not tool_name:
-            name_map = _lspci_device_name_map([bus_id]).get(bus_id)
-            if name_map:
-                name = name_map
 
     gpu: dict[str, Any] = {
         "index": idx,
@@ -929,15 +813,11 @@ def _gpu_rocm_smi() -> list[dict[str, Any]]:
 
         dev = row[0].strip()  # e.g. "card0"
         bus_id = _sysfs_pci_bus_id(dev)
-        board_vendor = "unknown"
+        # Board/GPU vendor from the raw PCI vendor ID (sysfs ``vendor``
+        # file) via a hardcoded map — pci.ids-independent.
+        board_vendor = _sysfs_pci_vendor_name(bus_id) if bus_id else "unknown"
+        # No tool product name on the rocm path — "AMD GPU".
         name = "AMD GPU"
-        if bus_id:
-            vendor_map = _lspci_vendor_map([bus_id]).get(bus_id)
-            if vendor_map:
-                board_vendor = vendor_map
-            name_map = _lspci_device_name_map([bus_id]).get(bus_id)
-            if name_map:
-                name = name_map
 
         gpu: dict[str, Any] = {
             "index": idx,
@@ -1000,15 +880,11 @@ def _gpu_amd_sysfs(
             continue
 
         bus_id = _sysfs_pci_bus_id(card)
-        board_vendor = "unknown"
+        # Board/GPU vendor from the raw PCI vendor ID (sysfs ``vendor``
+        # file) via a hardcoded map — pci.ids-independent.
+        board_vendor = _sysfs_pci_vendor_name(bus_id) if bus_id else "unknown"
+        # No tool product name on the sysfs path — "AMD GPU".
         name = "AMD GPU"
-        if bus_id:
-            vendor_map = _lspci_vendor_map([bus_id]).get(bus_id)
-            if vendor_map:
-                board_vendor = vendor_map
-            name_map = _lspci_device_name_map([bus_id]).get(bus_id)
-            if name_map:
-                name = name_map
 
         gpu: dict[str, Any] = {
             "index": idx,
@@ -4697,10 +4573,11 @@ def main() -> None:
                 if settings["upstreams"] else "")
     log.info("Starting Resource Dashboard on http://%s:%d (LLM: %s%s)",
              settings["host"], settings["port"], llm_status, up_status)
-    # threaded=True: the dev server is single-threaded by default, so a client
-    # holding the long-lived SSE /events stream would make every other request
-    # (incl. /api/metrics from an aggregating dashboard) queue or 503.
-    app.run(host=settings["host"], port=settings["port"], debug=False, threaded=True)
+    # waitress is a production WSGI server (a thread per connection), so a
+    # client holding the long-lived SSE /events stream does not block other
+    # requests (incl. /api/metrics from an aggregating dashboard).
+    from waitress import serve
+    serve(app, host=settings["host"], port=settings["port"], threads=20)
 
 
 def _bootstrap_wsgi() -> Flask:
