@@ -50,18 +50,31 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _lspci_cache: dict[str, str] | None = None  # bus_id → vendor name
+# Negative cache for failed/timed-out lookups (bus_id → monotonic ts):
+# a hung or missing lspci must not stall the snapshot path on every
+# poll — the failure is served from this cache and the subprocess is
+# re-run only after _LSPICI_NEGATIVE_TTL (same pattern as
+# _AMD_NEGATIVE_REPROBE_S).
+_lspci_negative: dict[str, float] = {}
+_LSPICI_NEGATIVE_TTL = 300.0
 
 
 def _lspci_vendor_map(bus_ids: list[str]) -> dict[str, str]:
     global _lspci_cache
     if _lspci_cache is None:
         _lspci_cache = {}
+    now = time.monotonic()
 
     mapping: dict[str, str] = {}
     for bus_id in bus_ids:
         # Return cached result immediately if we already have it
         if bus_id in _lspci_cache:
             mapping[bus_id] = _lspci_cache[bus_id]
+            continue
+        failed_at = _lspci_negative.get(bus_id)
+        if failed_at is not None and \
+                (now - failed_at) < _LSPICI_NEGATIVE_TTL:
+            mapping[bus_id] = ""  # cached failure — no subprocess
             continue
 
         try:
@@ -73,10 +86,15 @@ def _lspci_vendor_map(bus_ids: list[str]) -> dict[str, str]:
             )
             vendor_name = _parse_lspci_subsystem(result.stdout)
         except FileNotFoundError:
-            log.info("lspci not found – board vendor lookup unavailable")
+            log.info("lspci not found – board vendor lookup unavailable "
+                     "(negative-cached %.0fs)", _LSPICI_NEGATIVE_TTL)
+            _lspci_negative.update({b: now for b in bus_ids})
             break
         except subprocess.TimeoutExpired:
-            log.warning("lspci timed out for %s", bus_id)
+            log.warning("lspci timed out for %s "
+                       "(negative-cached %.0fs)",
+                       bus_id, _LSPICI_NEGATIVE_TTL)
+            _lspci_negative.update({b: now for b in bus_ids})
             break
 
         _lspci_cache[bus_id] = vendor_name
@@ -333,6 +351,9 @@ _nvidia_cli_missing_logged = False
 
 # lspci device-name cache (bus_id → "Radeon RX 7900 XTX" style name).
 _lspci_name_cache: dict[str, str] | None = None
+# Failed/timed-out GPU-name lookups (bus_id → monotonic ts); see
+# _lspci_negative — same TTL, same no-stall guarantee.
+_lspci_name_negative: dict[str, float] = {}
 
 
 def _find_cli_binary(candidates: tuple[str, ...]) -> str | None:
@@ -377,11 +398,17 @@ def _lspci_device_name_map(bus_ids: list[str]) -> dict[str, str]:
     global _lspci_name_cache
     if _lspci_name_cache is None:
         _lspci_name_cache = {}
+    now = time.monotonic()
 
     mapping: dict[str, str] = {}
     for bus_id in bus_ids:
         if bus_id in _lspci_name_cache:
             mapping[bus_id] = _lspci_name_cache[bus_id]
+            continue
+        failed_at = _lspci_name_negative.get(bus_id)
+        if failed_at is not None and \
+                (now - failed_at) < _LSPICI_NEGATIVE_TTL:
+            mapping[bus_id] = ""  # cached failure — no subprocess
             continue
         try:
             result = subprocess.run(  # noqa: S603 – static args only
@@ -392,8 +419,15 @@ def _lspci_device_name_map(bus_ids: list[str]) -> dict[str, str]:
             )
             name = _parse_lspci_device(result.stdout)
         except FileNotFoundError:
+            log.info("lspci not found – GPU name lookup unavailable "
+                     "(negative-cached %.0fs)", _LSPICI_NEGATIVE_TTL)
+            _lspci_name_negative.update({b: now for b in bus_ids})
             break
         except subprocess.TimeoutExpired:
+            log.warning("lspci timed out for %s "
+                       "(negative-cached %.0fs)",
+                       bus_id, _LSPICI_NEGATIVE_TTL)
+            _lspci_name_negative.update({b: now for b in bus_ids})
             break
         _lspci_name_cache[bus_id] = name
         mapping[bus_id] = name
@@ -3741,19 +3775,49 @@ class MetricsCollector(threading.Thread):
         # complete (matches the previous inline behavior); capped so a
         # hanging probe cannot stall startup forever.
         self._llm_ready.wait(timeout=10)
+        # Fixed-rate scheduling: cycle k is due at epoch + k * interval,
+        # independent of how long the previous _collect() took (the old
+        # sleep-after-collect made period = interval + collect cost).
+        next_ts = time.monotonic()
         while self.running:
+            slot_start = next_ts
+            cycle_start = time.monotonic()
+            metrics: dict[str, Any] | None = None
             try:
                 metrics = self._collect()
             except Exception:  # noqa: BLE001
                 log.exception("Error collecting metrics")
-                time.sleep(self.poll_interval)
-                continue
-
-            payload = json.dumps(metrics)
-            if self._queue.full():
-                self._drain_old()
-            self._queue.put_nowait(payload)
-            time.sleep(self.poll_interval)
+            t_end = time.monotonic()
+            collect_s = t_end - cycle_start
+            # Advance the schedule from the fixed epoch, not from now.
+            next_ts += self.poll_interval
+            # A cycle that overruns the next slot does not burst-
+            # catch-up: missed slots are skipped and the next cycle
+            # starts at the next due slot.
+            skipped = 0
+            while next_ts < t_end:
+                next_ts += self.poll_interval
+                skipped += 1
+            if skipped:
+                log.warning(
+                    "cycle overran the schedule by %.2fs; skipping %d "
+                    "slot(s) (no burst catch-up)",
+                    t_end - (slot_start + self.poll_interval), skipped)
+            # Per-cycle duration + drift vs schedule: one DEBUG line per
+            # cycle (no flood at the default INFO level); a cycle that
+            # finishes well past its slot is surfaced at INFO.
+            drift = t_end - (slot_start + self.poll_interval)
+            log.debug("cycle: collect=%.2fs drift=%+.2fs",
+                      collect_s, drift)
+            if drift > max(0.1, self.poll_interval * 0.25):
+                log.info("cycle late: collect=%.2fs, %.2fs past its "
+                         "slot", collect_s, drift)
+            if metrics is not None:
+                payload = json.dumps(metrics)
+                if self._queue.full():
+                    self._drain_old()
+                self._queue.put_nowait(payload)
+            time.sleep(max(0.0, next_ts - time.monotonic()))
 
 
 # ---------------------------------------------------------------------------

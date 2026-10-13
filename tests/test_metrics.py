@@ -4046,11 +4046,17 @@ def reset_amd_state():
 
     original_cache = app_mod._lspci_name_cache
     original_absent = app_mod._amd_absent_since
+    original_lspci_neg = app_mod._lspci_negative
+    original_name_neg = app_mod._lspci_name_negative
     app_mod._lspci_name_cache = None
     app_mod._amd_absent_since = None
+    app_mod._lspci_negative = {}
+    app_mod._lspci_name_negative = {}
     yield
     app_mod._lspci_name_cache = original_cache
     app_mod._amd_absent_since = original_absent
+    app_mod._lspci_negative = original_lspci_neg
+    app_mod._lspci_name_negative = original_name_neg
 
 
 def _amd_smi_mock(stdout: str, returncode: int = 0):
@@ -5511,3 +5517,121 @@ def test_llama_process_dropped_for_remote_url():
                return_value={"status": "up", "process": {"rss_gb": 3.0}}):
         entry = collector._collect_one(collector.llm_targets[0])
     assert "process" not in entry
+
+
+# ---------------------------------------------------------------------------
+# T2 — fixed-rate cadence + subprocess negative caching off the snapshot path
+# ---------------------------------------------------------------------------
+
+def test_fixed_rate_schedule_holds_period_under_collect_cost():
+    """Fixed-rate scheduling (next += interval): with a 0.5 s _collect()
+    and a 1.0 s poll_interval the inter-snapshot period stays ≈1.0 s
+    (the old sleep-after-collect produced ≈1.5 s)."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=1.0, llama_enabled=False)
+    collector._queue = queue.Queue(maxsize=30)
+    stamps: list[float] = []
+
+    def fake_collect() -> dict:
+        stamps.append(time.time())  # cycle start ≈ slot start
+        time.sleep(0.5)
+        return {"timestamp": time.time()}
+
+    collector._collect = fake_collect
+    collector.start()
+    try:
+        time.sleep(4.5)
+    finally:
+        collector.stop()
+        collector.join(timeout=3)
+    assert len(stamps) >= 3
+    periods = [b - a for a, b in zip(stamps, stamps[1:])]
+    for p in periods:
+        assert 0.6 <= p <= 1.4, \
+            f"period {p:.3f}s — expected ≈1.0s, not ≈1.5s"
+
+
+def test_cycle_duration_and_drift_logged(caplog):
+    """Each cycle logs its _collect() duration and drift vs the fixed
+    schedule (one DEBUG line per cycle; no INFO flood at the default
+    level)."""
+    import re
+
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.2, llama_enabled=False)
+    collector._queue = queue.Queue(maxsize=30)
+    collector._collect = lambda: {"timestamp": time.time()}
+    with caplog.at_level(logging.DEBUG, logger="app"):
+        collector.start()
+        try:
+            time.sleep(0.7)
+        finally:
+            collector.stop()
+            collector.join(timeout=2)
+    cycle_logs = [r for r in caplog.records
+                 if "cycle:" in r.getMessage()
+                 and "drift=" in r.getMessage()]
+    assert len(cycle_logs) >= 2
+    pattern = re.compile(r"collect=\d+\.\d\d+s drift=[+-]\d+\.\d\d+s")
+    assert any(pattern.search(r.getMessage()) for r in cycle_logs)
+
+
+def test_lspci_timeout_result_cached_not_repeated():
+    """A timed-out lspci lookup is negative-cached (TTL) and not re-run
+    on the next poll — a hung lspci cannot stall the snapshot path
+    every cycle."""
+    import subprocess as sp
+
+    import app as app_mod
+    from app import _lspci_vendor_map
+
+    original_neg = app_mod._lspci_negative
+    original_cache = app_mod._lspci_cache
+    app_mod._lspci_negative = {}
+    app_mod._lspci_cache = None
+    try:
+        with patch("subprocess.run",
+                   side_effect=sp.TimeoutExpired(
+                       cmd="lspci", timeout=5)) as mock_run:
+            first = _lspci_vendor_map(["0000:2d:00.0", "0000:61:00.0"])
+            second = _lspci_vendor_map(["0000:2d:00.0", "0000:61:00.0"])
+        assert mock_run.call_count == 1  # 2nd poll served from negative cache
+        assert first == {}
+        assert second == {"0000:2d:00.0": "", "0000:61:00.0": ""}
+    finally:
+        app_mod._lspci_negative = original_neg
+        app_mod._lspci_cache = original_cache
+
+
+def test_poll_interval_semantics_unchanged():
+    """poll_interval still means the target period between snapshots:
+    config plumbing (CLI > config > default) is intact and the run
+    loop schedules at that rate."""
+    from app import MetricsCollector, resolve_settings
+
+    assert resolve_settings(_ns(), {})["poll_interval"] == 1.0
+    assert resolve_settings(_ns(), {"poll_interval": 2.5})["poll_interval"] == 2.5
+    assert resolve_settings(_ns(poll_interval=3.5),
+                           {"poll_interval": 2.5})["poll_interval"] == 3.5
+
+    collector = MetricsCollector(poll_interval=0.3, llama_enabled=False)
+    assert collector.poll_interval == 0.3
+    collector._queue = queue.Queue(maxsize=30)
+    stamps: list[float] = []
+
+    def fake_collect() -> dict:
+        stamps.append(time.time())
+        return {"timestamp": time.time()}
+
+    collector._collect = fake_collect
+    collector.start()
+    try:
+        time.sleep(1.2)
+    finally:
+        collector.stop()
+        collector.join(timeout=2)
+    assert len(stamps) >= 3
+    for a, b in zip(stamps, stamps[1:]):
+        assert 0.15 <= b - a <= 0.45, f"period {b - a:.3f}s != target 0.3s"
