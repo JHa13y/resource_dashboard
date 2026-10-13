@@ -1535,11 +1535,14 @@ _vllm_req_rates: dict[str, deque[float]] = {}
 # (it finishes between two scrapes); such requests are skipped.
 _LLAMA_MIN_PREFILL_S = 0.25
 
-# Local llama-server process handle (T5): retained across scrapes so
-# cpu_percent(None) measures against the previous tick. A dead handle
-# (NoSuchProcess) is dropped and re-identified on the next scrape — a
-# model reload spawns a new PID.
-_llama_proc: psutil.Process | None = None
+# Local llama-server process handle (T5, keyed per target in T8): a
+# per-target retained handle so cpu_percent(None) measures against the
+# previous tick. A dead handle (NoSuchProcess) is dropped and
+# re-identified on the next scrape — a model reload spawns a new PID.
+# Keyed by state_key so parallel llama targets do not clobber each
+# other's retained handle (T8: the old single unkeyed global raced
+# across concurrent targets).
+_llama_proc: dict[str, psutil.Process | None] = {}
 
 # (dashboard key, Prometheus metric) pairs — verified against llama.cpp
 # ``to_metrics()`` (tools/server/server-task.cpp). Missing metrics are simply
@@ -1645,8 +1648,9 @@ def _llama_health(base_url: str) -> dict[str, Any] | None:
         return None
 
 
-def _llama_find_process() -> psutil.Process | None:
-    """Find the local llama-server process. Never raises.
+def _llama_find_process(state_key: str = "primary") -> psutil.Process | None:
+    """Find the local llama-server process for one scrape target. Never
+    raises.
 
     Name match first (the confirmed host binary is
     ``/home/joshua/llama.cpp/build/bin/llama-server``, psutil name
@@ -1654,16 +1658,19 @@ def _llama_find_process() -> psutil.Process | None:
     resolve to the largest RSS. Returns ``None`` when no local process
     exists (remote/dev mode). A retained live handle is reused so
     ``cpu_percent(None)`` keeps measuring; it was primed (first real
-    value on the scrape after identification).
+    value on the scrape after identification). Handles are keyed by
+    ``state_key`` so parallel llama targets do not clobber each other's
+    retained handle (T8).
     """
     global _llama_proc
-    if _llama_proc is not None:
+    retained = _llama_proc.get(state_key)
+    if retained is not None:
         try:
-            _llama_proc.memory_info().rss
-            return _llama_proc
+            retained.memory_info().rss
+            return retained
         except (psutil.NoSuchProcess, psutil.AccessDenied,
                 psutil.ZombieProcess):
-            _llama_proc = None
+            _llama_proc[state_key] = None
     try:
         by_name: list[psutil.Process] = []
         by_cmdline: list[psutil.Process] = []
@@ -1688,7 +1695,7 @@ def _llama_find_process() -> psutil.Process | None:
 
         proc = max(matches, key=_rss)
         proc.cpu_percent(None)  # prime; first real value on next scrape
-        _llama_proc = proc
+        _llama_proc[state_key] = proc
         return proc
     except Exception:  # noqa: BLE001 – collector must never raise
         return None
@@ -1975,8 +1982,9 @@ def collect_llama_metrics(
 
     # Local llama-server process (co-located deployments only): None when
     # the dashboard runs on a different host — the UI hides the card
-    # silently, no red state.
-    proc = _llama_find_process()
+    # silently, no red state. Keyed by state_key so parallel llama
+    # targets retain their own handle (T8).
+    proc = _llama_find_process(state_key)
     process_info: dict[str, Any] | None = None
     if proc is not None:
         try:
@@ -3354,6 +3362,13 @@ def collect_strata_metrics(
 # failed fetch keeps the last good entry flagged "stale" for 15 s, then
 # the entry drops to "down".
 _UPSTREAM_STALE_MAX_AGE_S = 15.0
+# A failing upstream backs off exponentially (double per failure) up to
+# this cap so a dead peer is not hammered every cycle (T8).
+_UPSTREAM_BACKOFF_CAP_S = 60.0
+# After this many consecutive failures an upstream is removed (the fetch
+# loop stops hammering it; the UI keeps showing "down" via the
+# last-good/placeholder path) (T8).
+_UPSTREAM_REMOVAL_AFTER_FAILURES = 30
 
 # Strict sanitizer key list: only per-system keys are forwarded from an
 # upstream snapshot. `systems` is explicitly excluded (no recursion) and
@@ -3935,6 +3950,10 @@ class MetricsCollector(threading.Thread):
         self._upstream_names: list[str] = []
         self._upstream_stop = threading.Event()
         self._upstream_threads: list[threading.Thread] = []
+        # Names removed after N consecutive failures (T8): the fetch loop
+        # stops hammering them; the UI keeps showing "down" via the
+        # last-good/placeholder path.
+        self._upstream_removed: set[str] = set()
 
         # Seed psutil (first cpu_percent call returns 0.0 and must be discarded)
         psutil.cpu_percent()
@@ -4101,13 +4120,21 @@ class MetricsCollector(threading.Thread):
         return data
 
     def stop(self, timeout: float = 2.0) -> None:
-        """Shut both loops down promptly (the LLM thread otherwise
-        sleeps out its whole poll interval before noticing
-        ``running`` flipped) — used by tests and shutdown paths."""
+        """Shut all loops down promptly (the LLM thread and the upstream
+        fetch threads otherwise sleep out their whole poll interval before
+        noticing ``running`` flipped) — used by tests and shutdown paths.
+        Sets ``_upstream_stop`` (wakes the ``_upstream_stop.wait()`` in
+        ``_upstream_loop``) and joins the upstream threads, so shutdown is
+        prompt and clean rather than leaving daemon fetch threads running
+        (T8)."""
         self.running = False
         self._llm_stop.set()
+        self._upstream_stop.set()
         if self._llm_thread.is_alive():
             self._llm_thread.join(timeout=timeout)
+        for t in self._upstream_threads:
+            if t.is_alive():
+                t.join(timeout=timeout)
 
     def start_upstreams(self, entries: list[dict[str, str]]) -> None:
         """Spawn one daemon fetch thread per configured upstream (a no-op
@@ -4127,14 +4154,37 @@ class MetricsCollector(threading.Thread):
     def _upstream_loop(self, name: str, url: str) -> None:
         """Fetch one upstream's /api/metrics on the main poll cadence.
         No ready-wait: upstreams may be slow to come up; the UI shows
-        "down" until the first fetch lands."""
+        "down" until the first fetch lands. A failing upstream (a
+        ``None`` return — the 15 s stale-hold expired) backs off
+        exponentially (double per failure, capped at
+        ``_UPSTREAM_BACKOFF_CAP_S``) so a dead peer is not hammered every
+        cycle; a success (an ``up`` or ``stale`` entry) resets to the poll
+        cadence. After ``_UPSTREAM_REMOVAL_AFTER_FAILURES`` consecutive
+        failures the upstream is removed (the loop stops fetching it; the
+        UI keeps showing "down" via the last-good/placeholder path) (T8)."""
+        backoff = self.poll_interval
+        failures = 0
         while self.running:
             try:
-                self._upstream_latest[name] = collect_upstream_metrics(
-                    url, name)
+                out = collect_upstream_metrics(url, name)
             except Exception:  # noqa: BLE001
                 log.exception("Error collecting upstream %s", name)
-            self._upstream_stop.wait(self.poll_interval)
+                out = None
+            # Always store the result (a None marks the upstream "down").
+            self._upstream_latest[name] = out
+            if out is None:
+                failures += 1
+                if failures >= _UPSTREAM_REMOVAL_AFTER_FAILURES:
+                    log.warning("Upstream %s removed after %d consecutive "
+                               "failures",
+                               name, failures)
+                    self._upstream_removed.add(name)
+                    break
+                backoff = min(backoff * 2, _UPSTREAM_BACKOFF_CAP_S)
+            else:
+                failures = 0
+                backoff = self.poll_interval
+            self._upstream_stop.wait(backoff)
 
     def _collect_llm(self, state_key: str = "primary") -> dict[str, Any] | None:
         """Auto-mode LLM backend selection over the legacy per-type URLs

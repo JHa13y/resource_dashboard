@@ -749,7 +749,7 @@ def reset_llama_proc():
     import app as app_mod
 
     original = app_mod._llama_proc
-    app_mod._llama_proc = None
+    app_mod._llama_proc = {}
     with patch("app.psutil.process_iter", return_value=[]):
         yield
     app_mod._llama_proc = original
@@ -2095,7 +2095,7 @@ def test_llama_process_name_match():
 
     assert result["process"] == {"rss_gb": 21.0, "cpu_pct": 340.0,
                                  "threads": 64}
-    assert app_mod._llama_proc is proc
+    assert app_mod._llama_proc["primary"] is proc
     proc.cpu_percent.assert_called_with(None)  # primed on identification
     # /models/x.gguf does not exist on this host -> key omitted
     assert "model_size_gb" not in result
@@ -2116,7 +2116,7 @@ def test_llama_process_multiple_matches_largest_rss_wins():
         result = collect_llama_metrics("http://127.0.0.1:9999")
 
     assert result["process"]["rss_gb"] == 30.0
-    assert app_mod._llama_proc is big
+    assert app_mod._llama_proc["primary"] is big
     small.cpu_percent.assert_not_called()
 
 
@@ -2140,7 +2140,7 @@ def test_llama_process_cmdline_fallback():
         result = collect_llama_metrics("http://127.0.0.1:9999")
 
     assert result["process"]["rss_gb"] == 21.0
-    assert app_mod._llama_proc is server
+    assert app_mod._llama_proc["primary"] is server
 
 
 def test_llama_process_reidentify_after_death():
@@ -2158,11 +2158,11 @@ def test_llama_process_reidentify_after_death():
             "/props": b"{}",
             "/slots": b"[]",
         })):
-        app_mod._llama_proc = dead
+        app_mod._llama_proc["primary"] = dead
         result = collect_llama_metrics("http://127.0.0.1:9999")
 
     assert result["process"]["rss_gb"] == 22.0
-    assert app_mod._llama_proc is fresh
+    assert app_mod._llama_proc["primary"] is fresh
 
 
 def test_llama_process_none_when_absent():
@@ -6387,3 +6387,132 @@ def test_strata_empty_slot_list_not_silently_dropped(reset_strata_state):
     assert result["slots"] == []
     # slots_busy is 0 (no busy slots).
     assert result["slots_busy"] == 0
+
+
+# ---------------------------------------------------------------------------
+# T8 — lifecycle + state-keying fixes
+# ---------------------------------------------------------------------------
+
+def test_stop_joins_upstream_threads():
+    """stop() sets _upstream_stop and joins the upstream fetch threads
+    (they are woken and joined on shutdown, not left running)."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1, llama_enabled=False)
+    with patch("app.collect_upstream_metrics", return_value=None):
+        collector.start_upstreams(
+            [{"name": "peer-a", "url": "http://127.0.0.1:9997"}])
+        assert len(collector._upstream_threads) == 1
+        t = collector._upstream_threads[0]
+        # Wait for the daemon thread to actually start.
+        for _ in range(200):
+            if t.is_alive():
+                break
+            time.sleep(0.01)
+        assert t.is_alive()
+        collector.stop(timeout=2.0)
+    # The upstream thread is woken (_upstream_stop set) and joined.
+    assert collector._upstream_stop.is_set()
+    assert not t.is_alive()
+
+
+def test_upstream_backoff_on_failure():
+    """A failing upstream backs off (retry interval increases on failure,
+    resets on success; does not hammer a dead upstream every cycle)."""
+    import app as app_mod
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1, llama_enabled=False)
+    wait_durations: list[float] = []
+    call_count = 0
+
+    def fake_collect(url, name):
+        nonlocal call_count
+        call_count += 1
+        # Fail on calls 1,2; succeed on call 3 (reset); fail on 4,5,6.
+        if call_count == 3:
+            return {"name": "peer-a", "status": "up", "metrics": {}}
+        return None
+
+    def fake_wait(timeout):
+        wait_durations.append(timeout)
+        if len(wait_durations) >= 6:
+            collector.running = False  # exit after 6 iterations
+        return True
+
+    orig_wait = collector._upstream_stop.wait
+    collector._upstream_stop.wait = fake_wait
+    with patch("app.collect_upstream_metrics", side_effect=fake_collect):
+        try:
+            collector._upstream_loop("peer-a", "http://127.0.0.1:9997")
+        finally:
+            collector._upstream_stop.wait = orig_wait
+    # Consecutive failures back off (the retry interval increases).
+    assert wait_durations[1] > wait_durations[0]
+    # A success resets the backoff to the poll cadence.
+    assert wait_durations[2] == collector.poll_interval
+    # A subsequent failure backs off again from the reset value.
+    assert wait_durations[3] > wait_durations[2]
+    # The backoff is capped (never exceeds _UPSTREAM_BACKOFF_CAP_S).
+    assert max(wait_durations) <= app_mod._UPSTREAM_BACKOFF_CAP_S
+
+
+def test_upstream_removal_after_n_failures():
+    """After N consecutive failures, the upstream is removed (the loop
+    stops fetching it)."""
+    import app as app_mod
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1, llama_enabled=False)
+    collect_count = 0
+
+    def fake_collect(url, name):
+        nonlocal collect_count
+        collect_count += 1
+        return None  # always fail
+
+    def fake_wait(timeout):
+        return True  # return immediately (no real sleep)
+
+    orig_wait = collector._upstream_stop.wait
+    collector._upstream_stop.wait = fake_wait
+    with patch("app.collect_upstream_metrics", side_effect=fake_collect):
+        try:
+            collector._upstream_loop("peer-a", "http://127.0.0.1:9997")
+        finally:
+            collector._upstream_stop.wait = orig_wait
+    # The upstream is removed after N consecutive failures.
+    assert "peer-a" in collector._upstream_removed
+    # The loop stopped after exactly N failures (not more).
+    assert collect_count == app_mod._UPSTREAM_REMOVAL_AFTER_FAILURES
+
+
+def test_llama_proc_keyed_per_target():
+    """_llama_proc is keyed per target (two different llama targets
+    retain different process handles; no cross-target clobbering)."""
+    import app as app_mod
+    from app import collect_llama_metrics
+
+    proc_a = _fake_llama_proc(rss_gb=10.0)
+    proc_b = _fake_llama_proc(rss_gb=20.0)
+    routes = {"/metrics": LLAMA_METRICS_SAMPLE.encode(),
+             "/props": b"{}", "/slots": b"[]"}
+    # Target A: process_iter yields only proc_a.
+    with patch("app.psutil.process_iter", return_value=[proc_a]), \
+         patch("app.urllib.request.urlopen",
+               side_effect=make_llama_server(routes)):
+        result_a = collect_llama_metrics("http://127.0.0.1:8080",
+                                        state_key="target-a")
+    assert result_a["process"]["rss_gb"] == 10.0
+    assert app_mod._llama_proc["target-a"] is proc_a
+    # Target B: process_iter yields only proc_b (a different handle).
+    with patch("app.psutil.process_iter", return_value=[proc_b]), \
+         patch("app.urllib.request.urlopen",
+               side_effect=make_llama_server(routes)):
+        result_b = collect_llama_metrics("http://127.0.0.1:8081",
+                                        state_key="target-b")
+    assert result_b["process"]["rss_gb"] == 20.0
+    assert app_mod._llama_proc["target-b"] is proc_b
+    # No cross-target clobbering: target-a's handle is still proc_a.
+    assert app_mod._llama_proc["target-a"] is proc_a
+    assert app_mod._llama_proc["target-a"] is not app_mod._llama_proc["target-b"]
