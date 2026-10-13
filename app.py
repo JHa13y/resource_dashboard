@@ -57,6 +57,10 @@ _lspci_cache: dict[str, str] | None = None  # bus_id → vendor name
 # _AMD_NEGATIVE_REPROBE_S).
 _lspci_negative: dict[str, float] = {}
 _LSPICI_NEGATIVE_TTL = 300.0
+# Warn-once guard: a missing lspci binary is a global condition, so the
+# "not found" message is logged once (not once per device) now that a
+# per-device failure ``continue``s instead of ``break``ing the loop.
+_lspci_missing_logged = False
 
 
 def _lspci_vendor_map(bus_ids: list[str]) -> dict[str, str]:
@@ -384,19 +388,47 @@ def _sysfs_pci_bus_id(card: int | str,
     return os.path.basename(target) or None
 
 
+# A GPU name that is actually a PCI BDF/slot, a bare hex id, or a
+# ``Device <hex>`` token is implausible — it is the *address* of the
+# card, not its name (the lspci first-``Device:``-line bug: the first
+# ``Device:`` line is the slot, the product name is on a later line).
+# Rejected names are neither used nor positive-cached. The domain is
+# 0-8 hex chars (``0000:`` and the 8-wide ``00000000:`` form both occur
+# in the payload).
+_GPU_NAME_BDF_RE = re.compile(
+    r"^[0-9a-fA-F]{0,8}:?[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
+_GPU_NAME_HEX_RE = re.compile(r"^(0x)?[0-9a-f]{4,}$", re.IGNORECASE)
+_GPU_NAME_DEVICE_HEX_RE = re.compile(r"^Device [0-9a-fx]+$", re.IGNORECASE)
+
+
+def _is_implausible_gpu_name(name: str) -> bool:
+    """True when *name* is a BDF/slot, a bare hex id, or a ``Device
+    <hex>`` token — i.e. the card's address, not its name. Such names
+    are rejected (neither used nor positive-cached) so a poisoned lspci
+    read cannot stick."""
+    name = name.strip()
+    return (bool(_GPU_NAME_BDF_RE.match(name))
+            or bool(_GPU_NAME_HEX_RE.match(name))
+            or bool(_GPU_NAME_DEVICE_HEX_RE.match(name)))
+
+
 def _parse_lspci_device(output: str) -> str:
     """Extract the board model name from ``lspci -s <bus> -vm`` output.
 
-    Prefers the bracketed part of the ``Device:`` line (the marketing
-    name on AMD cards, e.g. ``Device: Navi 31 [Radeon RX 7900 XTX]`` →
-    ``Radeon RX 7900 XTX``); falls back to the raw remainder.
+    ``lspci -vm`` can emit TWO ``Device:`` lines: the first is the
+    BDF/slot (``Device: 2d:00.0``) and the second is the product name
+    (``Device: Navi 48 [Radeon AI PRO R9700]``) — so the LAST
+    ``Device:`` line is taken (the product name when both are present,
+    the only line when just one is). Prefers the bracketed part (the
+    marketing name on AMD cards); falls back to the raw remainder.
     """
-    for line in output.splitlines():
-        if line.startswith("Device:"):
-            part = line.split("Device:", 1)[1].strip()
-            m = re.search(r"\[([^\]]+)\]", part)
-            return m.group(1).strip() if m else part
-    return ""
+    device_lines = [line for line in output.splitlines()
+                   if line.startswith("Device:")]
+    if not device_lines:
+        return ""
+    part = device_lines[-1].split("Device:", 1)[1].strip()
+    m = re.search(r"\[([^\]]+)\]", part)
+    return m.group(1).strip() if m else part
 
 
 def _lspci_device_name_map(bus_ids: list[str]) -> dict[str, str]:
@@ -424,16 +456,28 @@ def _lspci_device_name_map(bus_ids: list[str]) -> dict[str, str]:
             )
             name = _parse_lspci_device(result.stdout)
         except FileNotFoundError:
-            log.info("lspci not found – GPU name lookup unavailable "
-                     "(negative-cached %.0fs)", _LSPICI_NEGATIVE_TTL)
-            _lspci_name_negative.update({b: now for b in bus_ids})
-            break
+            if not _lspci_missing_logged:
+                log.info("lspci not found – GPU name lookup unavailable "
+                         "(negative-cached %.0fs)", _LSPICI_NEGATIVE_TTL)
+                _lspci_missing_logged = True
+            _lspci_name_negative[bus_id] = now  # this device only
+            continue
         except subprocess.TimeoutExpired:
             log.warning("lspci timed out for %s "
                        "(negative-cached %.0fs)",
                        bus_id, _LSPICI_NEGATIVE_TTL)
-            _lspci_name_negative.update({b: now for b in bus_ids})
-            break
+            _lspci_name_negative[bus_id] = now  # this device only
+            continue
+        if name and _is_implausible_gpu_name(name):
+            # Rejected (BDF/slot, bare hex, or ``Device <hex>``): the
+            # card's address, not its name (the lspci first-``Device:``-
+            # line bug). Neither used nor positive-cached — negative-
+            # cached for the TTL so the poisoned read is not served
+            # forever and the subprocess is not re-run on every poll.
+            # The caller falls back to the tool name / "AMD GPU".
+            _lspci_name_negative[bus_id] = now
+            mapping[bus_id] = ""
+            continue
         _lspci_name_cache[bus_id] = name
         mapping[bus_id] = name
 
@@ -561,6 +605,86 @@ def _rocm_smi_card_names() -> list[str] | None:
     return names
 
 
+# ---------------------------------------------------------------------------
+# AMD product/asic (market) name — the tool's own identity, preferred
+# over lspci so the label is not hostage to pci.ids freshness (the R9700
+# is new hardware). A static device fact: resolved once via ``amd-smi
+# static --asic --json`` and cached; failures negative-cached for
+# _AMD_BDF_NEGATIVE_TTL (same no-stall pattern as the T2/T3 caches).
+# ---------------------------------------------------------------------------
+
+# Fields that may carry the market name in ``amd-smi static --asic
+# --json``; the first plausible (non-implausible) string value wins.
+_AMD_PRODUCT_NAME_FIELDS = ("asic", "market_name", "name",
+                           "product_name", "device_name")
+
+_amd_product_names: dict[int, str] = {}  # gpu index → market name (static)
+_amd_product_names_ts: float | None = None  # last (failed) attempt, monotonic
+
+
+def _amd_smi_product_names(binary: str) -> dict[int, str]:
+    """``{vendor-local gpu index: market name}`` from ``amd-smi static
+    --asic --json``. The tool's own product/asic name — preferred over
+    lspci. {} on any failure (the caller falls back to lspci, then
+    "AMD GPU"). Never raises."""
+    try:
+        result = subprocess.run(  # noqa: S603 – static args only
+            [binary, "static", "--asic", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return {}
+    if result.returncode != 0:
+        return {}
+    try:
+        payload = json.loads(result.stdout)
+    except ValueError:
+        return {}
+    if not isinstance(payload, list):
+        return {}
+    names: dict[int, str] = {}
+    for entry in payload:
+        if not isinstance(entry, dict):
+            continue
+        idx = entry.get("gpu")
+        if not isinstance(idx, int) or isinstance(idx, bool):
+            continue
+        for field in _AMD_PRODUCT_NAME_FIELDS:
+            val = entry.get(field)
+            if (isinstance(val, str) and val.strip()
+                    and not _is_implausible_gpu_name(val)):
+                names[idx] = val.strip()
+                break
+    return names
+
+
+def _amd_product_name(idx: int) -> str | None:
+    """The tool's own product/asic name for a vendor-local gpu index,
+    cached (a static device fact). None when unavailable (the caller
+    falls back to lspci, then "AMD GPU"). A failed/empty lookup is
+    negative-cached for _AMD_BDF_NEGATIVE_TTL (no per-poll subprocess).
+    Never raises."""
+    global _amd_product_names, _amd_product_names_ts
+    if _amd_product_names:
+        return _amd_product_names.get(idx)
+    now = time.monotonic()
+    if _amd_product_names_ts is not None and \
+            (now - _amd_product_names_ts) < _AMD_BDF_NEGATIVE_TTL:
+        return None
+    binary = _find_cli_binary(_AMD_SMI_BIN_CANDIDATES)
+    if binary is None:
+        _amd_product_names_ts = now
+        return None
+    names = _amd_smi_product_names(binary)
+    if names:
+        _amd_product_names = names
+    else:
+        _amd_product_names_ts = now
+    return names.get(idx)
+
+
 def _sysfs_amd_card_bdfs(drm_dir: str = "/sys/class/drm") -> list[tuple[str, str]]:
     """``(cardN name, BDF)`` for every DRM card whose ``device/vendor``
     is ``0x1002`` (AMD), sorted by global card number. Mapping a
@@ -644,14 +768,23 @@ def _amd_smi_entry_to_gpu(entry: dict[str, Any], idx: int) -> dict[str, Any] | N
     # own data (T3) — never passed as a global ``/sys/class/drm/cardN``.
     bus_id = _amd_gpu_bus_id(idx)
     board_vendor = "unknown"
+    # Name: prefer the tool's own product/asic (market) name — a static
+    # device fact — over lspci, so the label is not hostage to pci.ids
+    # freshness (the R9700 is new hardware). Fall back to lspci (whose
+    # implausible names are rejected in _lspci_device_name_map), then
+    # "AMD GPU".
     name = "AMD GPU"
+    tool_name = _amd_product_name(idx)
+    if tool_name:
+        name = tool_name
     if bus_id:
         vendor_map = _lspci_vendor_map([bus_id]).get(bus_id)
         if vendor_map:
             board_vendor = vendor_map
-        name_map = _lspci_device_name_map([bus_id]).get(bus_id)
-        if name_map:
-            name = name_map
+        if not tool_name:
+            name_map = _lspci_device_name_map([bus_id]).get(bus_id)
+            if name_map:
+                name = name_map
 
     gpu: dict[str, Any] = {
         "index": idx,

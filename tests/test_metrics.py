@@ -4184,6 +4184,9 @@ def reset_amd_state():
     original_bdf_map = app_mod._amd_bdf_map
     original_bdf_neg = app_mod._amd_bdf_negative
     original_rocm_cards = app_mod._rocm_cards_cache
+    original_product_names = app_mod._amd_product_names
+    original_product_ts = app_mod._amd_product_names_ts
+    original_lspci_missing = app_mod._lspci_missing_logged
     app_mod._lspci_name_cache = None
     app_mod._amd_absent_since = None
     app_mod._lspci_negative = {}
@@ -4191,6 +4194,9 @@ def reset_amd_state():
     app_mod._amd_bdf_map = None
     app_mod._amd_bdf_negative = {}
     app_mod._rocm_cards_cache = None
+    app_mod._amd_product_names = {}
+    app_mod._amd_product_names_ts = None
+    app_mod._lspci_missing_logged = False
     yield
     app_mod._lspci_name_cache = original_cache
     app_mod._amd_absent_since = original_absent
@@ -4199,6 +4205,9 @@ def reset_amd_state():
     app_mod._amd_bdf_map = original_bdf_map
     app_mod._amd_bdf_negative = original_bdf_neg
     app_mod._rocm_cards_cache = original_rocm_cards
+    app_mod._amd_product_names = original_product_names
+    app_mod._amd_product_names_ts = original_product_ts
+    app_mod._lspci_missing_logged = original_lspci_missing
 
 
 def _amd_smi_mock(stdout: str, returncode: int = 0):
@@ -4588,6 +4597,145 @@ def test_colliding_bdf_merge_guard(caplog):
         [{"index": 0, "name": "R9700", "pci_bus_id": "0000:2d:00.0"}])
     assert [g["index"] for g in ok] == [0, 1]
     assert [g["vendor"] for g in ok] == ["nvidia", "amd"]
+
+
+def test_parse_lspci_device_takes_last_device_line():
+    """The host's ``lspci -vm`` has TWO ``Device:`` lines: the first is
+    the BDF/slot, the second is the product name. The parser must take
+    the LAST one (the product name), not the first (the BDF)."""
+    from app import _parse_lspci_device
+
+    two_device_lines = (
+        "Device:\t2d:00.0\n"
+        "Class:\tVGA compatible controller\n"
+        "Vendor:\tAdvanced Micro Devices, Inc. [AMD/ATI]\n"
+        "Device:\tNavi 48 [Radeon AI PRO R9700]\n"
+        "SVendor:\tASRock Incorporation\n"
+        "SDevice:\tDevice 5413\n"
+    )
+    assert _parse_lspci_device(two_device_lines) == "Radeon AI PRO R9700"
+    # The single-``Device:``-line case (the existing repo fixture) still
+    # works — the only line is also the last line.
+    single = "Device:\tNavi 31 [Radeon RX 7900 XTX]\n"
+    assert _parse_lspci_device(single) == "Radeon RX 7900 XTX"
+
+
+def test_gpu_name_rejects_bdf_slot_shape():
+    """A BDF/slot-shaped name is rejected — not used and not positive-
+    cached — so the poisoned ``{'0000:2d:00.0': '2d:00.0'}`` entry is
+    never served. The caller falls back to the tool name / "AMD GPU"."""
+    from app import _lspci_device_name_map
+    import app as app_mod
+
+    # lspci -vm with only a BDF-shaped Device: line (the poisoned case).
+    lspci_bdf = (
+        "Device:\t2d:00.0\n"
+        "Class:\tVGA compatible controller\n"
+        "Vendor:\tAdvanced Micro Devices, Inc. [AMD/ATI]\n"
+    )
+    with patch("subprocess.run", return_value=_amd_smi_mock(lspci_bdf)):
+        mapping = _lspci_device_name_map(["0000:2d:00.0"])
+    # Rejected: not used (mapping is "" and not in the positive cache.
+    assert mapping["0000:2d:00.0"] == ""
+    assert "0000:2d:00.0" not in (app_mod._lspci_name_cache or {})
+
+
+def test_gpu_name_rejects_bare_hex():
+    """A bare-hex name (a raw device id, e.g. ``5413``) is rejected —
+    not used and not positive-cached."""
+    from app import _lspci_device_name_map
+    import app as app_mod
+
+    lspci_hex = (
+        "Device:\t5413\n"
+        "Class:\tVGA compatible controller\n"
+        "Vendor:\tAdvanced Micro Devices, Inc. [AMD/ATI]\n"
+    )
+    with patch("subprocess.run", return_value=_amd_smi_mock(lspci_hex)):
+        mapping = _lspci_device_name_map(["0000:2d:00.0"])
+    assert mapping["0000:2d:00.0"] == ""
+    assert "0000:2d:00.0" not in (app_mod._lspci_name_cache or {})
+
+
+def test_gpu_name_prefers_tool_product_name():
+    """The tool's own product/asic name (``amd-smi static --asic``) is
+    preferred over lspci for the AMD path, so the label is not hostage
+    to pci.ids freshness."""
+    from app import _gpu_amd_smi
+
+    monitor = json.dumps([
+        {"gpu": 0, "gfx": {"value": 5, "unit": "%"},
+         "vram_used": {"value": 100, "unit": "MB"},
+         "vram_total": {"value": 32000, "unit": "MB"}},
+    ])
+    # The tool's own product/asic name (from amd-smi static --asic).
+    static_asic = json.dumps([
+        {"gpu": 0, "asic": "Radeon AI PRO R9700"},
+    ])
+    # lspci would return a different (plausible) name.
+    lspci_name = (
+        "Device:\tNavi 48 [Radeon Something Else]\n"
+        "Class:\tVGA compatible controller\n"
+        "Vendor:\tAdvanced Micro Devices, Inc. [AMD/ATI]\n"
+    )
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "lspci":
+            return _amd_smi_mock(lspci_name)
+        if "static" in cmd:
+            return _amd_smi_mock(static_asic)
+        return _amd_smi_mock(monitor)
+
+    with (
+        patch("shutil.which", return_value="/usr/bin/amd-smi"),
+        patch("subprocess.run", side_effect=fake_run),
+        patch("app._amd_gpu_bus_id", return_value="0000:2d:00.0"),
+    ):
+        gpus = _gpu_amd_smi()
+
+    assert len(gpus) == 1
+    # The tool's own product name is preferred over the lspci name.
+    assert gpus[0]["name"] == "Radeon AI PRO R9700"
+
+
+def test_gpu_name_never_matches_bdf_shape():
+    """Spec-mandated: run the real ``_gpu_amd_smi`` path on a fake host
+    layout where lspci would return a BDF-shaped name (the poisoned
+    first-``Device:``-line case) and assert no emitted GPU name matches a
+    BDF/slot shape — the fix rejects it and falls back."""
+    from app import _gpu_amd_smi, _is_implausible_gpu_name
+
+    # lspci -vm with only a BDF-shaped Device: line (the bug: the
+    # only/first Device: line is the slot, not the product name).
+    lspci_bdf_only = (
+        "Device:\t2d:00.0\n"
+        "Class:\tVGA compatible controller\n"
+        "Vendor:\tAdvanced Micro Devices, Inc. [AMD/ATI]\n"
+    )
+    monitor = json.dumps([
+        {"gpu": 0, "gfx": {"value": 5, "unit": "%"},
+         "vram_used": {"value": 100, "unit": "MB"},
+         "vram_total": {"value": 32000, "unit": "MB"}},
+    ])
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "lspci":
+            return _amd_smi_mock(lspci_bdf_only)
+        return _amd_smi_mock(monitor)  # amd-smi monitor/list/static
+
+    with (
+        patch("shutil.which", return_value="/usr/bin/amd-smi"),
+        patch("subprocess.run", side_effect=fake_run),
+        patch("app._amd_gpu_bus_id", return_value="0000:2d:00.0"),
+    ):
+        gpus = _gpu_amd_smi()
+
+    assert len(gpus) == 1
+    name = gpus[0]["name"]
+    # The emitted name must never be a BDF/slot shape.
+    assert not _is_implausible_gpu_name(name)
+    # lspci name rejected and no tool name → the fallback.
+    assert name == "AMD GPU"
 
 
 def test_gpu_amd_negative_cache_skips_reprobe():
