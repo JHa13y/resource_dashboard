@@ -6222,3 +6222,168 @@ def test_poll_interval_semantics_unchanged():
     assert len(stamps) >= 3
     for a, b in zip(stamps, stamps[1:]):
         assert 0.15 <= b - a <= 0.45, f"period {b - a:.3f}s != target 0.3s"
+
+
+# ---------------------------------------------------------------------------
+# T6 — LLM publish path busy-latch + Strata slot diagnosability
+# ---------------------------------------------------------------------------
+
+def test_llm_busy_latch_publishes_latest():
+    """A busy tick the slow main loop missed (current sample is idle but a
+    newer busy sample was latched) is still published — the busy state is
+    not discarded."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=1.0)
+    collector.llama_enabled = True
+    # The current sample (what the main loop reads) is idle.
+    collector._llm_latest = [
+        {"name": "primary", "backend": "strata", "status": "up",
+         "state": "idle", "requests_processing": 0.0}]
+    # A busy sample was latched by the LLM thread (a busy tick the main
+    # loop missed); it has not yet been published.
+    collector._llm_busy_latch = [
+        {"name": "primary", "backend": "strata", "status": "up",
+         "state": "generating", "requests_processing": 1.0}]
+    collector._llm_busy_latch_id = 1
+    collector._llm_busy_latch_published_id = 0
+
+    metrics = collector._collect()
+    # The latched busy sample is published (not the idle current).
+    assert metrics["llms"] == collector._llm_busy_latch
+    assert metrics["llms"][0]["state"] == "generating"
+    # The legacy `llm` key is the primary entry (busy, not down).
+    assert metrics["llm"]["state"] == "generating"
+    # The watermark advanced, so the latch is not re-published next cycle.
+    assert collector._llm_busy_latch_published_id == 1
+
+    # Next cycle: current is still idle, no new latch -> the idle current
+    # is published (the latch is not re-published).
+    metrics2 = collector._collect()
+    assert metrics2["llms"] == collector._llm_latest
+    assert metrics2["llms"][0]["state"] == "idle"
+
+
+def test_strata_slot_diagnosability_fields(reset_strata_state):
+    """The Strata LLM entry carries state_seen, slots_busy, last_busy_ts,
+    slots_state_mismatch with correct types/values for a busy payload."""
+    from app import collect_strata_metrics
+
+    doc = _strata_doc()
+    doc["live"]["state"] = "generating"
+    doc["live"]["running"] = 1
+    body = json.dumps(doc).encode()
+    with patch("app.time.time", return_value=12345.0), \
+         patch("app.urllib.request.urlopen",
+               side_effect=make_strata_server(body)):
+        result = collect_strata_metrics("http://127.0.0.1:9998")
+
+    assert result is not None
+    # slots_busy: one busy slot (slot 1 is decoding).
+    assert result["slots_busy"] == 1
+    # slots_state_mismatch: slot activity (1 busy) agrees with running (1)
+    # -> no mismatch.
+    assert result["slots_state_mismatch"] is False
+    # state_seen: the raw state string (generating).
+    assert result["state_seen"] == "generating"
+    # last_busy_ts: a float epoch ts (a slot is busy).
+    assert isinstance(result["last_busy_ts"], float)
+    assert result["last_busy_ts"] == 12345.0
+
+
+def test_strata_is_processing_cheap_guard(reset_strata_state):
+    """A slot whose state string is idle but has generated tokens (or
+    elapsed time) is marked is_processing (the cheap guard catches short
+    requests whose state lags the activity)."""
+    from app import collect_strata_metrics
+
+    # Positive: a slot with state "idle" but generated > 0 (a short
+    # request whose state string lags the actual activity).
+    doc = _strata_doc()
+    doc["live"]["slots"] = [
+        {"slot": 0, "state": "idle", "held_tokens": 0,
+         "generated": 10, "elapsed_s": 0.5},
+    ]
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_strata_server(json.dumps(doc).encode())):
+        result = collect_strata_metrics("http://127.0.0.1:9998",
+                                       state_key="pos")
+    assert result is not None
+    # The cheap guard: state is idle, but generated > 0 -> processing.
+    assert result["slots"][0]["is_processing"] is True
+    assert result["slots_busy"] == 1
+
+    # Negative: a truly idle slot (no generated, no elapsed) is not
+    # processing.
+    doc2 = _strata_doc()
+    doc2["live"]["slots"] = [
+        {"slot": 0, "state": "idle", "held_tokens": 5},
+    ]
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_strata_server(json.dumps(doc2).encode())):
+        result2 = collect_strata_metrics("http://127.0.0.1:9998",
+                                        state_key="neg")
+    assert result2["slots"][0]["is_processing"] is False
+    assert result2["slots_busy"] == 0
+
+
+def test_strata_slots_state_mismatch(reset_strata_state):
+    """slots_state_mismatch = any(active) != (running > 0): True when
+    slot-level activity disagrees with the engine-level running count,
+    False when they agree."""
+    from app import collect_strata_metrics
+
+    # Case 1 (mismatch): a busy slot but running = 0.
+    doc1 = _strata_doc()
+    doc1["live"]["running"] = 0
+    doc1["live"]["slots"] = [
+        {"slot": 0, "state": "decoding", "prompt_tokens": 100,
+         "generated": 10, "elapsed_s": 1.0},
+    ]
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_strata_server(json.dumps(doc1).encode())):
+        r1 = collect_strata_metrics("http://127.0.0.1:9998", state_key="m1")
+    assert r1["slots_state_mismatch"] is True
+
+    # Case 2 (agree, both active): a busy slot and running > 0.
+    doc2 = _strata_doc()
+    doc2["live"]["running"] = 1
+    doc2["live"]["slots"] = [
+        {"slot": 0, "state": "decoding", "prompt_tokens": 100,
+         "generated": 10, "elapsed_s": 1.0},
+    ]
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_strata_server(json.dumps(doc2).encode())):
+        r2 = collect_strata_metrics("http://127.0.0.1:9998", state_key="a1")
+    assert r2["slots_state_mismatch"] is False
+
+    # Case 3 (agree, both idle): no busy slot and running = 0.
+    doc3 = _strata_doc()
+    doc3["live"]["running"] = 0
+    doc3["live"]["slots"] = [
+        {"slot": 0, "state": "idle", "held_tokens": 5},
+    ]
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_strata_server(json.dumps(doc3).encode())):
+        r3 = collect_strata_metrics("http://127.0.0.1:9998", state_key="i1")
+    assert r3["slots_state_mismatch"] is False
+
+
+def test_strata_empty_slot_list_not_silently_dropped(reset_strata_state):
+    """An empty slot list is not silently discarded: out["slots"] is
+    present (as []) so the empty case is explicit / diagnosable."""
+    from app import collect_strata_metrics
+
+    doc = _strata_doc()
+    doc["live"]["slots"] = []
+    body = json.dumps(doc).encode()
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_strata_server(body)):
+        result = collect_strata_metrics("http://127.0.0.1:9998")
+
+    assert result is not None
+    # The empty slot list is present (not silently dropped).
+    assert "slots" in result
+    assert result["slots"] == []
+    # slots_busy is 0 (no busy slots).
+    assert result["slots_busy"] == 0

@@ -3008,10 +3008,15 @@ def _parse_strata_slots(data: Any,
     for entry in data:
         if not isinstance(entry, dict):
             continue
-        active = str(entry.get("state") or "idle") != "idle"
+        state_str = str(entry.get("state") or "idle")
         prompt = _strata_num(entry.get("prompt_tokens")) or 0.0
         generated = _strata_num(entry.get("generated")) or 0.0
+        elapsed_s = _strata_num(entry.get("elapsed_s")) or 0.0
         held = _strata_num(entry.get("held_tokens")) or 0.0
+        # Cheap guard: a slot is processing if its state string is not
+        # idle, OR it has generated tokens, OR time has elapsed (catches
+        # short requests whose state string lags the actual activity).
+        active = (state_str != "idle") or (generated > 0) or (elapsed_s > 0)
         used = (prompt + generated) if active else held
         slot: dict[str, Any] = {
             "id": entry.get("slot", len(slots)),
@@ -3120,8 +3125,33 @@ def collect_strata_metrics(
         out["total_slots"] = int(parallel)
         config["parallel"] = int(parallel)
     slots = _parse_strata_slots(live.get("slots"), n_ctx)
-    if slots:
-        out["slots"] = slots
+    # Always emit the slot list (even empty) so the empty case is
+    # explicit / diagnosable (a silently-dropped empty list hid "no
+    # slots" from the UI).
+    out["slots"] = slots
+
+    # --- Slot diagnosability (T6): busy count from the cheap guard,
+    # engine/slot cross-check, last-busy timestamp, last-seen state. ---
+    slots_busy = sum(1 for s in slots if s.get("is_processing"))
+    any_active = slots_busy > 0
+    # Cross-check: slot-level activity vs engine-level running count.
+    out["slots_busy"] = slots_busy
+    out["slots_state_mismatch"] = any_active != (running > 0)
+    # last_busy_ts: epoch ts of the last time a slot was observed busy
+    # (persists across scrapes via _strata_prev; a diagnostic for "idle
+    # while generating" — the engine is idle now but a slot was busy at
+    # this ts).
+    prev_last_busy_ts = prev.get("last_busy_ts") if prev else None
+    last_busy_ts = time.time() if any_active else prev_last_busy_ts
+    if last_busy_ts is not None:
+        out["last_busy_ts"] = last_busy_ts
+    # state_seen: the last observed NON-IDLE raw state (persists across
+    # scrapes); a diagnostic for "idle while generating" (the state was
+    # seen generating but the current scrape is idle).
+    prev_state_seen = prev.get("state_seen") if prev else None
+    state_seen = state if state != "idle" else prev_state_seen
+    if state_seen is not None:
+        out["state_seen"] = state_seen
 
     # --- Cumulative totals (counters since server start) ---
     gen_total = _strata_num(totals.get("output_tokens"))
@@ -3304,6 +3334,12 @@ def collect_strata_metrics(
         new_prev["prompt"] = prompt_total
     if last_rate is not None:
         new_prev["last_rate"] = last_rate
+    # Persist the last-busy ts + last-seen state across scrapes (the
+    # computed values already carry the previous value when idle).
+    if last_busy_ts is not None:
+        new_prev["last_busy_ts"] = last_busy_ts
+    if state_seen is not None:
+        new_prev["state_seen"] = state_seen
     _strata_prev[state_key] = new_prev
 
     _strata_last_good[state_key] = (now, out)
@@ -3800,6 +3836,27 @@ def _url_host_is_local(url: str | None) -> bool:
             or host == platform.node() or host.endswith(".local"))
 
 
+def _llm_entries_busy(entries: list[dict[str, Any]] | None) -> bool:
+    """True when any non-down LLM entry shows activity (a busy tick).
+
+    Backend-agnostic: a target is busy when it reports a running request
+    count, a generating/reading engine state, or a processing slot. Used
+    by the LLM thread's busy-latch so a short request / busy tick the
+    slower main loop misses is not discarded.
+    """
+    for e in entries or []:
+        if not isinstance(e, dict) or e.get("status") == "down":
+            continue
+        if (e.get("requests_processing") or 0) > 0:
+            return True
+        if e.get("state") in ("reading", "generating"):
+            return True
+        for s in e.get("slots") or []:
+            if isinstance(s, dict) and s.get("is_processing"):
+                return True
+    return False
+
+
 class MetricsCollector(threading.Thread):
     """Background thread that polls system + GPU metrics and broadcasts each
     JSON snapshot to every subscriber, plus a cached last-snapshot for
@@ -3853,6 +3910,14 @@ class MetricsCollector(threading.Thread):
         # token-rate window ~poll_interval even when the main cycle
         # is slow.
         self._llm_latest: list[dict[str, Any]] | None = None
+        # Busy-latch: the most recent BUSY LLM sample, retained so a slow
+        # main loop does not discard a short request / busy tick it
+        # missed. `_llm_busy_latch_id` increments per new busy sample;
+        # `_llm_busy_latch_published_id` is the id the main loop last
+        # published (so a busy sample is published once, not repeatedly).
+        self._llm_busy_latch: list[dict[str, Any]] | None = None
+        self._llm_busy_latch_id = 0
+        self._llm_busy_latch_published_id = 0
         self._llm_ready = threading.Event()
         self._llm_stop = threading.Event()
         self._llm_thread = threading.Thread(target=self._llm_loop,
@@ -3964,6 +4029,12 @@ class MetricsCollector(threading.Thread):
                     self._llm_latest = None
             except Exception:  # noqa: BLE001
                 log.exception("Error collecting LLM metrics")
+            # Busy-latch: retain the most recent BUSY sample so a slow
+            # main loop does not discard a short request / busy tick it
+            # missed (an idle sample does NOT clear the latch).
+            if _llm_entries_busy(self._llm_latest):
+                self._llm_busy_latch = list(self._llm_latest or [])
+                self._llm_busy_latch_id += 1
             self._llm_ready.set()
             self._llm_stop.wait(self.poll_interval)
 
@@ -4160,6 +4231,18 @@ class MetricsCollector(threading.Thread):
         # the old single-backend contract. It is NOT an aggregate across
         # targets: fleet consumers sum `llms`.
         entries = ((self._llm_latest or []) if self.llama_enabled else [])
+        # Busy-latch: if the current sample is idle but a newer busy
+        # sample was latched (a busy tick the slow main loop missed),
+        # publish the latched busy sample so the busy state is not lost.
+        # If the current sample is itself busy, it is published directly
+        # and the (redundant) latch watermark is advanced so the latched
+        # sample is not re-published after the current goes idle.
+        if self.llama_enabled and self._llm_busy_latch is not None:
+            if _llm_entries_busy(entries):
+                self._llm_busy_latch_published_id = self._llm_busy_latch_id
+            elif self._llm_busy_latch_id > self._llm_busy_latch_published_id:
+                entries = self._llm_busy_latch
+                self._llm_busy_latch_published_id = self._llm_busy_latch_id
         metrics["llms"] = entries
         primary = entries[0] if entries else None
         metrics["llm"] = (primary
