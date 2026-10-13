@@ -11,7 +11,12 @@ WorkingDirectory=/home/joshua/resource_dashboard
 # running the LLM server(s). In auto mode (default) the dashboard probes
 # vLLM first, then llama.cpp; pin with --llm-backend {llama|vllm}.
 # Drop both URL flags if the Local LLM section is not needed.
-ExecStart=/home/joshua/resource_dashboard/.venv/bin/python /home/joshua/resource_dashboard/app.py --config /home/joshua/resource_dashboard/config.yaml
+# T9: `python -m app` runs the explicit bootstrap (main()), which resolves
+# the settings (CLI > config > defaults) and starts the collector on the
+# resolved settings. A WSGI server (e.g. `waitress-serve app:wsgi`, T10)
+# uses the `wsgi` entry point, which applies the config's settings at
+# import time so it no longer runs on built-in defaults.
+ExecStart=/home/joshua/resource_dashboard/.venv/bin/python -m app --config /home/joshua/resource_dashboard/config.yaml
 Restart=on-failure
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1

@@ -4484,12 +4484,19 @@ class MetricsCollector(threading.Thread):
 # ---------------------------------------------------------------------------
 
 app = Flask(__name__)
+# Created (NOT started) at module level; started by apply_settings() so
+# the collector runs on the resolved settings, not built-in defaults.
 collector = MetricsCollector(poll_interval=1.0)
-collector.start()
+# True once the settings have been applied (by main() for a direct serve,
+# or by the lazy before_request hook for a WSGI/import-based serve).
+# Prevents re-resolving/re-applying the settings on every request, and
+# keeps the collector from starting at import time (which would do real
+# scrape work during tests / before the app is actually served).
+_settings_applied = False
 
 
 # Initial system tab shown on page load ("local" | "fleet"); set from
-# settings in __main__ before the server starts.
+# settings in apply_settings() before the server starts.
 _default_view = "local"
 
 
@@ -4556,7 +4563,9 @@ def health() -> Response:
 # Entry point
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser (shared by main() and the WSGI entry
+    point so the no-CLI namespace matches the real defaults)."""
     parser = argparse.ArgumentParser(description="Resource & GPU Utilization Dashboard")
     parser.add_argument("--config", default=None,
                         help="YAML config file (default: ./config.yaml when "
@@ -4609,11 +4618,23 @@ if __name__ == "__main__":
                         help="Upstream dashboard to consolidate (repeatable; also "
                              "available as config.yaml `upstreams`). Each upstream "
                              "runs this same app, e.g. NAME=http://host:5000")
-    args = parser.parse_args()
+    return parser
 
-    config = load_config(args.config, explicit=args.config is not None)
-    settings = resolve_settings(args, config)
 
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse CLI args (defaults to sys.argv[1:]). Passing [] yields the
+    no-CLI namespace (all defaults) used by the WSGI entry point."""
+    return _build_parser().parse_args(argv)
+
+
+def apply_settings(settings: dict[str, Any]) -> None:
+    """Apply every resolved setting to the module-level collector and start
+    it. This is the single place settings are applied, so the collector
+    runs on the resolved settings regardless of how the app is served
+    (direct `python app.py` or WSGI/import-based). Idempotent: a second
+    call re-applies the settings (a no-op) but does not re-start the
+    already-running collector."""
+    global _default_view, _settings_applied
     collector.poll_interval = settings["poll_interval"]
     collector.llama_url = settings["llama_url"]
     collector.llama_enabled = settings["llama_enabled"]
@@ -4628,7 +4649,45 @@ if __name__ == "__main__":
     collector.llm_targets = settings["llm_targets"]
     collector.start_upstreams(settings["upstreams"])
     _default_view = settings["default_view"]  # module scope; read by index()
+    # Guard against double-start: MetricsCollector is a threading.Thread,
+    # whose start() raises RuntimeError if already started (e.g. apply_
+    # settings called twice). A second call is a no-op.
+    try:
+        collector.start()
+    except RuntimeError:
+        pass
+    _settings_applied = True
 
+
+def _ensure_bootstrap() -> None:
+    """Lazy bootstrap for a WSGI/import-based serve: on the first request,
+    if the settings have not yet been applied (i.e. the app was imported by
+    a WSGI server rather than run via main()), resolve the settings from the
+    config (no CLI) and apply them (starting the collector on the resolved
+    settings). Subsequent calls are a no-op. This keeps the collector from
+    starting at import time (which would do real scrape work during tests /
+    before the app is actually served)."""
+    if _settings_applied:
+        return
+    config = load_config(None)
+    args = _parse_args([])
+    settings = resolve_settings(args, config)
+    apply_settings(settings)
+
+
+@app.before_request
+def _lazy_bootstrap() -> None:
+    _ensure_bootstrap()
+
+
+def main() -> None:
+    """Explicit bootstrap for a direct serve (`python app.py`): resolve the
+    settings (CLI > config > defaults), apply them (starting the collector
+    on the resolved settings), and run the dev server."""
+    args = _parse_args()
+    config = load_config(args.config, explicit=args.config is not None)
+    settings = resolve_settings(args, config)
+    apply_settings(settings)
     llm_status = "disabled" if not settings["llama_enabled"] else (
         "targets=" + ", ".join(
             f"{t.name}:{t.backend}" + (f"@{t.url}" if t.url else "")
@@ -4641,3 +4700,27 @@ if __name__ == "__main__":
     # holding the long-lived SSE /events stream would make every other request
     # (incl. /api/metrics from an aggregating dashboard) queue or 503.
     app.run(host=settings["host"], port=settings["port"], debug=False, threaded=True)
+
+
+def _bootstrap_wsgi() -> Flask:
+    """Eager WSGI/import-based bootstrap (optional): resolve the settings
+    from the config (no CLI) and apply them (starting the collector on the
+    resolved settings). NOT called at import time (see the lazy
+    before_request hook above); kept for an eager bootstrap if desired."""
+    config = load_config(None)
+    args = _parse_args([])
+    settings = resolve_settings(args, config)
+    apply_settings(settings)
+    return app
+
+
+# WSGI entry point (e.g. `waitress-serve app:wsgi`, T10). `wsgi` is the Flask
+# app (a WSGI callable); the settings are applied lazily on the first request
+# (via the before_request hook) so the collector does not start at import time.
+# When run directly (`python app.py`), `main()` applies the settings explicitly
+# before `app.run(...)` and the before_request hook is a no-op.
+wsgi = app
+
+
+if __name__ == "__main__":
+    main() 

@@ -6607,3 +6607,101 @@ def test_log_rate_limiting_suppresses_repeat_failures(caplog):
     # The recovery is logged once.
     recovered = [r for r in caplog.records if "recovered" in r.getMessage()]
     assert len(recovered) == 1, f"expected 1 recovery log, got {len(recovered)}"
+
+
+# ---------------------------------------------------------------------------
+# T9: app factory + explicit bootstrap
+# ---------------------------------------------------------------------------
+
+def _t9_settings(**overrides):
+    """A minimal settings dict (the shape resolve_settings returns) for the
+    T9 bootstrap tests. LLM is disabled by default so the test collector
+    does not probe any LLM server."""
+    s = {
+        "host": "127.0.0.1",
+        "port": 5000,
+        "poll_interval": 0.5,
+        "llama_url": "http://127.0.0.1:5001",
+        "vllm_url": "http://127.0.0.1:8000",
+        "litellm_url": "http://127.0.0.1:4000",
+        "litellm_token": None,
+        "strata_url": "http://127.0.0.1:8080",
+        "llm_backend": "auto",
+        "default_view": "local",
+        "llama_enabled": False,
+        "llm_targets": [],
+        "upstreams": [],
+    }
+    s.update(overrides)
+    return s
+
+
+def test_apply_settings_starts_collector(monkeypatch):
+    """apply_settings applies every resolved setting to the module-level
+    collector and starts it, so the collector runs on the resolved settings
+    (not the built-in defaults it was created with)."""
+    import time
+    import app as app_mod
+    from app import MetricsCollector
+
+    fresh = MetricsCollector(poll_interval=99.0)  # built-in default (to detect override)
+    monkeypatch.setattr(app_mod, "collector", fresh)
+    try:
+        app_mod.apply_settings(_t9_settings(poll_interval=0.5,
+                                          llama_url="http://127.0.0.1:5001"))
+        time.sleep(0.3)  # give the thread a moment to start
+        assert fresh.is_alive(), "apply_settings should start the collector"
+        assert fresh.poll_interval == 0.5, "poll_interval should be the resolved setting"
+        assert fresh.llama_url == "http://127.0.0.1:5001", "llama_url should be the resolved setting"
+    finally:
+        fresh.stop()
+        fresh.join(timeout=2)
+
+
+def test_wsgi_entry_applies_config(monkeypatch):
+    """The lazy before_request hook resolves the settings from the config
+    (no CLI) and applies them on the FIRST request, so a WSGI/import-based
+    serve runs on the config's settings, not built-in defaults. The
+    collector is NOT started at import time (only on the first request)."""
+    import app as app_mod
+    from app import MetricsCollector
+
+    # Simulate a config with a non-default poll_interval + llama disabled.
+    fake_config = {"poll_interval": 3.3, "llama_enabled": False}
+    monkeypatch.setattr(app_mod, "load_config",
+                        lambda path=None, explicit=False: fake_config)
+    monkeypatch.setattr(app_mod, "_settings_applied", False)
+
+    fresh = MetricsCollector(poll_interval=99.0)  # built-in default (to detect override)
+    monkeypatch.setattr(app_mod, "collector", fresh)
+    try:
+        # Import time does NOT start the collector; trigger the lazy bootstrap
+        # via a request (before_request -> _ensure_bootstrap -> apply_settings).
+        app_mod.app.test_client().get("/api/metrics")
+        assert fresh.poll_interval == 3.3, "poll_interval should be the config's setting (not the 99.0 built-in default)"
+        assert fresh.llama_enabled is False, "llama_enabled should be the config's setting"
+    finally:
+        fresh.stop()
+        fresh.join(timeout=2)
+
+
+def test_main_bootstrap_idempotent(monkeypatch):
+    """Calling apply_settings twice does not double-start the collector: the
+    second start() is a no-op via the RuntimeError guard (no crash, the
+    collector keeps running, no second thread is spawned)."""
+    import time
+    import app as app_mod
+    from app import MetricsCollector
+
+    fresh = MetricsCollector(poll_interval=0.5)
+    monkeypatch.setattr(app_mod, "collector", fresh)
+    s = _t9_settings()
+    try:
+        app_mod.apply_settings(s)  # first call: starts the collector
+        time.sleep(0.3)
+        assert fresh.is_alive(), "first apply_settings should start the collector"
+        app_mod.apply_settings(s)  # second call: no-op (no double-start, no crash)
+        assert fresh.is_alive(), "collector should still be running after the second apply_settings"
+    finally:
+        fresh.stop()
+        fresh.join(timeout=2)
