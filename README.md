@@ -292,6 +292,33 @@ curl http://127.0.0.1:5000/api/metrics | python -m json.tool
 
 **Breaking change:** the per-snapshot key `llama` was replaced by `llm` (with a `backend: "llama" | "vllm" | "litellm" | "strata"` discriminator) and `llama_enabled` by `llm_enabled`; the older output shape is gone.
 
+### Self-observability (`/health`)
+
+`GET /health` is a read-only self-observability endpoint (it does not consume or
+mutate the metrics snapshot). It returns JSON with:
+
+- `status`: `"ok"` when no target has a recent error, `"degraded"` otherwise.
+- `poll_interval`: the configured main-cycle interval (seconds).
+- `last_cycle_duration_s`: the wall-clock duration of the last main collection
+  cycle (the `_collect()` in the fixed-rate `run()` loop); `null` before the
+  first cycle completes.
+- `last_errors`: a map of per-target last errors, keyed by each LLM target's
+  name, each upstream's name, and `"main"` for the main metrics collection. A
+  target with no recent error is absent; a value is the most recent failure
+  (the exception string, or `"down (…returned None)"` for a stale-hold expiry).
+- `upstream_removed`: the count of upstreams removed after N consecutive
+  failures.
+
+```bash
+curl http://127.0.0.1:5000/health | python -m json.tool
+```
+
+To keep the log usable, a persistently failing target logs its exception once,
+then is suppressed for a 60 s cooldown (a single `still failing` warning is
+logged at most once per cooldown); a recovery is logged once. This prevents the
+old every-cycle `log.exception` flood while still surfacing new failures and
+recoveries.
+
 ## Running Tests
 
 ```bash

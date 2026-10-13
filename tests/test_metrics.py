@@ -6516,3 +6516,94 @@ def test_llama_proc_keyed_per_target():
     # No cross-target clobbering: target-a's handle is still proc_a.
     assert app_mod._llama_proc["target-a"] is proc_a
     assert app_mod._llama_proc["target-a"] is not app_mod._llama_proc["target-b"]
+
+
+# ---------------------------------------------------------------------------
+# T7 — self-observability (/health) + log rate limiting
+# ---------------------------------------------------------------------------
+
+def test_health_endpoint_reports_last_cycle_and_errors(monkeypatch):
+    """GET /health returns JSON with last_cycle_duration_s (a number) and
+    last_errors (a dict reflecting a seeded per-target error)."""
+    import app as app_mod
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1, llama_enabled=False)
+    collector.start()
+    try:
+        # Wait for a cycle to complete (so _last_cycle_duration is set).
+        for _ in range(200):
+            if collector._last_cycle_duration is not None:
+                break
+            time.sleep(0.05)
+        assert collector._last_cycle_duration is not None, \
+            "a cycle did not complete in time"
+        # Seed a per-target error (an upstream that is down).
+        collector._record_error("apollo", "down (fetch returned None)")
+        # GET /health via the Flask test client.
+        monkeypatch.setattr(app_mod, "collector", collector)
+        resp = app_mod.app.test_client().get("/health")
+        assert resp.status_code == 200
+        body = resp.get_json()
+        # last_cycle_duration_s is a number (>= 0).
+        assert isinstance(body["last_cycle_duration_s"], (int, float))
+        assert body["last_cycle_duration_s"] >= 0
+        # last_errors is a dict reflecting the seeded per-target error.
+        assert isinstance(body["last_errors"], dict)
+        assert body["last_errors"]["apollo"] == "down (fetch returned None)"
+        # status is "degraded" (a target has a recent error).
+        assert body["status"] == "degraded"
+    finally:
+        collector.stop()
+        collector.join(timeout=2)
+
+
+def test_log_rate_limiting_suppresses_repeat_failures(caplog):
+    """A persistently-failing target logs the exception the first time,
+    then suppresses it within the cooldown (no every-cycle flood); a
+    recovery logs once."""
+    import logging
+
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=1.0, llama_enabled=False)
+    # Do not start the collector (we test _record_error/_clear_error directly).
+    with caplog.at_level(logging.DEBUG, logger="app"):
+        # First failure: log the exception (with traceback).
+        collector._record_error("apollo", "boom", exc=Exception("boom"),
+                               log_msg="Error collecting upstream apollo")
+        # Subsequent failures (within the cooldown): suppressed (no flood).
+        collector._record_error("apollo", "boom", exc=Exception("boom"),
+                               log_msg="Error collecting upstream apollo")
+        collector._record_error("apollo", "boom", exc=Exception("boom"),
+                               log_msg="Error collecting upstream apollo")
+        # Simulate a cooldown expiry (the last log was > 60 s ago).
+        collector._last_error_log_ts["apollo"] = time.monotonic() - 61.0
+        # After the cooldown: a single "still failing" warning is logged.
+        collector._record_error("apollo", "boom", exc=Exception("boom"),
+                               log_msg="Error collecting upstream apollo")
+        # Recovery: log once.
+        collector._clear_error("apollo", log_msg="Upstream apollo")
+    # First failure: the exception is logged (with traceback / exc_info).
+    first_failure = [r for r in caplog.records
+                    if "Error collecting upstream apollo" in r.getMessage()
+                    and r.exc_info is not None]
+    assert len(first_failure) == 1, \
+        f"expected 1 logged exception, got {len(first_failure)}"
+    # Only 2 "Error collecting upstream apollo" logs total: the first
+    # (exception) and the post-cooldown "still failing" (a warning, no exc).
+    all_failure_logs = [r for r in caplog.records
+                       if "Error collecting upstream apollo" in r.getMessage()]
+    assert len(all_failure_logs) == 2, \
+        f"expected 2 failure logs (first + post-cooldown), " \
+        f"got {len(all_failure_logs)}"
+    # The post-cooldown log is a "still failing" warning (no exc_info).
+    still_failing = [r for r in caplog.records
+                    if "still failing" in r.getMessage()]
+    assert len(still_failing) == 1, \
+        f"expected 1 'still failing' log, got {len(still_failing)}"
+    assert still_failing[0].exc_info is None, \
+        "the 'still failing' log should not carry an exception"
+    # The recovery is logged once.
+    recovered = [r for r in caplog.records if "recovered" in r.getMessage()]
+    assert len(recovered) == 1, f"expected 1 recovery log, got {len(recovered)}"

@@ -3954,6 +3954,17 @@ class MetricsCollector(threading.Thread):
         # stops hammering them; the UI keeps showing "down" via the
         # last-good/placeholder path.
         self._upstream_removed: set[str] = set()
+        # Self-observability (T7): the wall-clock duration of the last main
+        # collection cycle, and a per-target last-error map (keyed by each
+        # LLM target's name, each upstream's name, and "main" for the main
+        # metrics collection). A target with no recent error is absent.
+        # `_last_error_log_ts` drives the log rate limiting (a persistently
+        # failing target logs the exception once, then is suppressed for
+        # `_error_cooldown_s` rather than flooding the log every cycle).
+        self._last_cycle_duration: float | None = None
+        self._last_errors: dict[str, str] = {}
+        self._last_error_log_ts: dict[str, float] = {}
+        self._error_cooldown_s: float = 60.0
 
         # Seed psutil (first cpu_percent call returns 0.0 and must be discarded)
         psutil.cpu_percent()
@@ -4020,6 +4031,58 @@ class MetricsCollector(threading.Thread):
             except ValueError:
                 pass
 
+    # -- self-observability (T7) ------------------------------------------------
+
+    def _record_error(self, key: str, error: str, *,
+                     exc: Exception | None = None,
+                     log_msg: str | None = None) -> None:
+        """Record a per-target last error and log it, rate-limited.
+
+        A persistently failing target would otherwise log an exception
+        every cycle (the every-cycle ``log.exception`` flood). Instead:
+        the first failure logs the exception (with traceback); failures
+        within ``_error_cooldown_s`` are suppressed, and after
+        the cooldown a single ``still failing`` warning is logged (at
+        most once per cooldown). The error string is always recorded in
+        ``_last_errors`` regardless of the log suppression, so ``/health``
+        always reflects the latest failure.
+        """
+        self._last_errors[key] = error
+        now = time.monotonic()
+        last_log = self._last_error_log_ts.get(key)
+        if last_log is not None and (now - last_log) < self._error_cooldown_s:
+            return  # suppressed (within the cooldown)
+        self._last_error_log_ts[key] = now
+        msg = log_msg or f"Error: {key}"
+        if last_log is not None:
+            log.warning("%s — still failing, suppressing for %.0fs",
+                        msg, self._error_cooldown_s)
+        elif exc is not None:
+            log.exception(msg)
+        else:
+            log.warning(msg)
+
+    def _clear_error(self, key: str, *, log_msg: str | None = None) -> None:
+        """Clear a per-target last error (the target recovered). Log the
+        recovery once if it was previously failing."""
+        if key in self._last_errors:
+            log.info("%s recovered", log_msg or key)
+            del self._last_errors[key]
+            self._last_error_log_ts.pop(key, None)
+
+    def health(self) -> dict[str, Any]:
+        """Self-observability snapshot for ``GET /health``: the last main
+        cycle duration, the per-target last-error map, and a few sensible
+        extras. A target with no recent error is absent from
+        ``last_errors``."""
+        return {
+            "status": "ok" if not self._last_errors else "degraded",
+            "poll_interval": self.poll_interval,
+            "last_cycle_duration_s": self._last_cycle_duration,
+            "last_errors": dict(self._last_errors),
+            "upstream_removed": len(self._upstream_removed),
+        }
+
     def _llm_loop(self) -> None:
         """LLM scrape on its own cadence (decoupled from the main
         cycle, which includes GPU/health probes). Keeps the token-rate
@@ -4046,8 +4109,12 @@ class MetricsCollector(threading.Thread):
                                 ex.map(self._collect_one, targets))
                 else:
                     self._llm_latest = None
-            except Exception:  # noqa: BLE001
-                log.exception("Error collecting LLM metrics")
+            except Exception as e:  # noqa: BLE001
+                # Batch-level (not per-target) failure: rate-limit the log
+                # so a persistently failing LLM loop does not flood the log
+                # every cycle (T7).
+                self._record_error("llm", repr(e), exc=e,
+                                  log_msg="Error collecting LLM metrics")
             # Busy-latch: retain the most recent BUSY sample so a slow
             # main loop does not discard a short request / busy tick it
             # missed (an idle sample does NOT clear the latch).
@@ -4101,8 +4168,18 @@ class MetricsCollector(threading.Thread):
         else:
             data = None
         if data is None:
+            # Per-target failure (the scrape returned None past the
+            # stale-hold): record it in the per-target last-error map and log
+            # it rate-limited so a persistently-down target does not flood
+            # the log every cycle (T7).
+            self._record_error(target.name, "down (scrape returned None)",
+                              log_msg=f"LLM target {target.name} down")
             return {"name": target.name, "backend": target.backend,
                     "status": "down"}
+        # Success: clear any prior last error for this target (recovery is
+        # logged once by _clear_error) (T7).
+        self._clear_error(target.name,
+                          log_msg=f"LLM target {target.name}")
         # llama process-card attribution: the local biggest-RSS
         # llama-server can only be tied to a llama target when the URL is
         # local AND that target is the dashboard's only llama server
@@ -4165,14 +4242,25 @@ class MetricsCollector(threading.Thread):
         backoff = self.poll_interval
         failures = 0
         while self.running:
+            upstream_exc: Exception | None = None
             try:
                 out = collect_upstream_metrics(url, name)
-            except Exception:  # noqa: BLE001
-                log.exception("Error collecting upstream %s", name)
+            except Exception as e:  # noqa: BLE001
+                upstream_exc = e
                 out = None
             # Always store the result (a None marks the upstream "down").
             self._upstream_latest[name] = out
             if out is None:
+                # A failure (exception or down): record the most specific
+                # error and log it rate-limited so a persistently failing
+                # upstream does not flood the log every cycle (T7).
+                if upstream_exc is not None:
+                    self._record_error(name, repr(upstream_exc),
+                                      exc=upstream_exc,
+                                      log_msg=f"Error collecting upstream {name}")
+                else:
+                    self._record_error(name, "down (fetch returned None)",
+                                      log_msg=f"Upstream {name} down")
                 failures += 1
                 if failures >= _UPSTREAM_REMOVAL_AFTER_FAILURES:
                     log.warning("Upstream %s removed after %d consecutive "
@@ -4182,6 +4270,9 @@ class MetricsCollector(threading.Thread):
                     break
                 backoff = min(backoff * 2, _UPSTREAM_BACKOFF_CAP_S)
             else:
+                # Success: clear any prior last error for this upstream
+                # (recovery is logged once by _clear_error) (T7).
+                self._clear_error(name, log_msg=f"Upstream {name}")
                 failures = 0
                 backoff = self.poll_interval
             self._upstream_stop.wait(backoff)
@@ -4346,10 +4437,20 @@ class MetricsCollector(threading.Thread):
             metrics: dict[str, Any] | None = None
             try:
                 metrics = self._collect()
-            except Exception:  # noqa: BLE001
-                log.exception("Error collecting metrics")
+            except Exception as e:  # noqa: BLE001
+                # Rate-limit the log so a persistently failing main
+                # collection does not flood the log every cycle (T7).
+                self._record_error("main", repr(e), exc=e,
+                                  log_msg="Error collecting metrics")
             t_end = time.monotonic()
             collect_s = t_end - cycle_start
+            # Record the wall-clock duration of the last main collection
+            # cycle for /health (T7).
+            self._last_cycle_duration = collect_s
+            # On success, clear any prior "main" last error (recovery is
+            # logged once by _clear_error) (T7).
+            if metrics is not None:
+                self._clear_error("main", log_msg="main metrics collection")
             # Advance the schedule from the fixed epoch, not from now.
             next_ts += self.poll_interval
             # A cycle that overruns the next slot does not burst-
@@ -4439,6 +4540,16 @@ def api_metrics() -> Response:
             mimetype="application/json",
         )
     return Response(data, mimetype="application/json")
+
+
+@app.route("/health")
+def health() -> Response:
+    """Self-observability endpoint (T7): the last main cycle duration, the
+    per-target last-error map (a target with no recent error is absent),
+    and a few sensible extras. Read-only; does not consume or mutate the
+    metrics snapshot."""
+    return Response(json.dumps(collector.health()),
+                    mimetype="application/json")
 
 
 # ---------------------------------------------------------------------------
