@@ -432,7 +432,7 @@ def _parse_lspci_device(output: str) -> str:
 
 
 def _lspci_device_name_map(bus_ids: list[str]) -> dict[str, str]:
-    global _lspci_name_cache
+    global _lspci_name_cache, _lspci_missing_logged
     if _lspci_name_cache is None:
         _lspci_name_cache = {}
     now = time.monotonic()
@@ -1101,7 +1101,6 @@ def _merge_gpu_lists(nvidia: list[dict[str, Any]],
         gpu = dict(gpu)
         gpu["vendor"] = "nvidia"
         merged.append(gpu)
-    offset = (max((g["index"] for g in nvidia), default=-1) + 1) if nvidia else 0
     for gpu in amd:
         gpu = dict(gpu)
         gpu["vendor"] = "amd"
@@ -2267,7 +2266,8 @@ _llm_tie_warned = False
 
 
 def _parse_prometheus_labeled(text: str, prefix: str) -> dict[str, dict]:
-    """Parse Prometheus text into ``{metric_name: {"series": {labelset: float}, "labels": {name: set(values)}}}``.
+    """Parse Prometheus text into
+    ``{metric_name: {"series": {labelset: float}, "labels": {name: set(values)}}}``.
 
     Keeps only series with the given *prefix* (e.g. ``"vllm:"``) plus the
     companion unprefixed ``process_start_time_seconds``. Labeled and
@@ -4576,7 +4576,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--poll-interval", type=float, default=None,
                         help="Poll interval in seconds (default: 1.0)")
     parser.add_argument("--llama-url", default=None,
-                        help="Base URL of llama.cpp llama-server (expects /metrics enabled via --metrics). "
+                        help="Base URL of llama.cpp llama-server "
+                             "(expects /metrics enabled via --metrics). "
                              "The default http://127.0.0.1:5001 works when the dashboard and "
                              "llama-server run on the same host; pass a remote URL otherwise, "
                              "e.g. http://<llama-host>:5001")
@@ -4723,4 +4724,4 @@ wsgi = app
 
 
 if __name__ == "__main__":
-    main() 
+    main()

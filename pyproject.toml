@@ -1,0 +1,35 @@
+[project]
+name = "resource-dashboard"
+version = "0.1.0"
+description = "Resource & GPU utilization dashboard with multi-LLM and fleet aggregation"
+requires-python = ">=3.10"
+dependencies = [
+    "flask>=3.0",
+    "psutil>=5.9",
+    "nvidia-ml-py>=11.0",
+    "PyYAML>=6.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+# E501 (line too long) is ignored: the long lines are data-format string
+# literals (Prometheus metric bodies, GPU CLI output) that cannot be wrapped
+# without changing their content. It is a style rule, not a bug.
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+warn_unused_ignores = false
+# First pass: keep mypy useful without a flood of errors. Strictness can be
+# tightened in a follow-up.
+disallow_untyped_defs = false
+check_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

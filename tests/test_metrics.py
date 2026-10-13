@@ -46,7 +46,7 @@ def no_real_nvidia():
 
 
 def test_gpu_cli_parses_single_gpu(no_real_nvidia):
-    from app import _gpu_cli, _lspci_vendor_map
+    from app import _gpu_cli
 
     no_real_nvidia.return_value = MagicMock(
         stdout="85, 4096, 8192, 72, 1410, Active, Not Active, 0000:01:00.0, NVIDIA A100-SXM4-80GB, 0x1EB810DE, 42.5, 400.00\n",
@@ -119,7 +119,7 @@ def test_gpu_cli_not_found():
 # ---------------------------------------------------------------------------
 
 def test_lspci_vendor_map_parses_subsystem():
-    from app import _lspci_vendor_map, _parse_lspci_subsystem
+    from app import _parse_lspci_subsystem
 
     # Machine-readable ``lspci -vm`` format uses a tab-separated SVendor line
     lspci_vm = (
@@ -157,7 +157,7 @@ def test_lspci_vendor_map_parses_subsystem():
 
 
 def test_lspci_vendor_map_not_found():
-    from app import _lspci_vendor_map, _lspci_cache
+    from app import _lspci_vendor_map
 
     import app as app_mod
     original = app_mod._lspci_cache
@@ -640,7 +640,7 @@ def test_fleet_projection_no_self_nesting():
 # ---------------------------------------------------------------------------
 
 def test_collect_gpu_falls_back_to_cli():
-    from app import collect_gpu_metrics, _gpu_pynvml, _gpu_cli
+    from app import collect_gpu_metrics
 
     with (
         patch("app._gpu_pynvml", return_value=[]),
@@ -1011,7 +1011,7 @@ def test_parse_llama_slots_next_token_shapes():
     assert d[0]["id_task"] is None
 
     # list shape: total n_decoded, skip non-dict items
-    l = _parse_llama_slots([{
+    slots = _parse_llama_slots([{
         "id": 0, "n_ctx": 100, "n_prompt_tokens": 10,
         "n_prompt_tokens_processed": 3,
         "next_token": [
@@ -1021,10 +1021,10 @@ def test_parse_llama_slots_next_token_shapes():
             "garbage",
         ],
     }])
-    assert l[0]["decoded"] == 15
-    assert l[0]["prompt_processed"] == 3
+    assert slots[0]["decoded"] == 15
+    assert slots[0]["prompt_processed"] == 3
     # context = prompt + decoded
-    assert l[0]["context_used"] == 25
+    assert slots[0]["context_used"] == 25
 
 
 def test_parse_llama_slots_remain():
@@ -1033,15 +1033,15 @@ def test_parse_llama_slots_remain():
     from app import _parse_llama_slots
 
     # list shape: sum positive n_remain over the items
-    l = _parse_llama_slots([{
+    slots = _parse_llama_slots([{
         "id": 0, "n_ctx": 100, "n_prompt_tokens": 10,
         "next_token": [
             {"n_decoded": 10, "n_remain": 16000},
             {"n_decoded": 5, "n_remain": 374},
         ],
     }])
-    assert l[0]["remain"] == 16374
-    assert l[0]["decoded"] == 15
+    assert slots[0]["remain"] == 16374
+    assert slots[0]["decoded"] == 15
 
     # dict shape (classic builds)
     d = _parse_llama_slots([{
@@ -2804,7 +2804,6 @@ def test_collect_vllm_counter_reset_rebaselines():
 
 def test_collect_vllm_rate_window_too_short():
     """elapsed < 0.5 s: rate is omitted."""
-    import app as app_mod
     from app import collect_vllm_metrics
 
     body1 = 'vllm:generation_tokens_total{engine="0",model_name="M"} 100.0\n'
@@ -2827,7 +2826,6 @@ def test_collect_vllm_rate_window_too_short():
 
 def test_collect_vllm_rate_window_too_long():
     """elapsed > 15 s: rate is omitted (gauges still present)."""
-    import app as app_mod
     from app import collect_vllm_metrics
 
     body1 = 'vllm:generation_tokens_total{engine="0",model_name="M"} 100.0\n'
@@ -4635,8 +4633,7 @@ def test_merge_gpu_lists_empty_sides():
 def test_amd_bdf_resolved_from_amd_smi_bus_id():
     """(a): ``amd-smi list --json`` bus_id is used; the vendor-local gpu
     index is never passed as a global cardN (no sysfs fallback runs)."""
-    from app import (_AMD_SMI_BIN_CANDIDATES, _ROCM_SMI_BIN_CANDIDATES,
-                     _amd_gpu_bus_id)
+    from app import (_AMD_SMI_BIN_CANDIDATES, _amd_gpu_bus_id)
 
     def fake_find_cli(candidates):
         if candidates == _AMD_SMI_BIN_CANDIDATES:
@@ -5764,7 +5761,7 @@ def test_collect_llm_auto_prefers_strata_over_llama(reset_strata_state):
     with patch("app.collect_vllm_metrics", return_value=None), \
          patch("app.collect_litellm_metrics", return_value=None), \
          patch("app.collect_strata_metrics",
-               return_value={"status": "up"}) as fake_strata, \
+               return_value={"status": "up"}), \
          patch("app.collect_llama_metrics") as fake_llama:
         data = collector._collect_llm()
     assert data == {"status": "up", "backend": "strata"}
