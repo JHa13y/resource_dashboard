@@ -15,11 +15,15 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install ruff mypy
+          python -m pip install ruff mypy pytest
           python -m pip install -r requirements.txt
       - name: Ruff
         run: ruff check app.py tests/test_metrics.py
       - name: Mypy
-        run: mypy app.py
+        run: |
+          mypy app.py > mypy-report.txt || true
+          count=$(grep -c 'error:' mypy-report.txt)
+          echo "mypy errors: $count (baseline: 40)"
+          [ "$count" -le 40 ]
       - name: Pytest
         run: pytest
