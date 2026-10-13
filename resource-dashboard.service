@@ -11,7 +11,7 @@ WorkingDirectory=/home/joshua/resource_dashboard
 # running the LLM server(s). In auto mode (default) the dashboard probes
 # vLLM first, then llama.cpp; pin with --llm-backend {llama|vllm}.
 # Drop both URL flags if the Local LLM section is not needed.
-ExecStart=/home/joshua/resource_dashboard/.venv/bin/python /home/joshua/resource_dashboard/app.py --host 0.0.0.0 --port 5000 --llama-url http://LLAMA_HOST:5001 --vllm-url http://VLLM_HOST:8000
+ExecStart=/home/joshua/resource_dashboard/.venv/bin/python /home/joshua/resource_dashboard/app.py --config /home/joshua/resource_dashboard/config.yaml
 Restart=on-failure
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1

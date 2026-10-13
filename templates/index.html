@@ -375,7 +375,8 @@
   <h1>⚡ Resource Dashboard-{{ hostname }}</h1>
   <p class="subtitle" id="clock"></p>
 
-  <!-- System tabs (multi-system consolidation; Fleet is the default view) -->
+  <!-- System tabs (multi-system consolidation; the default tab is
+       configurable: default_view: local | fleet, default local) -->
   <div class="sys-tabs" id="sys-tabs"></div>
 
   <!-- Fleet (summary) view: shown while the Fleet tab is selected -->
@@ -397,64 +398,67 @@
     </div>
   </div>
 
-  <!-- Local LLM section (hidden when the dashboard runs with --no-llama) -->
-  <div class="gpu-section" id="llama-section" style="margin-top:16px;">
-    <div class="card" id="llama-card">
+  <!-- Local LLM section (hidden when the dashboard runs with --no-llama).
+       Multi-LLM: one card per configured target, cloned from the
+       template by renderLLMCards() and keyed per (system, llm name). -->
+  <div class="gpu-section" id="llm-cards-container" style="margin-top:16px;"></div>
+
+  <template id="llm-card-template">
+    <div class="card llm-card">
       <div class="llama-header">
-        <h2>Local LLM <span id="llm-backend-label" style="font-weight:normal;font-size:0.8rem;color:#94a3b8;"></span></h2>
-        <span class="llama-model" id="llama-model">–</span>
-        <span id="llama-status" class="badge down">unreachable</span>
-        <span id="llama-stalled" class="badge down" style="display:none;">stalled</span>
-        <span class="llama-model" id="llama-slots-free" style="display:none;"></span>
+        <h2>Local LLM <span class="llm-name" style="display:none;font-weight:normal;font-size:0.9rem;color:#cbd5e1;"></span><span class="llm-backend" style="font-weight:normal;font-size:0.8rem;color:#94a3b8;"></span></h2>
+        <span class="llama-model llm-model">–</span>
+        <span class="llm-status badge down">unreachable</span>
+        <span class="llm-stalled badge down" style="display:none;">stalled</span>
+        <span class="llama-model llm-slots-free" style="display:none;"></span>
       </div>
-      <div class="llama-sub" id="llama-build" style="display:none;"></div>
+      <div class="llama-sub llm-build" style="display:none;"></div>
       <div class="gauges">
         <div class="gauge">
-          <div class="gauge-value" id="llama-gen-tokens-s">–</div>
+          <div class="gauge-value llm-gen">–</div>
           <div class="gauge-label">Gen tokens/s</div>
         </div>
         <div class="gauge">
-          <div class="gauge-value" id="llama-prompt-tokens-s">–</div>
-          <div class="gauge-label" id="llama-prompt-label">Prompt tokens/s</div>
+          <div class="gauge-value llm-prompt">–</div>
+          <div class="gauge-label llm-prompt-label">Prompt tokens/s</div>
         </div>
         <div class="gauge">
-          <div class="gauge-value" id="llama-busy">–</div>
+          <div class="gauge-value llm-busy">–</div>
           <div class="gauge-label">Requests (processing/deferred)</div>
         </div>
         <div class="gauge">
-          <div class="gauge-value" id="llama-context-max">–</div>
-          <div class="gauge-label">Context high-water (tokens)</div>
+          <div class="gauge-value llm-ctx">–</div>
+          <div class="gauge-label llm-ctx-label">Context high-water (tokens)</div>
         </div>
-        <div class="gauge" id="llama-spec-gauge" style="display:none;">
-          <div class="gauge-value" id="llama-spec-accept">–</div>
+        <div class="gauge llm-spec-gauge" style="display:none;">
+          <div class="gauge-value llm-spec">–</div>
           <div class="gauge-label">spec accept (lifetime)</div>
         </div>
       </div>
-      <!-- vLLM sub-lines (hidden for other backends) -->
-      <div id="vllm-details" style="display:none;margin-top:10px;font-size:0.85rem;color:#94a3b8;">
-        <span id="vllm-ttft">TTFT –</span>
-        <span id="vllm-itl"> · ITL –</span>
-        <span id="vllm-e2e"> · E2E –</span>
-        <span id="vllm-prefix-cache"> · prefix cache –</span>
-        <span id="vllm-kv-config"> · KV –</span>
+      <!-- per-backend sub-lines (hidden for other backends) -->
+      <div class="llm-vllm-details" style="display:none;margin-top:10px;font-size:0.85rem;color:#94a3b8;">
+        <span class="d-ttft">TTFT –</span><span class="d-itl"> · ITL –</span><span class="d-e2e"> · E2E –</span><span class="d-prefix"> · prefix cache –</span><span class="d-kv"> · KV –</span>
       </div>
-      <!-- LiteLLM sub-lines (hidden for other backends) -->
-      <div id="litellm-details" style="display:none;margin-top:10px;font-size:0.85rem;color:#94a3b8;">
-        <span id="litellm-ttft">TTFT –</span>
-        <span id="litellm-itl"> · ITL –</span>
-        <span id="litellm-e2e"> · E2E –</span>
-        <span id="litellm-api"> · API –</span>
-        <span id="litellm-prefix"> · prefix cache –</span>
-        <span id="litellm-failed"> · failed –</span>
+      <div class="llm-litellm-details" style="display:none;margin-top:10px;font-size:0.85rem;color:#94a3b8;">
+        <span class="d-ttft">TTFT –</span><span class="d-itl"> · ITL –</span><span class="d-e2e"> · E2E –</span><span class="d-api"> · API –</span><span class="d-prefix"> · prefix cache –</span><span class="d-failed"> · failed –</span>
       </div>
-      <div class="llama-slots" id="llama-slots-container">
-        <!-- Slot bars injected by JS -->
+      <div class="llm-strata-details" style="display:none;margin-top:10px;font-size:0.85rem;color:#94a3b8;">
+        <span class="d-ttft">TTFT –</span><span class="d-itl"> · ITL –</span><span class="d-e2e"> · E2E –</span><span class="d-reuse"> · KV reuse –</span><span class="d-engine"> · engine –</span>
       </div>
-      <div class="llama-slots-note" id="llama-slots-note" style="display:none;">no slot data (server started with --no-slots?)</div>
-      <div class="llama-slots-note" id="llama-peak-ctx" style="display:none;"></div>
-      <div class="chart-wrap" style="margin-top:16px;"><canvas id="llamaChart"></canvas></div>
+      <div class="llama-slots llm-slots"></div>
+      <div class="llama-slots-note llm-slots-note" style="display:none;">no slot data (server started with --no-slots?)</div>
+      <div class="llama-slots-note llm-peak-ctx" style="display:none;"></div>
+      <div class="chart-wrap" style="margin-top:16px;"><canvas class="llm-chart"></canvas></div>
+      <div class="llm-usage" style="display:none;margin-top:12px;">
+        <div class="gauge-label">LLM Usage (since server start)</div>
+        <div class="llama-usage-line llm-usage-line">–</div>
+      </div>
+      <div class="llm-proc" style="display:none;margin-top:8px;">
+        <div class="gauge-label">LLM Server Process</div>
+        <div class="llama-usage-line llm-proc-line">–</div>
+      </div>
     </div>
-  </div>
+  </template>
 
   <!-- System row -->
   <div class="grid" style="margin-top:16px;">
@@ -488,16 +492,8 @@
   </div>
 
   <!-- Extra cards at the bottom (after Memory Trend), in order:
-       LLM Usage → LLM Server Process → Swap → Host Health -->
+       Swap → Host Health  (LLM usage/process are per-card now) -->
   <div class="grid" id="bottom-cards" style="margin-top:16px;">
-    <div class="card" id="llama-usage-card" style="display:none;">
-      <h2>LLM Usage (since server start)</h2>
-      <div class="llama-usage-line" id="llama-usage-line">–</div>
-    </div>
-    <div class="card" id="llama-proc-card" style="display:none;">
-      <h2>LLM Server Process</h2>
-      <div class="llama-usage-line" id="llama-proc-line">–</div>
-    </div>
     <div class="card" id="swap-card" style="display:none;">
       <h2>Swap</h2>
       <div class="gauges">
@@ -526,8 +522,8 @@ const MAX_POINTS = 60;
 /* Multi-system consolidation (Fleet + per-system tabs)                */
 /* ------------------------------------------------------------------ */
 const sysState = {
-  selected: 'fleet',
-  // name -> {status, metrics, backend, backendChanged, hist}
+  selected: '{{ default_view or 'local' }}',
+  // name -> {status, metrics, llms: Map<llmName, {backend, hist}>}
   systems: new Map(),
 };
 
@@ -574,53 +570,116 @@ function updateTabs(systems) {
 /* Per-system state update + trend-buffer push (one SSE tick).
    Buffers grow on up + non-stale ticks; freeze on stale (entry status
    or inner LLM status — held values are not new data); gap on down
-   (labels advance, values null). A backend change resets the system's
-   history. */
+   (labels advance, values null). A backend change resets that TARGET's
+   history. Multi-LLM: each system carries per-LLM-name buffers (s.llms);
+   the fleet view consumes a tail-aligned summed series. */
 function updateSystemEntry(name, status, metrics) {
   let s = sysState.systems.get(name);
   if (!s) {
-    s = { status: null, metrics: null, backend: null,
-         backendChanged: false, hist: freshHist() };
+    s = { status: null, metrics: null, llms: new Map() };
     sysState.systems.set(name, s);
   }
   s.status = status;
   s.metrics = metrics;
-  const llm = metrics && metrics.llm;
-  if (llm) {
-    const backend = llm.backend || 'llama';
-    if (s.backend !== null && s.backend !== backend) {
-      s.hist = freshHist();
-      s.backendChanged = true;
+  if (!metrics) {
+    // System down past the hold: gap-tick every existing target buffer.
+    if (status === 'down') {
+      for (const t of s.llms.values()) gapTick(t.hist);
     }
-    s.backend = backend;
+    return;
   }
-  const h = s.hist;
-  if (status === 'down') {
-    // Gap tick: labels advance, values null (no new models added).
-    h.labels.push(nowLabel());
-    h.gen.push(null);
-    h.prompt.push(null);
-    for (const k of Object.keys(h.perModel)) h.perModel[k].push(null);
-  } else if (status === 'stale' || !llm || llm.status === 'stale') {
-    return; // freeze: held/missing values are not new data
-  } else {
-    h.labels.push(nowLabel());
-    h.gen.push(llm.gen_tokens_per_s ?? null);
-    h.prompt.push(llm.prompt_tokens_per_s ?? null);
-    const byModel = llm.gen_tokens_per_s_by_model;
-    if (byModel && Object.keys(byModel).length > 1) {
-      for (const model of Object.keys(byModel)) {
-        (h.perModel[model] = h.perModel[model] || [])
-          .push(byModel[model] ?? null);
+  if (metrics.llm_enabled === false) return; // no scraping: no buffers
+  const entries = normalizeLlms(metrics, name);
+  // Targets removed from the config drop their buffers (the payload is
+  // the truth only for new-shape payloads; the llm shim is synthetic).
+  if (Array.isArray(metrics.llms)) {
+    const keep = new Set(entries.map(e => e.name));
+    for (const k of [...s.llms.keys()]) {
+      if (!keep.has(k)) s.llms.delete(k);
+    }
+  }
+  for (const entry of entries) {
+    let t = s.llms.get(entry.name);
+    if (!t) {
+      t = { backend: null, hist: freshHist() };
+      s.llms.set(entry.name, t);
+    }
+    const backend = entry.backend || 'llama';
+    if (t.backend !== null && t.backend !== backend) t.hist = freshHist();
+    t.backend = backend;
+    const h = t.hist;
+    if (status === 'down') {
+      // Gap tick: labels advance, values null (no new models added).
+      gapTick(h);
+    } else if (status === 'stale' || entry.status === 'stale'
+               || entry.status === 'down') {
+      continue; // freeze: held/missing values are not new data
+                // (also skips the trim below, as the single-target build did)
+    } else {
+      h.labels.push(nowLabel());
+      h.gen.push(entry.gen_tokens_per_s ?? null);
+      h.prompt.push(entry.prompt_tokens_per_s ?? null);
+      const byModel = entry.gen_tokens_per_s_by_model;
+      if (byModel && Object.keys(byModel).length > 1) {
+        for (const model of Object.keys(byModel)) {
+          (h.perModel[model] = h.perModel[model] || [])
+            .push(byModel[model] ?? null);
+        }
       }
     }
+    if (h.labels.length > MAX_POINTS) {
+      h.labels.shift();
+      h.gen.shift();
+      h.prompt.shift();
+      for (const k of Object.keys(h.perModel)) h.perModel[k].shift();
+    }
   }
-  if (h.labels.length > MAX_POINTS) {
-    h.labels.shift();
-    h.gen.shift();
-    h.prompt.shift();
-    for (const k of Object.keys(h.perModel)) h.perModel[k].shift();
+}
+
+function gapTick(h) {
+  h.labels.push(nowLabel());
+  h.gen.push(null);
+  h.prompt.push(null);
+  for (const k of Object.keys(h.perModel)) h.perModel[k].push(null);
+}
+
+/* Normalize a system's metrics payload into a list of LLM entries.
+   New builds ship `llms[]`; version-skewed payloads carrying only `llm`
+   shim to one entry (backend defaults to llama). Single source of truth
+   for the version skew: fleet strip, charts and cards all go through
+   this. */
+function normalizeLlms(metrics, systemName) {
+  if (Array.isArray(metrics && metrics.llms)) {
+    return metrics.llms.map(e => ({ ...e, backend: e.backend || 'llama' }));
   }
+  const llm = metrics && metrics.llm;
+  const e = llm ? { ...llm } : { status: 'down' };
+  return [{ ...e,
+            name: systemName || 'primary',
+            backend: e.backend || 'llama' }];
+}
+
+/* Sum of a system's per-target series, tail-aligned (frozen buffers lag
+   in length exactly like cross-system buffers do in syncFleetChart). */
+function systemSumSeries(s, key) {
+  const arrs = [...s.llms.values()].map(t => t.hist[key]);
+  const maxLen = Math.max(0, ...arrs.map(a => a.length));
+  const out = new Array(maxLen).fill(null);
+  for (const a of arrs) {
+    const off = maxLen - a.length;
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] != null) out[off + i] = (out[off + i] ?? 0) + a[i];
+    }
+  }
+  return out;
+}
+
+function systemLabels(s) {
+  let best = [];
+  for (const t of s.llms.values()) {
+    if (t.hist.labels.length > best.length) best = t.hist.labels;
+  }
+  return best;
 }
 
 /* Fleet summary strip: one row per system
@@ -636,17 +695,29 @@ function updateFleetStrip(systems) {
   strip.appendChild(head);
   for (const s of systems) {
     const mm = s.metrics || {};
-    const utils = (mm.gpus || []).map(g => g.utilization_pct)
-      .filter(v => v != null);
-    const gpuVal = utils.length ? Math.max(...utils) : null;
+    // GPU column: one percentage per GPU card, in GPU-index order,
+    // comma-separated (unreported cards show '–'; no GPUs '–').
+    const gpus = mm.gpus || [];
+    const gpuVal = gpus.length
+      ? gpus.map(g => g.utilization_pct != null
+          ? `${g.utilization_pct}%` : '–').join(',')
+      : null;
     const row = document.createElement('div');
     row.className = 'fleet-row';
+    // Gen tok/s: sum over this system's LLM targets that are up OR stale
+    // (stale entries carry held values — matching the single-target build,
+    // which displayed the held mm.llm value).
+    const gens = normalizeLlms(mm, s.name)
+      .filter(e => e.status === 'up' || e.status === 'stale')
+      .map(e => e.gen_tokens_per_s).filter(v => v != null);
+    const genVal = gens.length
+      ? Math.round(gens.reduce((a, b) => a + b, 0) * 10) / 10 : null;
     row.innerHTML =
       `<span class="fleet-name"><span class="dot ${dotClass(s.status)}"></span>${s.name}</span>` +
       `<span class="fleet-val">${mm.cpu != null ? `${mm.cpu}%` : '–'}</span>` +
       `<span class="fleet-val">${mm.memory && mm.memory.percent != null ? `${mm.memory.percent}%` : '–'}</span>` +
-      `<span class="fleet-val">${gpuVal != null ? `${gpuVal}%` : '–'}</span>` +
-      `<span class="fleet-val">${mm.llm && mm.llm.gen_tokens_per_s != null ? mm.llm.gen_tokens_per_s : '–'}</span>`;
+      `<span class="fleet-val">${gpuVal != null ? gpuVal : '–'}</span>` +
+      `<span class="fleet-val">${genVal != null ? genVal : '–'}</span>`;
     strip.appendChild(row);
   }
 }
@@ -684,15 +755,16 @@ function syncFleetChart() {
   const series = {};
   let maxLen = 0;
   for (const n of names) {
-    const gen = sysState.systems.get(n).hist.gen;
+    // One line per SYSTEM: the tail-aligned sum over its LLM targets.
+    const gen = systemSumSeries(sysState.systems.get(n), 'gen');
     series[n] = gen;
     if (gen.length > maxLen) maxLen = gen.length;
   }
   const capped = Math.min(maxLen, MAX_POINTS);
   let labels = [];
   for (const n of names) {
-    const h = sysState.systems.get(n).hist;
-    if (maxLen > 0 && h.labels.length === maxLen) { labels = h.labels; break; }
+    const lab = systemLabels(sysState.systems.get(n));
+    if (maxLen > 0 && lab.length === maxLen) { labels = lab; break; }
   }
   chart.data.labels = labels.length ? labels.slice(-capped) : [];
   const total = new Array(capped).fill(null);
@@ -738,53 +810,10 @@ function syncFleetChart() {
   chart.update('none');
 }
 
-/* Restore the LLM trend chart from a per-system history buffer
-   (tab switch / backend-switch reset). Per-model arrays are
-   tail-aligned with leading nulls. */
-function restoreLlamaChart(hist) {
-  const chart = ensureLlamaChart();
-  chart.data.labels = hist.labels.slice();
-  chart.data.datasets = chart.data.datasets.filter(ds => !ds._perModel);
-  chart.data.datasets[0].data = hist.gen.slice();
-  const models = hist.perModel && Object.keys(hist.perModel).length > 1
-    ? Object.keys(hist.perModel).sort() : [];
-  models.forEach((model, mi) => {
-    const arr = hist.perModel[model];
-    const pad = chart.data.labels.length - arr.length;
-    chart.data.datasets.push({
-      label: model,
-      data: (pad > 0 ? new Array(pad).fill(null) : []).concat(arr.slice()),
-      borderColor: MODEL_LINE_COLORS[mi % MODEL_LINE_COLORS.length],
-      borderWidth: 1.5,
-      pointRadius: 0,
-      tension: 0.35,
-      fill: false,
-      order: -1, // draw over the total area
-      _perModel: true,
-    });
-  });
-  chart.options.plugins.legend = {
-    display: models.length > 0,
-    position: 'bottom',
-    labels: { color: '#94a3b8', boxWidth: 12, font: { size: 10 } },
-  };
-  chart.update('none');
-}
-
-/* Push one LLM trend tick to the chart (selected system only).
-   Skipped while stale: values are held, not new data. */
-function pushLlamaChartTick(llm) {
-  if (!llm || llm.status === 'stale') return;
-  const chart = ensureLlamaChart();
-  chart.data.labels.push(nowLabel());
-  chart.data.datasets[0].data.push(llm.gen_tokens_per_s ?? null);
-  syncLlamaModelDatasets(chart, llm.gen_tokens_per_s_by_model);
-  if (chart.data.labels.length > MAX_POINTS) {
-    chart.data.labels.shift();
-    chart.data.datasets.forEach(ds => ds.data.shift());
-  }
-  chart.update('none');
-}
+/* Restore-style chart refresh lives on the LLMCard object (the per-target
+   buffers in sysState are the source of truth; cards mirror them every
+   render, so tab switches and backend-switch resets need no dedicated
+   restore/push path). */
 
 /* CPU/mem/GPU trend charts reset on tab switch (v1 behavior; per-system
    buffers for those are a v2 candidate). GPU cards are rebuilt on the
@@ -802,17 +831,37 @@ function resetDetailCharts() {
   for (const k of Object.keys(gpuCharts)) delete gpuCharts[k];
 }
 
-/* Tab switch: Fleet <-> per-system. Restores the selected system's
-   buffers (never a reset) and re-renders all cards from its retained
-   metrics. */
-function selectSystem(name) {
-  if (name === sysState.selected) return;
-  sysState.selected = name;
-  const isFleet = name === 'fleet';
+/* Apply the selected view to the layout. Idempotent: run at load (the
+   markup default must not decide — sysState.selected comes from
+   default_view) and on every tab click, including clicks on the tab
+   that already looks selected. Also reveals/hides the LLM card
+   container from the current metrics (--no-llama). */
+function applySelectedView() {
+  const isFleet = sysState.selected === 'fleet';
   document.getElementById('fleet-section').style.display =
     isFleet ? '' : 'none';
   document.getElementById('detail-sections').style.display =
     isFleet ? 'none' : '';
+  const s = sysState.systems.get(sysState.selected);
+  const container = document.getElementById('llm-cards-container');
+  if (container) container.style.display =
+    s && s.metrics && s.metrics.llm_enabled === false ? 'none' : '';
+}
+applySelectedView();
+
+/* Tab switch: Fleet <-> per-system. Restores the selected system's
+   buffers (never a reset) and re-renders all cards from its retained
+   metrics. */
+function selectSystem(name) {
+  if (name === sysState.selected) {
+    // Re-click of the current tab: layout must still match the state
+    // (fresh loads and default_view changes must never desync).
+    applySelectedView();
+    return;
+  }
+  sysState.selected = name;
+  applySelectedView();
+  const isFleet = name === 'fleet';
   if (isFleet) {
     const systems = [...sysState.systems.keys()].map(k => ({
       name: k, status: sysState.systems.get(k).status,
@@ -825,17 +874,11 @@ function selectSystem(name) {
   }
   const s = sysState.systems.get(name);
   resetDetailCharts();
-  restoreLlamaChart(s ? s.hist : freshHist());
   if (s && s.metrics) {
     const sm = s.metrics;
     updateSystem(sm);
     updateGPUs(sm.gpus || []);
-    const llamaSec = document.getElementById('llama-section');
-    if (llamaSec) llamaSec.style.display =
-      sm.llm_enabled === false ? 'none' : '';
-    updateLLMCard(sm.llm);
-    updateLLMUsage(sm);
-    updateLLMProcess(sm);
+    renderLLMCards();
     updateSwap(sm);
     updateHostHealth(sm);
   }
@@ -1061,24 +1104,14 @@ source.onmessage = (e) => {
     syncFleetChart();
   } else {
     const s = sysState.systems.get(sysState.selected);
-    if (s && s.backendChanged) {
-      // Backend switched for this system: its buffer was reset; align
-      // the chart with it (a restore of the fresh buffer = a clear).
-      s.backendChanged = false;
-      restoreLlamaChart(s.hist);
-    }
     if (s && s.metrics) {
       const sm = s.metrics;
       updateSystem(sm);
       updateGPUs(sm.gpus || []);
-      /* --no-llama: hide the section. Absent key = enabled. */
-      const llamaSec = document.getElementById('llama-section');
-      if (llamaSec) llamaSec.style.display =
-        sm.llm_enabled === false ? 'none' : '';
-      updateLLMCard(sm.llm);
-      pushLlamaChartTick(sm.llm);
-      updateLLMUsage(sm);
-      updateLLMProcess(sm);
+      // Card reconcile + gauge/chart refresh from the per-target buffers
+      // (backend-switch resets are visible in the buffers already —
+      // updateSystemEntry applied them before this call).
+      renderLLMCards();
       updateSwap(sm);
       updateHostHealth(sm);
     }
@@ -1273,72 +1306,80 @@ function updateGPUs(gpus) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Local LLM (llama.cpp) card                                          */
+/* Multi-LLM cards (one card per LLM target, template-cloned)           */
 /* ------------------------------------------------------------------ */
-let llamaChart = null;
 
 /* Compact token count: 999 -> "999", 16374 -> "16.4k" */
 function fmtTok(n) { return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`; }
-
-function ensureLlamaChart() {
-  if (llamaChart) return llamaChart;
-  const ctx = document.getElementById('llamaChart').getContext('2d');
-  llamaChart = new Chart(ctx, {
-    type: 'line',
-    data: {
-      labels: [],
-      datasets: [{
-        label: 'Gen tokens/s',
-        data: [],
-        borderColor: '#22d3ee',
-        borderWidth: 2,
-        pointRadius: 0,
-        tension: 0.35,
-        fill: { target: 'origin', above: hexToRgba('#22d3ee', 0.15) },
-      }],
-    },
-    options: {
-      ...chartDefaults,
-      scales: {
-        ...chartDefaults.scales,
-        y: {
-          ...chartDefaults.scales.y,
-          max: null, // tokens/s is unbounded – autoscale
-          title: { display: true, text: 'tokens/s', color: '#22d3ee', font: { size: 11 } },
-        },
-      },
-    },
-  });
-  return llamaChart;
-}
 
 /* Per-model line colors (stable: color = position in sorted model list) */
 const MODEL_LINE_COLORS = ['#a78bfa', '#f472b6', '#fbbf24', '#34d399',
   '#fb7185', '#60a5fa', '#4ade80', '#facc15'];
 
-/* Add/remove per-model line datasets on the shared LLM chart.
-   byModel: {model: gen tokens/s} from the LiteLLM payload. Per-model
-   lines are shown only when 2+ models are present (single-model keeps
-   the plain area). Datasets are tagged _perModel so the backend-switch
-   reset can clear them. order: -1 draws the lines over the total area. */
-function syncLlamaModelDatasets(chart, byModel) {
-  const models = (byModel && Object.keys(byModel).length > 1)
-    ? Object.keys(byModel).sort() : [];
+/* One LLM card: template clone with scoped lookups and its own Chart.js
+   instance. The per-target history buffer (sysState) is the source of
+   truth for the chart — update() mirrors it, so tab switches, backend-
+   switch resets and stale freezes need no dedicated chart path. Cards
+   are destroyed (chart FIRST — constructing a Chart on a canvas that
+   still owns one throws, and a throw inside the SSE tick would kill the
+   whole handler) when their target or system goes away. */
+class LLMCard {
+  constructor(container) {
+    this.root = document.getElementById('llm-card-template')
+      .content.firstElementChild.cloneNode(true);
+    this.q = sel => this.root.querySelector(sel);
+    this.slotEls = new Map();
+    container.appendChild(this.root); // in the DOM BEFORE chart construction
+    this.chart = new Chart(this.q('.llm-chart'), {
+      type: 'line',
+      data: {
+        labels: [],
+        datasets: [{
+          label: 'Gen tokens/s',
+          data: [],
+          borderColor: '#22d3ee',
+          borderWidth: 2,
+          pointRadius: 0,
+          tension: 0.35,
+          fill: { target: 'origin', above: hexToRgba('#22d3ee', 0.15) },
+        }],
+      },
+      options: {
+        ...chartDefaults,
+        scales: {
+          ...chartDefaults.scales,
+          y: {
+            ...chartDefaults.scales.y,
+            max: null, // tokens/s is unbounded – autoscale
+            title: { display: true, text: 'tokens/s', color: '#22d3ee', font: { size: 11 } },
+          },
+        },
+      },
+    });
+  }
 
-  // Remove per-model datasets for models no longer present
-  const stale = [];
-  chart.data.datasets.forEach((ds, i) => {
-    if (ds._perModel && !models.includes(ds.label)) stale.push(i);
-  });
-  for (const i of stale.reverse()) chart.data.datasets.splice(i, 1);
+  destroy() {
+    this.chart.destroy();
+    this.root.remove();
+  }
 
-  // Add missing per-model datasets (backfilled with nulls)
-  models.forEach((model, mi) => {
-    let ds = chart.data.datasets.find(d => d._perModel && d.label === model);
-    if (!ds) {
-      ds = {
+  /* Mirror the per-target history buffer into the chart (labels + total
+     area + per-model lines tail-aligned with leading nulls). */
+  setSeries(hist) {
+    const h = hist || { labels: [], gen: [], prompt: [], perModel: {} };
+    const chart = this.chart;
+    chart.data.labels = h.labels.slice(-MAX_POINTS);
+    chart.data.datasets = chart.data.datasets.filter(ds => !ds._perModel);
+    chart.data.datasets[0].data = h.gen.slice(-chart.data.labels.length);
+    const models = h.perModel && Object.keys(h.perModel).length > 1
+      ? Object.keys(h.perModel).sort() : [];
+    const nLabels = chart.data.labels.length;
+    models.forEach((model, mi) => {
+      const arr = h.perModel[model].slice(-nLabels);
+      const pad = nLabels - arr.length;
+      chart.data.datasets.push({
         label: model,
-        data: new Array(chart.data.labels.length).fill(null),
+        data: (pad > 0 ? new Array(pad).fill(null) : []).concat(arr),
         borderColor: MODEL_LINE_COLORS[mi % MODEL_LINE_COLORS.length],
         borderWidth: 1.5,
         pointRadius: 0,
@@ -1346,268 +1387,385 @@ function syncLlamaModelDatasets(chart, byModel) {
         fill: false,
         order: -1, // draw over the total area
         _perModel: true,
-      };
-      chart.data.datasets.push(ds);
+      });
+    });
+    chart.options.plugins.legend = {
+      display: models.length > 0,
+      position: 'bottom',
+      labels: { color: '#94a3b8', boxWidth: 12, font: { size: 10 } },
+    };
+    chart.update('none');
+  }
+
+  /* Gauges, badges, sub-lines, slots, usage + process for one entry.
+     Logic ported 1:1 from the single-card build; all lookups scoped to
+     this card's DOM. displayName: shown when the system has more than
+     one target (or the target is explicitly named != "primary"). */
+  update(m, displayName, tstate) {
+    if (!m || m.status === 'down') {
+      // Unreachable: gauges + chart keep their last state (as in the
+      // single-card build); the badge carries the down signal.
+      const statusEl = this.q('.llm-status');
+      statusEl.textContent = 'unreachable';
+      statusEl.className = 'llm-status badge down';
+      statusEl.removeAttribute('title');
+      const modelEl = this.q('.llm-model');
+      modelEl.textContent = '–';
+      modelEl.removeAttribute('title');
+      this.q('.llm-name').style.display = 'none';
+      this.q('.llm-backend').textContent = '';
+      this.q('.llm-stalled').style.display = 'none';
+      this.q('.llm-build').style.display = 'none';
+      this.q('.llm-slots-free').style.display = 'none';
+      this.q('.llm-peak-ctx').style.display = 'none';
+      this.q('.llm-spec-gauge').style.display = 'none';
+      this.q('.llm-vllm-details').style.display = 'none';
+      this.q('.llm-litellm-details').style.display = 'none';
+      this.q('.llm-strata-details').style.display = 'none';
+      this.q('.llm-usage').style.display = 'none';
+      this.q('.llm-proc').style.display = 'none';
+      this.updateSlots([]);
+      this.q('.llm-slots-note').style.display = 'none';
+      this.setSeries(tstate && tstate.hist);
+      return;
+    }
+
+    const nameEl = this.q('.llm-name');
+    if (displayName) {
+      nameEl.textContent = `· ${displayName}`;
+      nameEl.style.display = '';
     } else {
-      ds.borderColor = MODEL_LINE_COLORS[mi % MODEL_LINE_COLORS.length];
-    }
-  });
-
-  // Push this tick's value into every per-model dataset
-  for (const ds of chart.data.datasets) {
-    if (ds._perModel) ds.data.push(byModel[ds.label] ?? null);
-  }
-
-  // Legend only while per-model lines are visible
-  chart.options.plugins.legend = {
-    display: models.length > 0,
-    position: 'bottom',
-    labels: { color: '#94a3b8', boxWidth: 12, font: { size: 10 } },
-  };
-}
-
-function updateLlamaSlots(slots) {
-  const container = document.getElementById('llama-slots-container');
-  const seen = new Set();
-
-  for (const slot of slots) {
-    const id = slot.id != null ? slot.id : 0;
-    seen.add(String(id));
-
-    let el = document.getElementById(`llama-slot-${id}`);
-    if (!el) {
-      el = document.createElement('div');
-      el.id = `llama-slot-${id}`;
-      el.innerHTML = `
-        <div class="llama-slot-head">
-          <span class="llama-slot-label">Slot ${id}</span>
-          <span class="llama-slot-capt">–</span>
-        </div>
-        <div class="llama-slot-bar"><div class="llama-slot-fill"></div></div>`;
-      container.appendChild(el);
+      nameEl.style.display = 'none';
     }
 
-    const pct = slot.context_pct != null ? slot.context_pct : 0;
-    const fill = el.querySelector('.llama-slot-fill');
-    fill.style.width = `${pct}%`;
-    fill.style.background = colorFor(pct);
+    const backend = m.backend || 'llama';
+    this.q('.llm-backend').textContent = backend === 'vllm' ? '· vLLM'
+      : backend === 'litellm' ? '· LiteLLM'
+      : backend === 'strata' ? '· Strata' : '· llama.cpp';
 
-    let capt = `${slot.context_used != null ? slot.context_used : 0} / ${slot.n_ctx != null ? slot.n_ctx : 0}`;
-    if (slot.remain != null) {
-      // Active: this task's progress — decoded so far, tokens left to go
-      capt += ` · ${fmtTok(slot.decoded ?? 0)} tok · ${fmtTok(slot.remain)} left`;
-    } else if (!slot.is_processing && (slot.prompt_total ?? 0) > 0) {
-      // Idle but still holding KV-cache context from a finished task
-      capt += ` · idle · holding ${fmtTok(slot.prompt_total)} tok`;
+    this.q('.llm-vllm-details').style.display = backend === 'vllm' ? '' : 'none';
+    this.q('.llm-litellm-details').style.display = backend === 'litellm' ? '' : 'none';
+    this.q('.llm-strata-details').style.display = backend === 'strata' ? '' : 'none';
+
+    /* Status ("stale" = last data held after a failed scrape;
+       "loading" = /health answered 503, model still loading — llama only) */
+    const statusEl = this.q('.llm-status');
+    if (m.status === 'loading') {
+      statusEl.textContent = 'loading model';
+      statusEl.className = 'llm-status badge warn';
+      if (m.health_detail) statusEl.title = m.health_detail;
+      else statusEl.removeAttribute('title');
+    } else if (m.status === 'stale') {
+      statusEl.textContent = 'stale';
+      statusEl.className = 'llm-status badge warn';
+      statusEl.removeAttribute('title');
+    } else if (m.sleeping) {
+      statusEl.textContent = 'sleeping';
+      statusEl.className = 'llm-status badge warn';
+      statusEl.removeAttribute('title');
+    } else {
+      statusEl.textContent = 'up';
+      statusEl.className = 'llm-status badge ok';
+      statusEl.removeAttribute('title');
     }
-    el.querySelector('.llama-slot-capt').textContent = capt;
+    const modelEl = this.q('.llm-model');
+    modelEl.textContent = m.model != null ? m.model : '–';
+    if (m.model_path) modelEl.title = m.model_path;
+    else modelEl.removeAttribute('title');
 
-    const label = el.querySelector('.llama-slot-label');
-    label.textContent = `Slot ${id}${slot.is_processing ? ' ●' : ''}`;
-    label.classList.toggle('llama-slot-processing', !!slot.is_processing);
-  }
+    /* Build info (llama only) */
+    const buildEl = this.q('.llm-build');
+    if (backend === 'llama' && m.build_info) {
+      buildEl.textContent = `build ${m.build_info}`;
+      buildEl.style.display = '';
+    } else {
+      buildEl.style.display = 'none';
+    }
 
-  // Remove slot elements that disappeared (e.g. server restarted)
-  for (const child of [...container.children]) {
-    if (!seen.has(child.id.replace('llama-slot-', ''))) child.remove();
-  }
+    /* Decode-stall flag (llama only) */
+    this.q('.llm-stalled').style.display =
+      backend === 'llama' && m.stalled === true ? '' : 'none';
 
-  document.getElementById('llama-slots-note').style.display =
-    slots.length === 0 ? '' : 'none';
-}
+    /* Gauges (older builds may omit keys – show '–') */
+    const genEl = this.q('.llm-gen');
+    const promptEl = this.q('.llm-prompt');
+    const busyEl = this.q('.llm-busy');
+    const ctxEl = this.q('.llm-ctx');
+    const ctxLabelEl = ctxEl.parentElement.querySelector('.gauge-label');
 
-/* LLM card gauges only. Trend-chart handling is per-system
-   (sysState + restoreLlamaChart / pushLlamaChartTick). */
-function updateLLMCard(m) {
-  const statusEl = document.getElementById('llama-status');
-  const modelEl = document.getElementById('llama-model');
-  const backendLabel = document.getElementById('llm-backend-label');
+    genEl.textContent = m.gen_tokens_per_s != null ? m.gen_tokens_per_s : '–';
+    promptEl.textContent = m.prompt_tokens_per_s != null ? m.prompt_tokens_per_s : '–';
+    if (backend === 'llama') {
+      // The prompt rate counts cached + uncached tokens (server/CLI
+      // accounting); the label shows the last prompt's size and cache share.
+      this.q('.llm-prompt-label').textContent = m.prompt_last
+        ? `Prompt tokens/s (last 5 reqs) · last ${fmtTok(m.prompt_last.total)} tok · ${m.prompt_last.pct_cached}% cached`
+        : `Prompt tokens/s (last 5 reqs) · cached ${m.prompt_cached_tokens_per_s != null ? m.prompt_cached_tokens_per_s : '–'}`;
+      busyEl.textContent = `${m.requests_processing ?? 0}/${m.requests_deferred ?? 0}`;
+      ctxEl.textContent = m.context_tokens_max != null ? m.context_tokens_max : '–';
+      ctxEl.style.color = '';
+      ctxLabelEl.textContent = 'Context high-water (tokens)';
+    } else if (backend === 'vllm') {
+      this.q('.llm-prompt-label').textContent = 'Prompt tokens/s (last 5 reqs)';
+      busyEl.textContent = `${m.requests_processing ?? 0}/${m.requests_waiting ?? 0}`;
+      const kvPct = m.kv_cache_usage_pct;
+      ctxEl.textContent = kvPct != null ? `${kvPct}%` : '–';
+      ctxEl.style.color = kvPct != null ? colorFor(kvPct) : '';
+      ctxLabelEl.textContent = 'KV cache %';
+    } else if (backend === 'strata') {
+      // Strata: busy = batch slots running / queued+waiting; KV prefix
+      // reuse % replaces context high-water. The prompt gauge is the
+      // last-5-requests prefill aggregate (Σ fresh tokens / Σ read
+      // time, vLLM-style).
+      this.q('.llm-prompt-label').textContent = 'Prompt tokens/s (last 5 reqs)';
+      busyEl.textContent = `${m.requests_processing ?? 0}/${m.requests_waiting ?? 0}`;
+      const reusePct = m.prefix_cache_hit_pct;
+      ctxEl.textContent = reusePct != null ? `${reusePct}%` : '–';
+      ctxEl.style.color = reusePct != null ? colorFor(reusePct) : '';
+      ctxLabelEl.textContent = 'KV reuse %';
+    } else {
+      // LiteLLM: provider-side prompt-cache % replaces context high-water
+      this.q('.llm-prompt-label').textContent = 'Prompt tokens/s';
+      busyEl.textContent = `${m.requests_processing ?? 0} in flight`;
+      const pcPct = m.prefix_cache_hit_pct;
+      ctxEl.textContent = pcPct != null ? `${pcPct}%` : '–';
+      ctxEl.style.color = '';
+      ctxEl.title = pcPct != null ? '' :
+          'No cached-token reports from the provider (prompt caching not in use)';
+      ctxLabelEl.textContent = 'Prompt cache % (provider)';
+    }
 
-  if (m == null) {
-    statusEl.textContent = 'unreachable';
-    statusEl.className = 'badge down';
-    statusEl.removeAttribute('title');
-    modelEl.textContent = '–';
-    modelEl.removeAttribute('title');
-    backendLabel.textContent = '';
-    document.getElementById('llama-stalled').style.display = 'none';
-    document.getElementById('llama-build').style.display = 'none';
-    document.getElementById('llama-slots-free').style.display = 'none';
-    document.getElementById('llama-peak-ctx').style.display = 'none';
-    document.getElementById('llama-spec-gauge').style.display = 'none';
-    document.getElementById('vllm-details').style.display = 'none';
-    document.getElementById('litellm-details').style.display = 'none';
-    updateLlamaSlots([]);
-    return; // keep gauges / chart history as-is
-  }
+    /* Spec-decode accept rate (lifetime); hidden when spec decode is off */
+    if (m.spec_accept_pct != null) {
+      this.q('.llm-spec').textContent = `${m.spec_accept_pct}%`;
+      this.q('.llm-spec-gauge').style.display = '';
+    } else {
+      this.q('.llm-spec-gauge').style.display = 'none';
+    }
 
-  /* Backend subtitle (per-system tracking lives in sysState) */
-  const backend = m.backend || 'llama';
-  backendLabel.textContent = backend === 'vllm' ? '· vLLM'
-    : backend === 'litellm' ? '· LiteLLM' : '· llama.cpp';
-
-  /* vLLM details block visibility */
-  document.getElementById('vllm-details').style.display = backend === 'vllm' ? '' : 'none';
-
-  /* Status + model ("stale" = last data held after a failed scrape;
-     "loading" = /health answered 503, model still loading — llama only) */
-  if (m.status === 'loading') {
-    statusEl.textContent = 'loading model';
-    statusEl.className = 'badge warn';
-    if (m.health_detail) statusEl.title = m.health_detail;
-    else statusEl.removeAttribute('title');
-  } else if (m.status === 'stale') {
-    statusEl.textContent = 'stale';
-    statusEl.className = 'badge warn';
-    statusEl.removeAttribute('title');
-  } else if (m.sleeping) {
-    statusEl.textContent = 'sleeping';
-    statusEl.className = 'badge warn';
-    statusEl.removeAttribute('title');
-  } else {
-    statusEl.textContent = 'up';
-    statusEl.className = 'badge ok';
-    statusEl.removeAttribute('title');
-  }
-  modelEl.textContent = m.model != null ? m.model : '–';
-  if (m.model_path) modelEl.title = m.model_path;
-  else modelEl.removeAttribute('title');
-
-  /* Build info (llama only; hidden for vLLM) */
-  const buildEl = document.getElementById('llama-build');
-  if (backend === 'llama' && m.build_info) {
-    buildEl.textContent = `build ${m.build_info}`;
-    buildEl.style.display = '';
-  } else {
-    buildEl.style.display = 'none';
-  }
-
-  /* Decode-stall flag (llama only) */
-  document.getElementById('llama-stalled').style.display =
-    backend === 'llama' && m.stalled === true ? '' : 'none';
-
-  /* Gauges (older builds may omit keys – show '–') */
-  const genEl = document.getElementById('llama-gen-tokens-s');
-  const promptEl = document.getElementById('llama-prompt-tokens-s');
-  const busyEl = document.getElementById('llama-busy');
-  const ctxEl = document.getElementById('llama-context-max');
-
-  genEl.textContent = m.gen_tokens_per_s != null ? m.gen_tokens_per_s : '–';
-  promptEl.textContent = m.prompt_tokens_per_s != null ? m.prompt_tokens_per_s : '–';
-  const ctxLabelEl = ctxEl.parentElement.querySelector('.gauge-label');
-  if (backend === 'llama') {
-    // The prompt rate counts cached + uncached tokens (server/CLI
-    // accounting); the label shows the last prompt's size and cache share.
-    document.getElementById('llama-prompt-label').textContent = m.prompt_last
-      ? `Prompt tokens/s (last 5 reqs) · last ${fmtTok(m.prompt_last.total)} tok · ${m.prompt_last.pct_cached}% cached`
-      : `Prompt tokens/s (last 5 reqs) · cached ${m.prompt_cached_tokens_per_s != null ? m.prompt_cached_tokens_per_s : '–'}`;
-    busyEl.textContent = `${m.requests_processing ?? 0}/${m.requests_deferred ?? 0}`;
-    ctxEl.textContent = m.context_tokens_max != null ? m.context_tokens_max : '–';
-    ctxEl.style.color = '';
-    ctxLabelEl.textContent = 'Context high-water (tokens)';
-  } else if (backend === 'vllm') {
-    // vLLM: KV cache % replaces context high-water
-    document.getElementById('llama-prompt-label').textContent = 'Prompt tokens/s (last 5 reqs)';
-    busyEl.textContent = `${m.requests_processing ?? 0}/${m.requests_waiting ?? 0}`;
-    const kvPct = m.kv_cache_usage_pct;
-    ctxEl.textContent = kvPct != null ? `${kvPct}%` : '–';
-    ctxEl.style.color = kvPct != null ? colorFor(kvPct) : '';
-    ctxLabelEl.textContent = 'KV cache %';
-  } else {
-    // LiteLLM: provider-side prompt-cache % replaces context high-water
-    document.getElementById('llama-prompt-label').textContent = 'Prompt tokens/s';
-    busyEl.textContent = `${m.requests_processing ?? 0} in flight`;
-    const pcPct = m.prefix_cache_hit_pct;
-    ctxEl.textContent = pcPct != null ? `${pcPct}%` : '–';
-    ctxEl.style.color = '';
-    ctxEl.title = pcPct != null ? '' :
-        'No cached-token reports from the provider (prompt caching not in use)';
-    ctxLabelEl.textContent = 'Prompt cache % (provider)';
-  }
-
-  /* Spec-decode accept rate (lifetime); hidden when spec decode is off */
-  const specGaugeEl = document.getElementById('llama-spec-gauge');
-  if (m.spec_accept_pct != null) {
-    document.getElementById('llama-spec-accept').textContent = `${m.spec_accept_pct}%`;
-    specGaugeEl.style.display = '';
-  } else {
-    specGaugeEl.style.display = 'none';
-  }
-
-  /* Free slots + peak context (llama only) */
-  const freeEl = document.getElementById('llama-slots-free');
-  if (backend === 'llama' && m.free_slots != null && m.total_slots != null) {
-    freeEl.textContent = `${m.free_slots}/${m.total_slots} slots free`;
-    freeEl.style.display = '';
-  } else {
-    freeEl.style.display = 'none';
-  }
-  const peakEl = document.getElementById('llama-peak-ctx');
-  if (backend === 'llama') {
-    const nCtx = (Array.isArray(m.slots) ? m.slots : [])
-      .map(s => s.n_ctx).find(v => v != null && v > 0);
-    if (m.context_tokens_max != null && nCtx) {
-      peakEl.textContent = `peak ctx ${fmtTok(m.context_tokens_max)} / ${fmtTok(nCtx)} (${Math.round(100 * m.context_tokens_max / nCtx)}%)`;
-      peakEl.style.display = '';
+    /* Free slots + peak context (llama) */
+    const freeEl = this.q('.llm-slots-free');
+    if ((backend === 'llama' || backend === 'strata') && m.free_slots != null && m.total_slots != null) {
+      freeEl.textContent = `${m.free_slots}/${m.total_slots} slots free`;
+      freeEl.style.display = '';
+    } else {
+      freeEl.style.display = 'none';
+    }
+    const peakEl = this.q('.llm-peak-ctx');
+    if (backend === 'llama') {
+      const nCtx = (Array.isArray(m.slots) ? m.slots : [])
+        .map(s => s.n_ctx).find(v => v != null && v > 0);
+      if (m.context_tokens_max != null && nCtx) {
+        peakEl.textContent = `peak ctx ${fmtTok(m.context_tokens_max)} / ${fmtTok(nCtx)} (${Math.round(100 * m.context_tokens_max / nCtx)}%)`;
+        peakEl.style.display = '';
+      } else {
+        peakEl.style.display = 'none';
+      }
     } else {
       peakEl.style.display = 'none';
     }
-  } else {
-    peakEl.style.display = 'none';
-  }
 
-  /* Per-slot context usage (llama only) */
-  updateLlamaSlots(backend === 'llama' && Array.isArray(m.slots) ? m.slots : []);
+    /* Per-slot context usage (llama + Strata batch slots) */
+    this.updateSlots((backend === 'llama' || backend === 'strata') && Array.isArray(m.slots) ? m.slots : []);
 
-  /* vLLM / LiteLLM have no slots: keep the llama-specific note hidden
-     (updateLlamaSlots([]) would otherwise reveal it). */
-  if (backend !== 'llama') {
-    document.getElementById('llama-slots-note').style.display = 'none';
-  }
+    /* vLLM / LiteLLM have no slots: keep the llama-specific note hidden
+       (updateSlots([]) would otherwise reveal it). */
+    if (backend !== 'llama' && backend !== 'strata') {
+      this.q('.llm-slots-note').style.display = 'none';
+    }
 
-  /* vLLM sub-lines */
-  if (backend === 'vllm') {
-    const ttftEl = document.getElementById('vllm-ttft');
-    const itlEl = document.getElementById('vllm-itl');
-    const e2eEl = document.getElementById('vllm-e2e');
-    const pcEl = document.getElementById('vllm-prefix-cache');
-    const kvEl = document.getElementById('vllm-kv-config');
-    ttftEl.textContent = m.ttft_seconds != null ? `TTFT ${m.ttft_seconds}s` : 'TTFT –';
-    itlEl.textContent = m.itl_ms != null ? ` · ITL ${m.itl_ms}ms` : ' · ITL –';
-    e2eEl.textContent = m.e2e_latency_seconds != null ? ` · E2E ${m.e2e_latency_seconds}s` : ' · E2E –';
-    pcEl.textContent = m.prefix_cache_hit_pct != null ? ` · prefix ${m.prefix_cache_hit_pct}%` : '';
-    if (m.config) {
-      const c = m.config;
+    /* vLLM sub-lines */
+    if (backend === 'vllm') {
+      const d = this.q('.llm-vllm-details');
+      d.querySelector('.d-ttft').textContent = m.ttft_seconds != null ? `TTFT ${m.ttft_seconds}s` : 'TTFT –';
+      d.querySelector('.d-itl').textContent = m.itl_ms != null ? ` · ITL ${m.itl_ms}ms` : ' · ITL –';
+      d.querySelector('.d-e2e').textContent = m.e2e_latency_seconds != null ? ` · E2E ${m.e2e_latency_seconds}s` : ' · E2E –';
+      d.querySelector('.d-prefix').textContent = m.prefix_cache_hit_pct != null ? ` · prefix ${m.prefix_cache_hit_pct}%` : '';
+      if (m.config) {
+        const c = m.config;
+        const parts = [];
+        if (c.kv_cache_size_tokens != null) parts.push(`${fmtTok(c.kv_cache_size_tokens)} tok KV`);
+        if (c.cache_dtype) parts.push(c.cache_dtype);
+        if (c.gpu_memory_utilization != null) parts.push(`mem ${Math.round(c.gpu_memory_utilization * 100)}%`);
+        d.querySelector('.d-kv').textContent = parts.length ? ` · ${parts.join(' · ')}` : '';
+      } else {
+        d.querySelector('.d-kv').textContent = '';
+      }
+    }
+
+    /* LiteLLM sub-lines */
+    if (backend === 'litellm') {
+      const d = this.q('.llm-litellm-details');
+      d.querySelector('.d-ttft').textContent = m.ttft_seconds != null ? `TTFT ${m.ttft_seconds}s` : 'TTFT –';
+      d.querySelector('.d-itl').textContent = m.itl_ms != null ? ` · ITL ${m.itl_ms}ms` : ' · ITL –';
+      d.querySelector('.d-e2e').textContent = m.e2e_latency_seconds != null ? ` · E2E ${m.e2e_latency_seconds}s` : ' · E2E –';
+      d.querySelector('.d-api').textContent = m.llm_api_latency_seconds != null ? ` · API ${m.llm_api_latency_seconds}s` : ' · API –';
+      d.querySelector('.d-prefix').textContent = m.prefix_cache_hit_pct != null ? ` · prefix cache ${m.prefix_cache_hit_pct}%` : '';
+      d.querySelector('.d-failed').textContent = m.requests_failed_total != null ? ` · failed ${fmtTok(m.requests_failed_total)}` : '';
+    }
+
+    /* Strata sub-lines */
+    if (backend === 'strata') {
+      const d = this.q('.llm-strata-details');
+      d.querySelector('.d-ttft').textContent = m.ttft_seconds != null ? `TTFT ${m.ttft_seconds}s` : 'TTFT –';
+      d.querySelector('.d-itl').textContent = m.itl_ms != null ? ` · ITL ${m.itl_ms}ms` : ' · ITL –';
+      d.querySelector('.d-e2e').textContent = m.e2e_latency_seconds != null ? ` · E2E ${m.e2e_latency_seconds}s` : ' · E2E –';
+      d.querySelector('.d-reuse').textContent = m.prefix_cache_hit_pct != null ? ` · KV reuse ${m.prefix_cache_hit_pct}%` : '';
       const parts = [];
-      if (c.kv_cache_size_tokens != null) parts.push(`${fmtTok(c.kv_cache_size_tokens)} tok KV`);
-      if (c.cache_dtype) parts.push(c.cache_dtype);
-      if (c.gpu_memory_utilization != null) parts.push(`mem ${Math.round(c.gpu_memory_utilization * 100)}%`);
-      kvEl.textContent = parts.length ? ` · ${parts.join(' · ')}` : '';
+      if (m.state && m.state !== 'idle') parts.push(m.state);
+      if (m.live_tok_s != null && m.state !== 'idle') parts.push(`${m.live_tok_s} tok/s live`);
+      if (m.config && m.config.version) parts.push(`engine ${m.config.version}`);
+      if (m.config && m.config.context) parts.push(`${fmtTok(m.config.context)} ctx`);
+      d.querySelector('.d-engine').textContent = parts.length ? ` · ${parts.join(' · ')}` : '';
+    }
+
+    /* Usage summary line (per card; hidden when the backend has none) */
+    const usageWrap = this.q('.llm-usage');
+    const usage = m.usage;
+    if (!usage) {
+      usageWrap.style.display = 'none';
     } else {
-      kvEl.textContent = '';
+      const parts = [`${fmtTok(usage.total_tokens ?? 0)} tok total`];
+      if (usage.gen_avg_tps != null) {
+        parts.push(`${fmtTok(usage.gen_tokens ?? 0)} gen @ ${usage.gen_avg_tps} t/s avg (while generating)`);
+      } else {
+        parts.push(`${fmtTok(usage.gen_tokens ?? 0)} gen`);
+      }
+      if (usage.prompt_cached_pct != null) {
+        parts.push(`${usage.prompt_cached_pct}% prompt cached`);
+      }
+      if (usage.total_spend_usd != null) {
+        parts.push(`spend $${usage.total_spend_usd.toFixed(2)}`);
+      }
+      const up = fmtUptime(usage.uptime_s);
+      if (up != null) parts.push(`up ${up}`);
+      this.q('.llm-usage-line').textContent = parts.join(' · ');
+      usageWrap.style.display = '';
+    }
+
+    /* Process line (llama co-located only; hidden when the backend or
+       the attribution rule leaves no `process` — silent, no red state) */
+    const procWrap = this.q('.llm-proc');
+    const proc = m.process;
+    if (!proc) {
+      procWrap.style.display = 'none';
+    } else {
+      const parts = [
+        `${proc.rss_gb} GB RSS`,
+        `${proc.cpu_pct}% CPU (all cores)`,
+        `${proc.threads} thr`,
+      ];
+      if (m.model_size_gb != null) {
+        parts.push(`model ${m.model_size_gb} GB`);
+      }
+      this.q('.llm-proc-line').textContent = parts.join(' · ');
+      procWrap.style.display = '';
+    }
+
+    this.setSeries(tstate && tstate.hist);
+  }
+
+  /* Per-slot context bars (llama + Strata), scoped to this card. */
+  updateSlots(slots) {
+    const container = this.q('.llm-slots');
+    const seen = new Set();
+
+    for (const slot of slots) {
+      const id = slot.id != null ? slot.id : 0;
+      seen.add(String(id));
+
+      let el = this.slotEls.get(String(id));
+      if (!el) {
+        el = document.createElement('div');
+        el.innerHTML = `
+          <div class="llama-slot-head">
+            <span class="llama-slot-label">Slot ${id}</span>
+            <span class="llama-slot-capt">–</span>
+          </div>
+          <div class="llama-slot-bar"><div class="llama-slot-fill"></div></div>`;
+        container.appendChild(el);
+        this.slotEls.set(String(id), el);
+      }
+
+      const pct = slot.context_pct != null ? slot.context_pct : 0;
+      const fill = el.querySelector('.llama-slot-fill');
+      fill.style.width = `${pct}%`;
+      fill.style.background = colorFor(pct);
+
+      let capt = `${slot.context_used != null ? slot.context_used : 0} / ${slot.n_ctx != null ? slot.n_ctx : 0}`;
+      if (slot.remain != null) {
+        // Active: this task's progress — decoded so far, tokens left to go
+        capt += ` · ${fmtTok(slot.decoded ?? 0)} tok · ${fmtTok(slot.remain)} left`;
+      } else if (!slot.is_processing && (slot.prompt_total ?? 0) > 0) {
+        // Idle but still holding KV-cache context from a finished task
+        capt += ` · idle · holding ${fmtTok(slot.prompt_total)} tok`;
+      }
+      el.querySelector('.llama-slot-capt').textContent = capt;
+
+      const label = el.querySelector('.llama-slot-label');
+      label.textContent = `Slot ${id}${slot.is_processing ? ' ●' : ''}`;
+      label.classList.toggle('llama-slot-processing', !!slot.is_processing);
+    }
+
+    // Remove slot elements that disappeared (e.g. server restarted)
+    for (const [id, el] of [...this.slotEls]) {
+      if (!seen.has(id)) {
+        el.remove();
+        this.slotEls.delete(id);
+      }
+    }
+
+    this.q('.llm-slots-note').style.display =
+      slots.length === 0 ? '' : 'none';
+  }
+}
+
+/* Card registry for the SELECTED system only — per-target history
+   buffers live in sysState keyed by system, so switching systems
+   destroys the current cards and rebuilds them from the new system's
+   buffers (charts mirror the buffers, no state is lost). */
+const llmCards = new Map();   // llm target name -> LLMCard
+let llmCardsOwner = null;     // system the current cards belong to
+
+/* Reconcile the visible cards against the selected system's targets:
+   enter (clone + chart), exit (chart.destroy FIRST, then DOM removal),
+   update in place. Called from the SSE tick and on tab switch. */
+function renderLLMCards() {
+  const sys = sysState.selected;
+  if (sys === 'fleet') return;
+  const container = document.getElementById('llm-cards-container');
+  if (!container) return;
+  const s = sysState.systems.get(sys);
+  if (!s || !s.metrics) return; // down past hold: keep last rendered
+  if (llmCardsOwner !== sys) {
+    for (const card of llmCards.values()) card.destroy();
+    llmCards.clear();
+    llmCardsOwner = sys;
+  }
+  const entries = s.metrics.llm_enabled === false ? []
+    : normalizeLlms(s.metrics, sys);
+  const wanted = new Map(entries.map(e => [e.name, e]));
+  for (const [name, card] of [...llmCards]) {
+    if (!wanted.has(name)) {
+      card.destroy();
+      llmCards.delete(name);
     }
   }
-
-  /* LiteLLM sub-lines */
-  if (backend === 'litellm') {
-    const ttftEl = document.getElementById('litellm-ttft');
-    const itlEl = document.getElementById('litellm-itl');
-    const e2eEl = document.getElementById('litellm-e2e');
-    const apiEl = document.getElementById('litellm-api');
-    const pcEl = document.getElementById('litellm-prefix');
-    const failEl = document.getElementById('litellm-failed');
-    ttftEl.textContent = m.ttft_seconds != null ? `TTFT ${m.ttft_seconds}s` : 'TTFT –';
-    itlEl.textContent = m.itl_ms != null ? ` · ITL ${m.itl_ms}ms` : ' · ITL –';
-    e2eEl.textContent = m.e2e_latency_seconds != null ? ` · E2E ${m.e2e_latency_seconds}s` : ' · E2E –';
-    apiEl.textContent = m.llm_api_latency_seconds != null ? ` · API ${m.llm_api_latency_seconds}s` : ' · API –';
-    pcEl.textContent = m.prefix_cache_hit_pct != null ? ` · prefix cache ${m.prefix_cache_hit_pct}%` : '';
-    failEl.textContent = m.requests_failed_total != null ? ` · failed ${fmtTok(m.requests_failed_total)}` : '';
+  for (const [name, entry] of wanted) {
+    let card = llmCards.get(name);
+    if (!card) {
+      card = new LLMCard(container);
+      llmCards.set(name, card);
+    }
+    // Legacy single "primary" target keeps the old header; named or
+    // multi-target setups show each target's name.
+    const showName = wanted.size > 1 || name !== 'primary';
+    card.update(entry, showName ? name : null, s.llms.get(name));
   }
-
 }
 
 /* ------------------------------------------------------------------ */
-/* LLM usage summary card (bottom; hidden with --no-llama / no usage)  */
+/* Uptime formatting for the per-card usage line                       */
 /* ------------------------------------------------------------------ */
 function fmtUptime(s) {
   if (s == null) return null;
@@ -1617,30 +1775,6 @@ function fmtUptime(s) {
   if (d > 0) return `${d}d ${h}h`;
   if (h > 0) return `${h}h ${m}m`;
   return `${m}m`;
-}
-
-function updateLLMProcess(m) {
-  const card = document.getElementById('llama-proc-card');
-  if (!card) return;
-  const llm = m.llm;
-  const proc = llm && llm.process;
-  // Hidden with --no-llama, and when the dashboard runs on a different
-  // host than the LLM server (process null) — silent, no red state.
-  // vLLM never sends `process` → card stays hidden (existing path).
-  if (m.llm_enabled === false || !proc) {
-    card.style.display = 'none';
-    return;
-  }
-  const parts = [
-    `${proc.rss_gb} GB RSS`,
-    `${proc.cpu_pct}% CPU (all cores)`,
-    `${proc.threads} thr`,
-  ];
-  if (llm.model_size_gb != null) {
-    parts.push(`model ${llm.model_size_gb} GB`);
-  }
-  document.getElementById('llama-proc-line').textContent = parts.join(' · ');
-  card.style.display = '';
 }
 
 /* ------------------------------------------------------------------ */
@@ -1695,31 +1829,6 @@ function updateHostHealth(m) {
   card.style.display = '';
 }
 
-function updateLLMUsage(m) {
-  const card = document.getElementById('llama-usage-card');
-  if (!card) return;
-  const usage = m.llm && m.llm.usage;
-  if (m.llm_enabled === false || !usage) {
-    card.style.display = 'none';
-    return;
-  }
-  const parts = [`${fmtTok(usage.total_tokens ?? 0)} tok total`];
-  if (usage.gen_avg_tps != null) {
-    parts.push(`${fmtTok(usage.gen_tokens ?? 0)} gen @ ${usage.gen_avg_tps} t/s avg (while generating)`);
-  } else {
-    parts.push(`${fmtTok(usage.gen_tokens ?? 0)} gen`);
-  }
-  if (usage.prompt_cached_pct != null) {
-    parts.push(`${usage.prompt_cached_pct}% prompt cached`);
-  }
-  if (usage.total_spend_usd != null) {
-    parts.push(`spend $${usage.total_spend_usd.toFixed(2)}`);
-  }
-  const up = fmtUptime(usage.uptime_s);
-  if (up != null) parts.push(`up ${up}`);
-  document.getElementById('llama-usage-line').textContent = parts.join(' · ');
-  card.style.display = '';
-}
 </script>
 </body>
 </html>

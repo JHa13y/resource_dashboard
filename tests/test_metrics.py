@@ -238,7 +238,7 @@ def test_collector_produces_data():
         assert "memory" in metrics
         assert "gpus" in metrics
     finally:
-        collector.running = False
+        collector.stop()
         collector.join(timeout=2)
 
 
@@ -258,7 +258,7 @@ def test_collector_queue_bounded():
             items.append(collector._queue.get_nowait())
         assert len(items) <= 3
     finally:
-        collector.running = False
+        collector.stop()
         collector.join(timeout=2)
 
 
@@ -268,8 +268,20 @@ def test_collector_llm_disabled_performs_no_llm_calls():
 
     collector = MetricsCollector(poll_interval=0.1, llama_enabled=False)
     collector._queue = queue.Queue(maxsize=3)
-    with patch("app.urllib.request.urlopen") as fake_urlopen:
-        fake_urlopen.side_effect = ConnectionRefusedError("LLM must not be scraped")
+    # The module-global collector (started at import) keeps probing in
+    # the background; count only calls made by THIS collector's scrape
+    # threads (named per instance in MetricsCollector.__init__).
+    own_thread = collector._llm_thread.name
+    own_prefix = collector._llm_thread_prefix
+    own_calls = []
+
+    def fake_urlopen(*args, **kwargs):
+        t = threading.current_thread().name
+        if t == own_thread or t.startswith(own_prefix):
+            own_calls.append(t)
+        raise ConnectionRefusedError("LLM must not be scraped")
+
+    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen):
         collector.start()
         try:
             data = collector.get_latest(timeout=3.0)
@@ -277,10 +289,11 @@ def test_collector_llm_disabled_performs_no_llm_calls():
             metrics = json.loads(data)
             assert metrics["llm_enabled"] is False
             assert metrics.get("llm") is None
+            assert metrics.get("llms") == []
         finally:
-            collector.running = False
+            collector.stop()
             collector.join(timeout=2)
-        assert fake_urlopen.call_count == 0
+        assert not own_calls
 
 
 def test_collector_llm_enabled_by_default():
@@ -304,7 +317,7 @@ def test_collector_llm_enabled_by_default():
             assert metrics["llm"]["status"] == "up"
             assert metrics["llm"]["model"] == "x.gguf"
         finally:
-            collector.running = False
+            collector.stop()
             collector.join(timeout=2)
 
 
@@ -328,9 +341,9 @@ def test_collector_llm_thread_populates_latest():
             metrics = json.loads(data)
             assert metrics["llm"]["status"] == "up"
             assert collector._llm_latest is not None
-            assert collector._llm_latest["status"] == "up"
+            assert collector._llm_latest[0]["status"] == "up"
         finally:
-            collector.running = False
+            collector.stop()
             collector.join(timeout=2)
 
 
@@ -398,32 +411,30 @@ def reset_llama_props_cache():
     import app as app_mod
 
     original = app_mod._llama_props_cache
-    app_mod._llama_props_cache = None
+    app_mod._llama_props_cache = {}
     yield
     app_mod._llama_props_cache = original
 
 
 @pytest.fixture(autouse=True)
 def reset_llama_prev():
-    """Reset module-level scrape history around every test."""
+    """Reset module-level llama scrape history around every test.
+
+    Multi-LLM: all scrape-state containers are target-name-keyed dicts;
+    swapping in fresh dicts is the reset."""
     import app as app_mod
 
-    original_prev = app_mod._llama_prev
-    original_last_good = app_mod._llama_last_good
-    original_slot_prev = app_mod._llama_slot_prev
-    original_decode_history = app_mod._llama_decode_history
-    original_req_rates = app_mod._llama_req_rates
-    app_mod._llama_prev = None
-    app_mod._llama_last_good = None
-    app_mod._llama_slot_prev = None
-    app_mod._llama_decode_history = []
-    app_mod._llama_req_rates.clear()
+    originals = {
+        k: getattr(app_mod, k) for k in (
+            "_llama_prev", "_llama_last_good", "_llama_slot_prev",
+            "_llama_decode_history", "_llama_req_rates",
+        )
+    }
+    for k in originals:
+        setattr(app_mod, k, {})
     yield
-    app_mod._llama_prev = original_prev
-    app_mod._llama_last_good = original_last_good
-    app_mod._llama_slot_prev = original_slot_prev
-    app_mod._llama_decode_history = original_decode_history
-    app_mod._llama_req_rates.extend(original_req_rates)
+    for k, v in originals.items():
+        setattr(app_mod, k, v)
 
 
 @pytest.fixture(autouse=True)
@@ -781,7 +792,7 @@ def test_collect_llama_free_slots():
     def run(props: str, metrics: str):
         # Bypass the 30 s /props cache so each run sees its own props body.
         import app as app_mod
-        app_mod._llama_props_cache = None
+        app_mod._llama_props_cache = {}
         with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
             "/metrics": metrics.encode(),
             "/props": props.encode(),
@@ -1193,8 +1204,9 @@ def test_collect_llama_prompt_rate_cleared_on_counter_reset():
     import app as app_mod
     from app import collect_llama_metrics
 
-    app_mod._llama_req_rates.append(1000.0)  # pretend a request completed
-    app_mod._llama_prev = {"ts": 1000.0, "gen": 1000.0, "prompt": 1000.0}
+    app_mod._llama_req_rates["primary"] = [1000.0]  # pretend a request completed
+    app_mod._llama_prev["primary"] = {"ts": 1000.0, "gen": 1000.0,
+                                      "prompt": 1000.0}
     with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
         "/metrics": ("llamacpp:tokens_predicted_total 100\n"
                      "llamacpp:prompt_tokens_total 50\n").encode(),
@@ -1204,7 +1216,7 @@ def test_collect_llama_prompt_rate_cleared_on_counter_reset():
         result = collect_llama_metrics("http://127.0.0.1:9999")
 
     # Restart detected (prev 1000 -> now 100): history cleared, no mean
-    assert list(app_mod._llama_req_rates) == []
+    assert list(app_mod._llama_req_rates["primary"]) == []
     assert result["prompt_tokens_per_s"] == 0.0
 
 
@@ -1306,7 +1318,7 @@ def test_collect_llama_props_cached():
     assert calls.count("http://127.0.0.1:9999/props") == 1
 
     # Age the cache past the 30 s TTL -> must be re-fetched
-    app_mod._llama_props_cache = (
+    app_mod._llama_props_cache["primary"] = (
         time.monotonic() - 31.0, {"model_path": "/models/x.gguf"}
     )
     with patch("app.urllib.request.urlopen", side_effect=fake_urlopen):
@@ -1368,7 +1380,7 @@ def test_collect_llama_counter_reset():
     import app as app_mod
     from app import collect_llama_metrics
 
-    app_mod._llama_prev = {
+    app_mod._llama_prev["primary"] = {
         "ts": time.monotonic(), "gen": 1000.0, "prompt": 1000.0,
     }
     with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
@@ -1655,7 +1667,7 @@ def test_collect_llama_build_info():
     assert result["build_info"] == "b10450-ece963f41"
 
     # Drop the 30 s /props cache so the second scrape re-fetches props.
-    app_mod._llama_props_cache = None
+    app_mod._llama_props_cache = {}
     with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
         "/metrics": LLAMA_METRICS_SAMPLE.encode(),
         "/props": b'{"model_path": "/models/x.gguf"}',
@@ -1687,9 +1699,9 @@ _PREFILL_SLOT = (b'[{"id": 0, "n_ctx": 1000, "n_prompt_tokens": 500, '
 
 
 def _seed_decode_history(app_mod, value: float, n: int = 9):
-    app_mod._llama_decode_history = [
-        (1000.0 + i, value) for i in range(n)
-    ]
+    app_mod._llama_decode_history = {
+        "primary": [(1000.0 + i, value) for i in range(n)]
+    }
 
 
 def test_collect_llama_stall_flag_when_decode_frozen():
@@ -1707,7 +1719,7 @@ def test_collect_llama_stall_flag_when_decode_frozen():
         result = collect_llama_metrics("http://127.0.0.1:9999")
 
     assert result["stalled"] is True
-    assert len(app_mod._llama_decode_history) == 10
+    assert len(app_mod._llama_decode_history["primary"]) == 10
 
 
 def test_collect_llama_no_stall_during_prefill():
@@ -1772,7 +1784,7 @@ def test_collect_llama_stall_history_window_bounded():
     })):
         collect_llama_metrics("http://127.0.0.1:9999")
 
-    assert len(app_mod._llama_decode_history) == 10
+    assert len(app_mod._llama_decode_history["primary"]) == 10
 
 
 # ---------------------------------------------------------------------------
@@ -2028,7 +2040,7 @@ def test_collector_snapshot_includes_swap():
             assert metrics["swap"]["pct"] == 37.5
             assert "in_kb_s" not in metrics["swap"]
         finally:
-            collector.running = False
+            collector.stop()
             collector.join(timeout=2)
 
 
@@ -2135,7 +2147,7 @@ def test_collector_snapshot_includes_host_health():
             assert data is not None
             metrics = json.loads(data)
         finally:
-            collector.running = False
+            collector.stop()
             collector.join(timeout=2)
 
     hh = metrics["host_health"]
@@ -2219,19 +2231,17 @@ def reset_vllm_state():
     """Reset module-level vLLM scrape history around every test."""
     import app as app_mod
 
-    original_prev = app_mod._vllm_prev
-    original_last_good = app_mod._vllm_last_good
-    original_config_cache = app_mod._vllm_config_cache
-    original_req_rates = app_mod._vllm_req_rates
-    app_mod._vllm_prev = None
-    app_mod._vllm_last_good = None
-    app_mod._vllm_config_cache = None
-    app_mod._vllm_req_rates.clear()
+    originals = {
+        k: getattr(app_mod, k) for k in (
+            "_vllm_prev", "_vllm_last_good", "_vllm_config_cache",
+            "_vllm_req_rates",
+        )
+    }
+    for k in originals:
+        setattr(app_mod, k, {})
     yield
-    app_mod._vllm_prev = original_prev
-    app_mod._vllm_last_good = original_last_good
-    app_mod._vllm_config_cache = original_config_cache
-    app_mod._vllm_req_rates.extend(original_req_rates)
+    for k, v in originals.items():
+        setattr(app_mod, k, v)
 
 
 def make_vllm_server(body: bytes, calls: list | None = None):
@@ -2489,7 +2499,8 @@ def test_collect_vllm_counter_reset_rebaselines():
     import app as app_mod
     from app import collect_vllm_metrics
 
-    app_mod._vllm_prev = {"ts": 1000.0, "gen": 10000.0, "prompt": 10000.0}
+    app_mod._vllm_prev["primary"] = {"ts": 1000.0, "gen": 10000.0,
+                                     "prompt": 10000.0}
     body = (
         'vllm:generation_tokens_total{engine="0",model_name="M"} 100.0\n'
         'vllm:prompt_tokens_total{engine="0",model_name="M"} 200.0\n'
@@ -2721,7 +2732,7 @@ def test_collect_vllm_config_none_values_omitted():
         'gpu_memory_utilization="None",kv_cache_size_tokens="1000",'
         'num_gpu_blocks="100"} 1.0\n'
     )
-    app_mod._vllm_config_cache = None  # bypass 30s cache
+    app_mod._vllm_config_cache = {}  # bypass 30s cache
     with patch("app.urllib.request.urlopen",
                side_effect=make_vllm_server(body.encode())):
         result = collect_vllm_metrics("http://127.0.0.1:9999")
@@ -3052,7 +3063,8 @@ def test_snapshot_schema_llm_key_singular():
          patch("app.collect_host_health_metrics", return_value={"psi_mem_avg10": None, "d_state_procs": 0}):
         # Populate _llm_latest the way the LLM thread would (this test
         # calls _collect() directly without starting the threads).
-        collector._llm_latest = collector._collect_llm()
+        collector._llm_latest = [
+            collector._collect_one(collector._targets_snapshot()[0])]
         snapshot = collector._collect()
 
     assert "llm" in snapshot
@@ -3536,8 +3548,8 @@ def reset_litellm_state():
 
     original_prev = app_mod._litellm_prev
     original_last_good = app_mod._litellm_last_good
-    app_mod._litellm_prev = None
-    app_mod._litellm_last_good = None
+    app_mod._litellm_prev = {}
+    app_mod._litellm_last_good = {}
     yield
     app_mod._litellm_prev = original_prev
     app_mod._litellm_last_good = original_last_good
@@ -4419,7 +4431,8 @@ def test_load_config_invalid_value_exits(tmp_path):
 def _ns(**kw):
     base = dict(host=None, port=None, poll_interval=None, llama_url=None,
                 vllm_url=None, litellm_url=None, litellm_token=None,
-                llm_backend=None, no_llama=False, upstream=[])
+                strata_url=None, llm_backend=None, default_view=None,
+                no_llama=False, upstream=[])
     base.update(kw)
     return SimpleNamespace(**base)
 
@@ -4449,6 +4462,49 @@ def test_no_llama_flag_overrides_config():
     assert resolve_settings(_ns(),
                            {"llama_enabled": True})["llama_enabled"] is True
     assert resolve_settings(_ns(), {})["llama_enabled"] is True
+
+
+def test_litellm_token_env_var_overrides_config(monkeypatch):
+    from app import resolve_settings
+
+    monkeypatch.setenv("RD_LITELLM_TOKEN", "env-token")
+    # env wins over config
+    assert resolve_settings(_ns(),
+                           {"litellm_token": "cfg-token"})["litellm_token"] == "env-token"
+    # env wins over the CLI flag too
+    assert resolve_settings(_ns(litellm_token="cli-token"),
+                           {"litellm_token": "cfg-token"})["litellm_token"] == "env-token"
+    # and it reaches the legacy single-backend target
+    s = resolve_settings(_ns(llm_backend="litellm"), {})
+    assert s["llm_targets"][0].token == "env-token"
+
+
+def test_litellm_token_env_var_unset_falls_back_to_config(monkeypatch):
+    from app import resolve_settings
+
+    monkeypatch.delenv("RD_LITELLM_TOKEN", raising=False)
+    # config value used when the env var is absent
+    assert resolve_settings(_ns(),
+                           {"litellm_token": "cfg-token"})["litellm_token"] == "cfg-token"
+    # CLI still beats config when the env var is absent
+    assert resolve_settings(_ns(litellm_token="cli-token"),
+                           {"litellm_token": "cfg-token"})["litellm_token"] == "cli-token"
+    # and the legacy single-backend target falls back the same way
+    s = resolve_settings(_ns(llm_backend="litellm"),
+                        {"litellm_token": "cfg-token"})
+    assert s["llm_targets"][0].token == "cfg-token"
+
+
+def test_litellm_token_env_var_empty_falls_back_to_config(monkeypatch):
+    from app import resolve_settings
+
+    monkeypatch.setenv("RD_LITELLM_TOKEN", "")
+    # an empty env var is treated as unset
+    assert resolve_settings(_ns(),
+                           {"litellm_token": "cfg-token"})["litellm_token"] == "cfg-token"
+    s = resolve_settings(_ns(llm_backend="litellm"),
+                        {"litellm_token": "cfg-token"})
+    assert s["llm_targets"][0].token == "cfg-token"
 
 
 def test_upstream_cli_merge_dedupe_cli_wins():
@@ -4611,7 +4667,7 @@ def test_snapshot_systems_array():
             # `systems` never nests
             assert "systems" not in by_name["local"]["metrics"]
     finally:
-        collector.running = False
+        collector.stop()
         collector.join(timeout=2)
 
 
@@ -4639,7 +4695,7 @@ def test_collector_upstream_thread_populates_latest():
             assert latest["status"] == "up"
             assert latest["metrics"]["cpu"] == 7.5
     finally:
-        collector.running = False
+        collector.stop()
         collector.join(timeout=2)
 
 
@@ -4699,7 +4755,7 @@ def test_snapshot_upstream_down_after_hold_expiry():
                              for s in m["systems"]))
             assert metrics is not None
     finally:
-        collector.running = False
+        collector.stop()
         collector.join(timeout=2)
         app_mod._upstream_last_good = orig
 
@@ -4721,7 +4777,7 @@ def test_start_upstreams_empty_noop():
         # systems is always present: the local entry at minimum
         assert [s["name"] for s in metrics["systems"]] == ["local"]
     finally:
-        collector.running = False
+        collector.stop()
         collector.join(timeout=2)
 
 
@@ -4752,3 +4808,706 @@ def test_snapshot_upstream_initial_down():
     by_name = {s["name"]: s for s in metrics["systems"]}
     assert by_name["mock"]["status"] == "down"
     assert by_name["mock"]["metrics"] is None
+
+
+# ---------------------------------------------------------------------------
+# Strata backend (collect_strata_metrics + config plumbing)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def reset_strata_state():
+    """Reset module-level Strata scrape history around a test."""
+    import app as app_mod
+
+    originals = (app_mod._strata_prev, app_mod._strata_last_good,
+                 app_mod._strata_tie_warned)
+    app_mod._strata_prev = {}
+    app_mod._strata_last_good = {}
+    app_mod._strata_tie_warned = False
+    yield
+    (app_mod._strata_prev, app_mod._strata_last_good,
+     app_mod._strata_tie_warned) = originals
+
+
+def _strata_doc(**over):
+    """A minimal Strata /metrics document (serve/server.py metrics() shape)."""
+    doc = {
+        "engine": {"model": "qwen-test", "max_context": 262144,
+                   "context": 262144, "kv": "int8", "images": False,
+                   "version": "0.1.39"},
+        "live": {"state": "idle", "queued": 0, "waiting": 0,
+                 "parallel": 4, "running": 0,
+                 "slots": [
+                     {"slot": 0, "state": "idle", "held_tokens": 3692},
+                     {"slot": 1, "state": "decoding", "prompt_tokens": 1000,
+                      "generated": 50, "elapsed_s": 2.0, "tok_s": 40.0},
+                     {"slot": 2, "state": "idle", "held_tokens": 0},
+                     {"slot": 3, "state": "idle", "held_tokens": 0},
+                 ]},
+        "requests": [],
+        "totals": {"since": time.time() - 100.0, "requests": 10,
+                   "prompt_tokens": 10000.0, "reused": 5000.0,
+                   "output_tokens": 500.0, "prompt_ms": 100.0,
+                   "decode_ms": 200.0, "drafts_offered": 100.0,
+                   "drafts_accepted": 75.0},
+        "time": time.time(),
+    }
+    doc.update(over)
+    return doc
+
+
+def make_strata_server(body: bytes):
+    """Side_effect for app.urllib.request.urlopen serving Strata /metrics.
+
+    The Strata collector passes a plain URL string (no Request), unlike
+    the header-carrying LiteLLM path.
+    """
+    def fake_urlopen(url, timeout=None):
+        if str(url).endswith("/metrics"):
+            return _http_response(body)
+        raise ConnectionRefusedError(f"no route for {url}")
+    return fake_urlopen
+
+
+def test_collect_strata_happy_path(reset_strata_state):
+    from app import collect_strata_metrics
+
+    body = json.dumps(_strata_doc()).encode()
+    with patch("app.urllib.request.urlopen",
+               side_effect=make_strata_server(body)):
+        result = collect_strata_metrics("http://127.0.0.1:9998")
+
+    assert result is not None
+    assert result["status"] == "up"
+    assert result["model"] == "qwen-test"
+    assert result["state"] == "idle"
+    assert result["requests_processing"] == 0.0
+    assert result["requests_waiting"] == 0.0
+    assert result["free_slots"] == 4
+    assert result["total_slots"] == 4
+    # Slot normalisation into the llama-shaped UI contract
+    slots = result["slots"]
+    assert slots[0]["context_used"] == 3692  # idle: held KV
+    assert slots[0]["is_processing"] is False
+    assert slots[1]["context_used"] == 1050  # active: prompt + generated
+    assert slots[1]["is_processing"] is True
+    assert slots[1]["decoded"] == 50
+    assert slots[1]["context_pct"] == round(100.0 * 1050 / 262144, 1)
+    # Cumulative totals
+    assert result["gen_tokens_total"] == 500.0
+    assert result["prompt_tokens_total"] == 10000.0
+    assert result["prompt_tokens_cached_total"] == 5000.0
+    assert result["requests_completed_total"] == 10.0
+    assert result["prefix_cache_hit_pct"] == 50.0  # reused / prompt
+    assert result["spec_accept_pct"] == 75.0       # accepted / offered
+    # First scrape: no Δ-window rates, no request-window latencies
+    assert "gen_tokens_per_s" not in result
+    assert "prompt_tokens_per_s" not in result
+    assert "ttft_seconds" not in result
+    # Usage: reused is NESTED in prompt (vLLM-style), not added
+    usage = result["usage"]
+    assert usage["total_tokens"] == 10500
+    assert usage["gen_tokens"] == 500
+    assert usage["prompt_cached_pct"] == 50.0
+    assert usage["uptime_s"] >= 99
+    assert result["config"]["version"] == "0.1.39"
+    assert result["config"]["context"] == 262144
+    assert result["config"]["parallel"] == 4
+
+
+def test_collect_strata_rates_and_request_windows(reset_strata_state):
+    """Second scrape yields Δ-counter rates + means over NEW requests."""
+    from app import collect_strata_metrics
+
+    clock = _FakeClock()
+    first = json.dumps(_strata_doc()).encode()
+    doc2 = _strata_doc()
+    doc2["totals"]["output_tokens"] = 700.0   # +200 / 2 s -> Δ would say 100
+    doc2["totals"]["prompt_tokens"] = 12000.0  # +2000 / 2 s -> Δ would say 1000
+    doc2["requests"] = [
+        {"time": 2600.0, "duration_s": 20.0, "prompt_ms": 4000.0,
+         "prompt_tokens": 2000.0, "decode_tok_s": 50.0},
+        {"time": 2500.0, "duration_s": 10.0, "prompt_ms": 2000.0,
+         "prompt_tokens": 1000.0, "decode_tok_s": 50.0},
+    ]
+    second = json.dumps(doc2).encode()
+
+    with patch("app.time.monotonic", clock), \
+         patch("app.urllib.request.urlopen",
+               side_effect=make_strata_server(first)):
+        r1 = collect_strata_metrics("http://127.0.0.1:9998")
+    assert "gen_tokens_per_s" not in r1
+    assert "ttft_seconds" not in r1  # first scrape: no window
+
+    clock.advance(2.0)
+    with patch("app.time.monotonic", clock), \
+         patch("app.urllib.request.urlopen",
+               side_effect=make_strata_server(second)):
+        r2 = collect_strata_metrics("http://127.0.0.1:9998")
+    # Completion tick (engine idle): the ring's TRUE speeds replace the
+    # one-tick counter-burst (mean decode_tok_s; prompt tokens / prompt_ms)
+    assert r2["gen_tokens_per_s"] == 50.0
+    assert r2["prompt_tokens_per_s"] == 500.0   # 3000 tok / 6 s prefill
+    # Means over the two NEW finished requests
+    assert r2["ttft_seconds"] == 3.0            # mean(2.0, 4.0)
+    assert r2["e2e_latency_seconds"] == 15.0    # mean(10, 20)
+    assert r2["itl_ms"] == 20.0                 # mean(1000/50, 1000/50)
+
+    # Third scrape, same ring buffer: watermark excludes old requests
+    clock.advance(2.0)
+    with patch("app.time.monotonic", clock), \
+         patch("app.urllib.request.urlopen",
+               side_effect=make_strata_server(second)):
+        r3 = collect_strata_metrics("http://127.0.0.1:9998")
+    assert "ttft_seconds" not in r3
+    assert "e2e_latency_seconds" not in r3
+    assert "itl_ms" not in r3
+
+
+def test_collect_strata_live_rates_preferred_while_busy(reset_strata_state):
+    """Strata totals.* only advance at request completion; while the
+    engine is busy the live fields must drive the gauges instead."""
+    from app import collect_strata_metrics
+
+    clock = _FakeClock()
+    first = json.dumps(_strata_doc()).encode()
+    with patch("app.time.monotonic", clock), \
+         patch("app.urllib.request.urlopen",
+               side_effect=make_strata_server(first)):
+        collect_strata_metrics("http://127.0.0.1:9998")  # baseline
+
+    def scrape(doc):
+        clock.advance(2.0)
+        body = json.dumps(doc).encode()
+        with patch("app.time.monotonic", clock), \
+             patch("app.urllib.request.urlopen",
+                   side_effect=make_strata_server(body)):
+            return collect_strata_metrics("http://127.0.0.1:9998")
+
+    # Solo decode: counters frozen (rate would be 0.0) -> live.tok_s
+    solo = _strata_doc()
+    solo["live"] = dict(solo["live"], state="generating", running=1,
+                        tok_s=42.5, tok_s_mean=40.0, slots=[])
+    r = scrape(solo)
+    assert r["gen_tokens_per_s"] == 42.5
+
+    # Batch decode: live.tok_s is the engine's WINDOWED aggregate (sum
+    # of every running request's recent rate - what the Monitor tab shows). The
+    # per-slot tok_s values are whole-request means (generated /
+    # since-first-token) and must NOT be summed: a long-running or
+    # slowing request's mean outruns its windowed rate, over-reporting
+    # (e.g. 55+55=110 while the windowed aggregate is 75).
+    batch = _strata_doc()
+    batch["live"] = dict(batch["live"], state="generating", running=2,
+                         tok_s=75.0, slots=[
+                             {"slot": 0, "state": "decoding",
+                              "prompt_tokens": 10, "generated": 5,
+                              "elapsed_s": 1.0, "tok_s": 55.0},
+                             {"slot": 1, "state": "decoding",
+                              "prompt_tokens": 20, "generated": 8,
+                              "elapsed_s": 1.0, "tok_s": 55.0},
+                             {"slot": 2, "state": "idle",
+                              "held_tokens": 0},
+                         ])
+    r = scrape(batch)
+    assert r["gen_tokens_per_s"] == 75.0  # windowed sum, not 55+55
+
+    # No live.tok_s (edge: state flipped to generating without one):
+    # fall back to tok_s_mean, still NOT the slot-sum
+    fallback = _strata_doc()
+    fallback["live"] = dict(fallback["live"], state="generating",
+                           running=1, tok_s=None, tok_s_mean=40.0,
+                           slots=[
+                               {"slot": 0, "state": "decoding",
+                                "prompt_tokens": 10, "generated": 5,
+                                "elapsed_s": 1.0, "tok_s": 55.0},
+                           ])
+    r = scrape(fallback)
+    assert r["gen_tokens_per_s"] == 40.0
+
+    # Prefill (reading): live.prefill_tok_s_mean drives the prompt gauge
+    reading = _strata_doc()
+    reading["live"] = dict(reading["live"], state="reading", running=1,
+                           prefill_tok_s_mean=1234.5, slots=[])
+    r = scrape(reading)
+    assert r["prompt_tokens_per_s"] == 1234.5
+
+    # Idle again: no live fields -> back to the (frozen) counter rate
+    idle = _strata_doc()
+    r = scrape(idle)
+    assert r["gen_tokens_per_s"] == 0.0
+
+
+def test_collect_strata_prompt_prefill_last5(reset_strata_state):
+    """prompt_tokens_per_s = the last 5 completed requests' prefill
+    speed as a vLLM-style windowed aggregate (Σ fresh tokens / Σ read
+    time), staying current on every tick instead of spiking at
+    completion and freezing."""
+    from app import collect_strata_metrics
+
+    def req(t, tok, ms):
+        return {"time": t, "prompt_tokens": tok, "prompt_ms": ms}
+
+    def scrape(doc):
+        with patch("app.urllib.request.urlopen",
+                   side_effect=make_strata_server(
+                       json.dumps(doc).encode())):
+            return collect_strata_metrics("http://127.0.0.1:9998")
+
+    # 6 completions: the 6th (oldest, 10000 tok/s) must NOT enter the
+    # mean - only the 5 newest (all 500 tok/s).
+    doc = _strata_doc()
+    doc["requests"] = [
+        req(3000.0, 100.0, 200.0),    # 500 tok/s  (newest)
+        req(2900.0, 200.0, 400.0),    # 500
+        req(2800.0, 300.0, 600.0),    # 500
+        req(2700.0, 400.0, 800.0),    # 500
+        req(2600.0, 500.0, 1000.0),   # 500
+        req(2500.0, 1000.0, 100.0),   # 10000 - excluded (6th)
+    ]
+    r = scrape(doc)
+    assert r["prompt_tokens_per_s"] == 500.0  # not (5*500+10000)/6
+
+    # vLLM-style AGGREGATE (Σ fresh / Σ read time), not the per-request
+    # mean: 1100 tok / 10.1 s = 108.9, whereas mean(1000, 100) = 550
+    doc2 = _strata_doc()
+    doc2["requests"] = [
+        req(3000.0, 100.0, 100.0),    # 1000 tok/s
+        req(2900.0, 1000.0, 10000.0), # 100 tok/s
+    ]
+    r = scrape(doc2)
+    assert r["prompt_tokens_per_s"] == 108.9
+
+    # Entries without a usable prompt_ms (older engine) are skipped
+    doc3 = _strata_doc()
+    doc3["requests"] = [
+        req(3000.0, 100.0, 100.0),    # 1000 tok/s
+        {"time": 2900.0, "prompt_tokens": 100.0, "prompt_ms": None},
+    ]
+    r = scrape(doc3)
+    assert r["prompt_tokens_per_s"] == 1000.0
+
+    # Cached tokens are excluded (the engine's own prompt_per_second
+    # definition): 20k tokens in 1 ms is a cache lookup, not a 20M
+    # tok/s prefill - the FRESH (prompt_tokens - reused) work counts.
+    # Both requests at 1000 tok/s -> aggregate 1100 / 1.1 s = 1000;
+    # WITHOUT the subtraction it would be 20100 / 1.1 s = 18272.7.
+    doc3b = _strata_doc()
+    doc3b["requests"] = [
+        req(3000.0, 100.0, 100.0),    # 1000 tok/s (no cache)
+        {"time": 2900.0, "prompt_tokens": 20000.0, "reused": 19000.0,
+         "prompt_ms": 1000.0},        # 1000 fresh tok / 1 s -> 1000 tok/s
+    ]
+    r = scrape(doc3b)
+    assert r["prompt_tokens_per_s"] == 1000.0  # not 20100/1.1 = 18272.7
+
+    # Fully cached (no fresh work) requests are skipped from the mean
+    doc3c = _strata_doc()
+    doc3c["requests"] = [
+        req(3000.0, 100.0, 100.0),    # 1000 tok/s
+        {"time": 2900.0, "prompt_tokens": 1000.0, "reused": 1000.0,
+         "prompt_ms": 1.0},           # fully cached: skipped
+    ]
+    r = scrape(doc3c)
+    assert r["prompt_tokens_per_s"] == 1000.0
+
+    # Reading state with an EMPTY ring: the live prefill speed is the
+    # fallback (no completed requests yet).
+    doc4 = _strata_doc()
+    doc4["live"] = dict(doc4["live"], state="reading",
+                        prefill_tok_s_mean=999.0)
+    r = scrape(doc4)
+    assert r["prompt_tokens_per_s"] == 999.0
+
+    # Reading state WITH ring data: the last-5 mean wins over the live
+    # prefill (the gauge is a completed-requests window, vLLM-style).
+    doc5 = _strata_doc()
+    doc5["live"] = dict(doc5["live"], state="reading",
+                        prefill_tok_s_mean=999.0)
+    doc5["requests"] = [req(3000.0, 100.0, 100.0)]  # 1000 tok/s
+    r = scrape(doc5)
+    assert r["prompt_tokens_per_s"] == 1000.0
+
+
+def test_collect_strata_rejects_non_strata_payloads(reset_strata_state):
+    """JSON without engine+live shape, or non-JSON text -> None."""
+    from app import collect_strata_metrics
+
+    for body in (b'{"hello": "world"}', b'not json at all'):
+        with patch("app.urllib.request.urlopen",
+                   side_effect=make_strata_server(body)):
+            assert collect_strata_metrics("http://127.0.0.1:9998") is None
+
+
+def test_collect_strata_stale_hold_and_expiry(reset_strata_state):
+    """Failed scrape holds the last snapshot as stale for 15 s."""
+    from app import collect_strata_metrics
+
+    clock = _FakeClock()
+    body = json.dumps(_strata_doc()).encode()
+    with patch("app.time.monotonic", clock), \
+         patch("app.urllib.request.urlopen",
+               side_effect=make_strata_server(body)):
+        assert collect_strata_metrics("http://127.0.0.1:9998")["status"] == "up"
+
+    clock.advance(2.0)
+    with patch("app.time.monotonic", clock), \
+         patch("app.urllib.request.urlopen",
+               side_effect=ConnectionRefusedError("down")):
+        held = collect_strata_metrics("http://127.0.0.1:9998")
+        assert held["status"] == "stale"
+        clock.advance(20.0)
+        assert collect_strata_metrics("http://127.0.0.1:9998") is None
+
+
+def test_collect_llm_auto_prefers_strata_over_llama(reset_strata_state):
+    """auto order: vLLM/LiteLLM down -> Strata wins before llama.cpp."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1, llm_backend="auto")
+    with patch("app.collect_vllm_metrics", return_value=None), \
+         patch("app.collect_litellm_metrics", return_value=None), \
+         patch("app.collect_strata_metrics",
+               return_value={"status": "up"}) as fake_strata, \
+         patch("app.collect_llama_metrics") as fake_llama:
+        data = collector._collect_llm()
+    assert data == {"status": "up", "backend": "strata"}
+    fake_llama.assert_not_called()
+
+
+def test_collect_llm_pinned_strata_skips_others():
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1, llm_backend="strata",
+                                 strata_url="http://s:8080")
+    with patch("app.collect_vllm_metrics") as fake_vllm, \
+         patch("app.collect_litellm_metrics") as fake_litellm, \
+         patch("app.collect_llama_metrics") as fake_llama, \
+         patch("app.collect_strata_metrics",
+               return_value={"status": "up"}) as fake_strata:
+        data = collector._collect_llm()
+    assert data["backend"] == "strata"
+    fake_strata.assert_called_once_with("http://s:8080",
+                                        state_key="primary")
+    fake_vllm.assert_not_called()
+    fake_litellm.assert_not_called()
+    fake_llama.assert_not_called()
+
+
+def test_config_strata_and_default_view(tmp_path):
+    from app import load_config, resolve_settings
+
+    p = tmp_path / "config.yaml"
+    p.write_text(
+        "llm_backend: strata\n"
+        "strata_url: http://192.168.5.219:8080\n"
+        "default_view: fleet\n"
+    )
+    cfg = load_config(str(p))
+    settings = resolve_settings(_ns(), cfg)
+    assert settings["llm_backend"] == "strata"
+    assert settings["strata_url"] == "http://192.168.5.219:8080"
+    assert settings["default_view"] == "fleet"
+
+
+def test_default_view_defaults_to_local():
+    from app import resolve_settings
+
+    settings = resolve_settings(_ns(), {})
+    assert settings["default_view"] == "local"
+    assert settings["strata_url"] == "http://127.0.0.1:8080"
+
+
+def test_default_view_invalid_exits(tmp_path):
+    from app import load_config
+
+    p = tmp_path / "bad_view.yaml"
+    p.write_text("default_view: sidebar\n")
+    with pytest.raises(SystemExit):
+        load_config(str(p))
+
+
+# ---------------------------------------------------------------------------
+# Multi-LLM (targets, keyed state, payload shape, fleet, config)
+# ---------------------------------------------------------------------------
+
+def _multi_strata_router(bodies: dict):
+    """urlopen side_effect routing several Strata servers by host:port."""
+    def fake_urlopen(url, timeout=None):
+        u = str(url)
+        if not u.endswith("/metrics"):
+            raise ConnectionRefusedError(f"no route for {u}")
+        for hostport, body in bodies.items():
+            if hostport in u:
+                if body is None:
+                    raise ConnectionRefusedError(f"{hostport} down")
+                return _http_response(body)
+        raise ConnectionRefusedError(f"no route for {u}")
+    return fake_urlopen
+
+
+def test_multi_llm_state_keyed_per_target(reset_strata_state):
+    """Two same-type targets keep independent rate windows and stale holds."""
+    from app import collect_strata_metrics
+
+    clock = _FakeClock()
+    doc_a, doc_b = _strata_doc(), _strata_doc()
+    doc_b["totals"]["output_tokens"] = 900.0
+    doc_b["engine"]["model"] = "qwen-b"
+    body_a = json.dumps(doc_a).encode()
+    body_b = json.dumps(doc_b).encode()
+    router = _multi_strata_router({"h1": body_a, "h2": body_b})
+
+    with patch("app.time.monotonic", clock), \
+         patch("app.urllib.request.urlopen", side_effect=router):
+        a1 = collect_strata_metrics("http://h1:8080", state_key="strata-a")
+        b1 = collect_strata_metrics("http://h2:8080", state_key="strata-b")
+    assert "gen_tokens_per_s" not in a1  # first scrape per key, independent
+    assert "gen_tokens_per_s" not in b1
+
+    clock.advance(2.0)
+    doc_a["totals"]["output_tokens"] = 700.0   # +200 / 2 s = 100 t/s
+    doc_b["totals"]["output_tokens"] = 1100.0  # +200 / 2 s = 100 t/s
+    doc_b_body = json.dumps(doc_b).encode()
+    router2 = _multi_strata_router({"h1": json.dumps(doc_a).encode(),
+                                    "h2": doc_b_body})
+    with patch("app.time.monotonic", clock), \
+         patch("app.urllib.request.urlopen", side_effect=router2):
+        a2 = collect_strata_metrics("http://h1:8080", state_key="strata-a")
+        b2 = collect_strata_metrics("http://h2:8080", state_key="strata-b")
+    assert a2["gen_tokens_per_s"] == 100.0
+    assert b2["gen_tokens_per_s"] == 100.0
+    assert a2["model"] == "qwen-test"
+    assert b2["model"] == "qwen-b"
+
+    # h1 down: stale-hold for strata-a only; strata-b unaffected
+    clock.advance(2.0)
+    router3 = _multi_strata_router({"h1": None, "h2": doc_b_body})
+    with patch("app.time.monotonic", clock), \
+         patch("app.urllib.request.urlopen", side_effect=router3):
+        a3 = collect_strata_metrics("http://h1:8080", state_key="strata-a")
+        b3 = collect_strata_metrics("http://h2:8080", state_key="strata-b")
+    assert a3["status"] == "stale"
+    assert b3["status"] == "up"
+
+
+def _collector_snapshot(collector):
+    """_collect() with host-metric probes stubbed."""
+    with patch("app.collect_gpu_metrics", return_value=[]), \
+         patch("app.collect_swap_metrics", return_value=None), \
+         patch("app.collect_host_health_metrics",
+               return_value={"psi_mem_avg10": None, "d_state_procs": 0}):
+        return collector._collect()
+
+
+def test_collector_multi_llm_entries_and_alias(reset_strata_state):
+    """Two strata targets -> two ordered entries; `llm` = primary alias."""
+    from app import LLMTarget, MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1)
+    collector.llm_targets = [
+        LLMTarget("strata-a", "strata", "http://h1:8080"),
+        LLMTarget("strata-b", "strata", "http://h2:8081"),
+    ]
+    doc_a, doc_b = _strata_doc(), _strata_doc()
+    doc_b["totals"]["output_tokens"] = 900.0
+    router = _multi_strata_router(
+        {"h1:8080": json.dumps(doc_a).encode(),
+         "h2:8081": json.dumps(doc_b).encode()})
+    with patch("app.urllib.request.urlopen", side_effect=router):
+        collector._llm_latest = [
+            collector._collect_one(t) for t in collector._targets_snapshot()]
+    snapshot = _collector_snapshot(collector)
+
+    names = [e["name"] for e in snapshot["llms"]]
+    assert names == ["strata-a", "strata-b"]
+    assert all(e["backend"] == "strata" for e in snapshot["llms"])
+    assert snapshot["llms"][1]["gen_tokens_total"] == 900.0
+    # legacy alias: primary (first) entry, NOT an aggregate
+    assert snapshot["llm"]["name"] == "strata-a"
+    assert snapshot["llm"]["gen_tokens_total"] == 500.0
+
+
+def test_collector_multi_llm_down_placeholders(reset_strata_state):
+    """A dead target keeps a named down entry; alias None if it is primary."""
+    from app import LLMTarget, MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1)
+    collector.llm_targets = [
+        LLMTarget("strata-a", "strata", "http://h1:8080"),
+        LLMTarget("strata-b", "strata", "http://h2:8081"),
+    ]
+    router = _multi_strata_router(
+        {"h1:8080": None,  # down
+         "h2:8081": json.dumps(_strata_doc()).encode()})
+    with patch("app.urllib.request.urlopen", side_effect=router):
+        collector._llm_latest = [
+            collector._collect_one(t) for t in collector._targets_snapshot()]
+    snapshot = _collector_snapshot(collector)
+
+    a, b = snapshot["llms"]
+    assert a == {"name": "strata-a", "backend": "strata", "status": "down"}
+    assert b["status"] == "up"
+    assert snapshot["llm"] is None  # primary down -> legacy contract
+
+
+def test_collector_disabled_shape():
+    """llama_enabled=False -> llm None AND llms [] (pinned contract)."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1, llama_enabled=False)
+    snapshot = _collector_snapshot(collector)
+    assert snapshot["llm"] is None
+    assert snapshot["llms"] == []
+
+
+def test_legacy_config_single_primary_target():
+    from app import resolve_settings
+
+    settings = resolve_settings(_ns(llm_backend="vllm"), {})
+    targets = settings["llm_targets"]
+    assert len(targets) == 1
+    assert targets[0].name == "primary"
+    assert targets[0].backend == "vllm"
+    assert targets[0].url == "http://127.0.0.1:5001"
+    # auto keeps url None (probes per-type URLs on the collector)
+    settings = resolve_settings(_ns(), {})
+    assert settings["llm_targets"][0].backend == "auto"
+    assert settings["llm_targets"][0].url is None
+
+
+def test_llms_config_multi_and_primary_first(tmp_path):
+    from app import load_config, resolve_settings
+
+    p = tmp_path / "config.yaml"
+    p.write_text(
+        "llms:\n"
+        "  - name: strata-main\n"
+        "    backend: strata\n"
+        "    url: http://192.168.5.219:8080\n"
+        "  - name: coder\n"
+        "    backend: strata\n"
+        "    url: http://127.0.0.1:8081\n"
+        "  - name: vllm-box\n"
+        "    backend: vllm\n"
+        "    url: http://127.0.0.1:8000\n"
+        "    primary: true\n"
+    )
+    settings = resolve_settings(_ns(), load_config(str(p)))
+    names = [t.name for t in settings["llm_targets"]]
+    assert names == ["vllm-box", "strata-main", "coder"]
+
+
+def test_llms_config_conflicts_with_legacy(tmp_path):
+    from app import resolve_settings
+
+    cfg = {"llms": [{"name": "a", "backend": "strata",
+                     "url": "http://x:8080"}],
+           "llm_backend": "strata"}
+    with pytest.raises(SystemExit):
+        resolve_settings(_ns(), cfg)
+    # CLI-side legacy flag conflicts too (raw presence)
+    with pytest.raises(SystemExit):
+        resolve_settings(_ns(llm_backend="llama"), cfg)
+
+
+def test_llms_config_validation_errors(tmp_path):
+    from app import load_config
+
+    cases = [
+        "llms: []\n",                                        # empty
+        "llms: notalist\n",                                  # not a list
+        "llms:\n  - {name: a, backend: auto, url: 'http://x'}\n",
+        "llms:\n  - {name: 'bad name!', backend: strata, url: 'http://x'}\n",
+        "llms:\n  - {name: a, backend: strata}\n",           # missing url
+        ("llms:\n  - {name: a, backend: strata, url: 'http://x'}\n"
+         "  - {name: a, backend: strata, url: 'http://y'}\n"),  # dup name
+        ("llms:\n  - {name: a, backend: strata, url: 'http://x',"
+         " primary: true}\n"
+         "  - {name: b, backend: strata, url: 'http://y',"
+         " primary: true}\n"),                               # two primaries
+    ]
+    for i, text in enumerate(cases):
+        p = tmp_path / f"bad{i}.yaml"
+        p.write_text(text)
+        with pytest.raises(SystemExit):
+            load_config(str(p))
+
+
+def test_upstream_sanitizer_forwards_llms():
+    import app as app_mod
+    from app import collect_upstream_metrics
+
+    orig = app_mod._upstream_last_good
+    app_mod._upstream_last_good = {}
+    try:
+        payload = {
+            "timestamp": 1.0, "cpu": 5.0, "memory": {}, "gpus": [],
+            "llm_enabled": True,
+            "llm": {"name": "primary", "backend": "strata", "status": "up"},
+            "llms": [
+                {"name": "primary", "backend": "strata", "status": "up"},
+                {"name": "second", "backend": "vllm", "status": "down"},
+            ],
+            "systems": [{"name": "nested"}],
+        }
+        with patch("app.urllib.request.urlopen",
+                   side_effect=make_llama_server(
+                       {"/api/metrics": json.dumps(payload).encode()})):
+            out = collect_upstream_metrics("http://127.0.0.1:9996", "mock")
+        m = out["metrics"]
+        assert len(m["llms"]) == 2
+        assert m["llms"][1]["name"] == "second"
+        assert "systems" not in m
+    finally:
+        app_mod._upstream_last_good = orig
+
+
+def test_llama_usage_state_path_per_target(tmp_path, monkeypatch):
+    from app import _llama_usage_state_path
+
+    monkeypatch.setenv("RD_LLAMA_USAGE_STATE",
+                       str(tmp_path / "llama_usage_state.json"))
+    assert _llama_usage_state_path() == str(
+        tmp_path / "llama_usage_state.json")
+    assert _llama_usage_state_path("coder") == str(
+        tmp_path / ".llama_usage_state.coder.json")
+
+
+def test_llama_process_dropped_for_multi_llama_targets():
+    """The local process can only be attributed to the sole llama target."""
+    from app import LLMTarget, MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1)
+    collector.llm_targets = [
+        LLMTarget("llama-a", "llama", "http://127.0.0.1:8080"),
+        LLMTarget("llama-b", "llama", "http://127.0.0.1:8081"),
+    ]
+    with patch("app.collect_llama_metrics",
+               return_value={"status": "up", "process": {"rss_gb": 3.0}}):
+        entry = collector._collect_one(collector.llm_targets[0])
+    assert "process" not in entry
+
+
+def test_llama_process_kept_for_sole_local_target():
+    from app import LLMTarget, MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1)
+    collector.llm_targets = [LLMTarget("primary", "llama",
+                                       "http://127.0.0.1:8080")]
+    with patch("app.collect_llama_metrics",
+               return_value={"status": "up", "process": {"rss_gb": 3.0}}):
+        entry = collector._collect_one(collector.llm_targets[0])
+    assert entry["process"] == {"rss_gb": 3.0}
+
+
+def test_llama_process_dropped_for_remote_url():
+    from app import LLMTarget, MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1)
+    collector.llm_targets = [LLMTarget("primary", "llama",
+                                       "http://192.168.5.207:5001")]
+    with patch("app.collect_llama_metrics",
+               return_value={"status": "up", "process": {"rss_gb": 3.0}}):
+        entry = collector._collect_one(collector.llm_targets[0])
+    assert "process" not in entry

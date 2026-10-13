@@ -14,13 +14,43 @@
 # poll_interval: 1.0            # seconds; must be > 0
 
 # --- LLM backend --------------------------------------------------------
-# llama | vllm | litellm (auto-detect order: vLLM, LiteLLM, llama.cpp)
+# llama | vllm | litellm | strata
+# (auto-detect order: vLLM, LiteLLM, Strata, llama.cpp)
 # llm_backend: litellm
 # llama_url: http://127.0.0.1:8080
 # vllm_url: http://127.0.0.1:5001
 # litellm_url: http://127.0.0.1:4000
 # litellm_token: sk-...         # Bearer header for require_auth_for_metrics_endpoint
+# strata_url: http://127.0.0.1:8080  # Strata inference engine (JSON /metrics)
 # llama_enabled: true           # false == --no-llama (the flag wins when passed)
+
+# --- Multiple LLM servers (optional) --------------------------------------
+# Scrape several inference servers at once; the UI shows one card per
+# target. When `llms:` is present it REPLACES the single-backend keys
+# above — mixing both exits with an error ("llms: configured; drop the
+# legacy LLM settings ... or remove llms"). Each entry needs a unique
+# name ([A-Za-z0-9._-], max 64 chars) and an explicit backend (no
+# auto-detect per target); `token` is only used for litellm (Bearer);
+# at most one entry may set `primary: true` (default: first entry — the
+# primary backs the legacy `llm` payload key and sorts first).
+#
+# llms:
+#   - name: studio
+#     backend: strata
+#     url: http://127.0.0.1:8080
+#   - name: gpu-box
+#     backend: vllm
+#     url: http://192.168.5.30:8000
+#   - name: proxy
+#     backend: litellm
+#     url: http://127.0.0.1:4000
+#     token: sk-...
+#     primary: true
+
+# --- UI --------------------------------------------------------------------
+# System tab shown on page load: local (this host, the default) or
+# fleet (the multi-system summary). CLI: --default-view
+# default_view: local
 
 # --- Upstream dashboards (multi-system consolidation) --------------------
 # Each entry points at another dashboard instance's /api/metrics endpoint.

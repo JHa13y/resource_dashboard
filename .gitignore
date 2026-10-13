@@ -3,4 +3,6 @@ __pycache__/
 .venv/
 .pytest_cache/
 docs/
-.llama_usage_state.json
+.llama_usage_state*.json
+config.yaml
+.DS_Store

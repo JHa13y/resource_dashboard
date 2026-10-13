@@ -27,9 +27,11 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import deque
-from typing import Any, Generator
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Generator, NamedTuple
 
 import psutil
 from flask import Flask, Response, render_template
@@ -1101,29 +1103,37 @@ DEFAULT_VLLM_URL = "http://127.0.0.1:5001"
 # Base URL of the LiteLLM proxy (overridable via --litellm-url).
 DEFAULT_LITELLM_URL = "http://127.0.0.1:4000"
 
+# Base URL of the Strata inference engine (overridable via --strata-url).
+# Strata serves its web UI + JSON /metrics on port 8080 by default.
+DEFAULT_STRATA_URL = "http://127.0.0.1:8080"
+
 # How often (seconds) to re-fetch /props; model info only changes on reload.
+# All module-level scrape state below is keyed by LLM *target name*
+# ("primary" for the implicit single-backend target), so several servers of
+# the same backend type scrape independently. Each key is touched by exactly
+# one scrape thread (mirrors the _upstream_last_good discipline).
 _LLAMA_PROPS_TTL = 30.0
-_llama_props_cache: tuple[float, dict[str, Any]] | None = None
+_llama_props_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
 # Previous successful scrape's cumulative counters + timestamp, used to
 # compute tokens/s from per-scrape counter deltas. The windowed
 # ``*_tokens_seconds`` gauges read 0 on some builds (e.g. the llama.cpp
 # bundled with LM Studio) while the cumulative counters increment correctly.
-_llama_prev: dict[str, float] | None = None
+_llama_prev: dict[str, dict[str, float]] = {}
 
 # Last successful snapshot (monotonic ts + dict). When a scrape fails
 # (e.g. the 2 s timeout under heavy llama-server load) the UI keeps showing
 # this data, flagged "stale", for up to this many seconds so a single bad
 # tick doesn't flicker the card to "unreachable".
 _LLAMA_STALE_MAX_AGE_S = 15.0
-_llama_last_good: tuple[float, dict[str, Any]] | None = None
+_llama_last_good: dict[str, tuple[float, dict[str, Any]]] = {}
 
 # Per-slot decode counters from the previous successful scrape, used for
 # LIVE tokens/s: on some builds (e.g. the llama.cpp bundled with LM Studio)
 # the /metrics counters only advance when a request COMPLETES, so counter
 # deltas read 0 during generation while the per-slot n_decoded /
 # n_prompt_tokens_processed update per token.
-_llama_slot_prev: dict[str, Any] | None = None
+_llama_slot_prev: dict[str, dict[str, Any]] = {}
 
 # (monotonic ts, n_decode_total) pairs from the last successful scrapes.
 # n_decode_total ticks per llama_decode() call; frozen across 10 consecutive
@@ -1131,7 +1141,7 @@ _llama_slot_prev: dict[str, Any] | None = None
 # hung (stuck decode / GPU wedged). Long prefills call no llama_decode, so
 # slots with decoded == 0 are excluded (see the stall check below).
 _LLAMA_DECODE_HISTORY_LEN = 10
-_llama_decode_history: list[tuple[float, float]] = []
+_llama_decode_history: dict[str, list[tuple[float, float]]] = {}
 
 # Per-completed-request prompt-rate samples (tokens/s), kept for BOTH
 # llama and vLLM: the per-scrape delta spikes for one tick when a large
@@ -1139,8 +1149,8 @@ _llama_decode_history: list[tuple[float, float]] = []
 # N completed requests instead, falling back to the per-scrape live rate
 # until the first measurable request completes.
 LLM_REQ_RATE_WINDOW = 5
-_llama_req_rates: deque[float] = deque(maxlen=LLM_REQ_RATE_WINDOW)
-_vllm_req_rates: deque[float] = deque(maxlen=LLM_REQ_RATE_WINDOW)
+_llama_req_rates: dict[str, deque[float]] = {}
+_vllm_req_rates: dict[str, deque[float]] = {}
 # A prefill shorter than this cannot be measured at 1 s scrape cadence
 # (it finishes between two scrapes); such requests are skipped.
 _LLAMA_MIN_PREFILL_S = 0.25
@@ -1304,17 +1314,18 @@ def _llama_find_process() -> psutil.Process | None:
         return None
 
 
-def _llama_props(base_url: str) -> dict[str, Any] | None:
+def _llama_props(base_url: str,
+                 state_key: str = "primary") -> dict[str, Any] | None:
     """Fetch /props with a 30 s cache (model info only changes on reload)."""
-    global _llama_props_cache
     now = time.monotonic()
-    if _llama_props_cache is not None:
-        ts, data = _llama_props_cache
+    cache = _llama_props_cache.get(state_key)
+    if cache is not None:
+        ts, data = cache
         if now - ts < _LLAMA_PROPS_TTL:
             return data
     data = _llama_get_json(base_url, "/props")
     if isinstance(data, dict):
-        _llama_props_cache = (now, data)
+        _llama_props_cache[state_key] = (now, data)
     return data
 
 
@@ -1322,11 +1333,22 @@ def _llama_props(base_url: str) -> dict[str, Any] | None:
 # Cumulative usage state (persistent server uptime, T3)
 # ---------------------------------------------------------------------------
 
-def _llama_usage_state_path() -> str:
-    """State-file location; RD_LLAMA_USAGE_STATE overrides the default."""
-    return os.environ.get("RD_LLAMA_USAGE_STATE") or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), ".llama_usage_state.json"
-    )
+def _llama_usage_state_path(state_key: str = "primary") -> str:
+    """State-file location; RD_LLAMA_USAGE_STATE overrides the default.
+
+    Named targets (multi-LLM) get a per-target filename next to the
+    default one: ``.llama_usage_state.<name>.json``. The env override is
+    process-wide, so it can only ever address the default target.
+    """
+    if state_key == "primary":
+        return os.environ.get("RD_LLAMA_USAGE_STATE") or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            ".llama_usage_state.json"
+        )
+    base = os.environ.get("RD_LLAMA_USAGE_STATE")
+    base_dir = (os.path.dirname(os.path.abspath(base)) if base
+                else os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_dir, f".llama_usage_state.{state_key}.json")
 
 
 def _llama_load_usage_state(path: str) -> dict[str, float] | None:
@@ -1431,8 +1453,14 @@ def _parse_llama_slots(data: Any) -> list[dict[str, Any]]:
     return slots
 
 
-def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
+def collect_llama_metrics(
+    base_url: str, state_key: str = "primary"
+) -> dict[str, Any] | None:
     """Scrape llama-server ``/metrics`` + ``/props`` + ``/slots``.
+
+    ``state_key`` names the scrape target: all per-scrape state (rate
+    windows, stale-hold, slot deltas, props cache, usage-state file) is
+    kept per key so several llama servers scrape independently.
 
     Returns ``None`` when the server is unreachable or not started with
     ``--metrics`` (UI shows "unreachable"). Never raises.
@@ -1452,13 +1480,12 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
     ``status: "stale"`` for up to ``_LLAMA_STALE_MAX_AGE_S`` seconds so a
     transient timeout doesn't flicker the UI to "unreachable".
     """
-    global _llama_prev, _llama_last_good, _llama_slot_prev, _llama_decode_history
-    global _llama_req_rates
 
     def _stale_or_none() -> dict[str, Any] | None:
         """Hold last-good data during a transient scrape failure."""
-        if _llama_last_good is not None:
-            ts, held = _llama_last_good
+        held_good = _llama_last_good.get(state_key)
+        if held_good is not None:
+            ts, held = held_good
             if time.monotonic() - ts <= _LLAMA_STALE_MAX_AGE_S:
                 out = dict(held)
                 out["status"] = "stale"
@@ -1506,7 +1533,9 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
     prompt_total = raw.get("llamacpp:prompt_tokens_total")
     cached_total = raw.get("llamacpp:prompt_tokens_cached_total")
     now = time.monotonic()
-    prev = _llama_prev
+    prev = _llama_prev.get(state_key)
+    rates = _llama_req_rates.setdefault(
+        state_key, deque(maxlen=LLM_REQ_RATE_WINDOW))
     elapsed = now - prev["ts"] if prev is not None else 0.0
     # A counter decrease means the server restarted/reloaded: the
     # per-request prompt-rate history belongs to the old process.
@@ -1514,7 +1543,7 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
         (gen_total is not None and gen_total < prev["gen"])
         or (prompt_total is not None and prompt_total < prev["prompt"])
     ):
-        _llama_req_rates.clear()
+        rates.clear()
     if (
         prev is not None
         and gen_total is not None
@@ -1541,15 +1570,16 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
         out.setdefault("gen_tokens_per_s", 0.0)
         out.setdefault("prompt_tokens_per_s", 0.0)
     if gen_total is not None and prompt_total is not None:
-        _llama_prev = {
+        new_prev: dict[str, Any] = {
             "ts": now,
             "gen": gen_total,
             "prompt": prompt_total,
         }
         if cached_total is not None:
-            _llama_prev["cached"] = cached_total
+            new_prev["cached"] = cached_total
+        _llama_prev[state_key] = new_prev
 
-    props = _llama_props(base_url)
+    props = _llama_props(base_url, state_key)
     if isinstance(props, dict):
         model_path = props.get("model_path")
         if isinstance(model_path, str) and model_path:
@@ -1637,7 +1667,7 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
             ),
         }
         now_wall = time.time()
-        state_path = _llama_usage_state_path()
+        state_path = _llama_usage_state_path(state_key)
         state = _llama_load_usage_state(state_path)
         if state is None:
             state = {"first_seen": now_wall, "last_reset": now_wall}
@@ -1667,12 +1697,13 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
     # long prefills call no llama_decode and must not trigger this) means
     # the server stopped advancing: hang / GPU wedged.
     decode_total = raw.get("llamacpp:n_decode_total")
+    decode_hist = _llama_decode_history.setdefault(state_key, [])
     if decode_total is not None:
-        _llama_decode_history.append((now, decode_total))
-        if len(_llama_decode_history) > _LLAMA_DECODE_HISTORY_LEN:
-            _llama_decode_history.pop(0)
-    if len(_llama_decode_history) >= _LLAMA_DECODE_HISTORY_LEN:
-        if len({v for _, v in _llama_decode_history}) == 1:
+        decode_hist.append((now, decode_total))
+        if len(decode_hist) > _LLAMA_DECODE_HISTORY_LEN:
+            decode_hist.pop(0)
+    if len(decode_hist) >= _LLAMA_DECODE_HISTORY_LEN:
+        if len({v for _, v in decode_hist}) == 1:
             for slot in slots:
                 if slot["is_processing"] and slot["decoded"] > 0:
                     out["stalled"] = True
@@ -1680,7 +1711,7 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
 
     # Live tokens/s from per-slot decode counters (see _llama_slot_prev):
     # they update per token, unlike the /metrics counters on some builds.
-    prev_slot = _llama_slot_prev
+    prev_slot = _llama_slot_prev.get(state_key)
     prompt_last = prev_slot.get("prompt_last") if prev_slot is not None else None
     if slots and prev_slot is not None:
         slot_elapsed = now - prev_slot["ts"]
@@ -1785,12 +1816,12 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
                     duration >= _LLAMA_MIN_PREFILL_S
                     and s["prompt_processed"] > 0
                 ):
-                    _llama_req_rates.append(
+                    rates.append(
                         s["prompt_processed"] / duration
                     )
             new_slot_state[s["id"]]["prefill_done"] = True
 
-    _llama_slot_prev = {
+    _llama_slot_prev[state_key] = {
         "ts": now,
         "slots": {
             s["id"]: {
@@ -1807,12 +1838,12 @@ def collect_llama_metrics(base_url: str) -> dict[str, Any] | None:
 
     # Gauge value: mean of the last 5 completed-request prompt rates when
     # available; otherwise the per-scrape live rate computed above.
-    if _llama_req_rates:
+    if rates:
         out["prompt_tokens_per_s"] = round(
-            sum(_llama_req_rates) / len(_llama_req_rates), 1
+            sum(rates) / len(rates), 1
         )
 
-    _llama_last_good = (now, out)
+    _llama_last_good[state_key] = (now, out)
     return out
 
 
@@ -1830,15 +1861,15 @@ _VLLM_STALE_MAX_AGE_S = 15.0
 # instead of omitting it, so the UI never flashes "–" on recovery.
 _RATE_MAX_GAP_S = 15.0
 
-_vllm_last_good: tuple[float, dict[str, Any]] | None = None
+_vllm_last_good: dict[str, tuple[float, dict[str, Any]]] = {}
 
 # Previous successful scrape's cumulative counters + histogram sums, used
 # to compute rates and windowed means from per-scrape deltas.
-_vllm_prev: dict[str, float] | None = None
+_vllm_prev: dict[str, dict[str, Any]] = {}
 
 # 30 s cache for the parsed cache_config_info dict (static during runtime).
 _VLLM_CONFIG_TTL = 30.0
-_vllm_config_cache: tuple[float, dict[str, Any]] | None = None
+_vllm_config_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
 # Warn-once guard for LLM auto mode: the first time vLLM comes up, tell the
 # operator it is the active backend and how to pin the choice.
@@ -1984,8 +2015,13 @@ def _parse_vllm_config(entry: dict[str, dict]) -> dict[str, Any]:
     return config
 
 
-def collect_vllm_metrics(base_url: str) -> dict[str, Any] | None:
+def collect_vllm_metrics(
+    base_url: str, state_key: str = "primary"
+) -> dict[str, Any] | None:
     """Scrape vLLM ``/metrics`` and build the dashboard snapshot.
+
+    ``state_key`` names the scrape target; all per-scrape state is kept
+    per key so several vLLM servers scrape independently.
 
     Returns ``None`` when the server is unreachable, or the body contains
     no ``vllm:`` series. Never raises.
@@ -1998,11 +2034,11 @@ def collect_vllm_metrics(base_url: str) -> dict[str, Any] | None:
     is a SUBSET of prompt_tokens_total (nested, not disjoint). Usage total is
     therefore ``prompt_total + gen_total`` (NOT + cached).
     """
-    global _vllm_last_good, _vllm_prev, _vllm_config_cache, _vllm_req_rates
 
     def _stale_or_none() -> dict[str, Any] | None:
-        if _vllm_last_good is not None:
-            ts, held = _vllm_last_good
+        held_good = _vllm_last_good.get(state_key)
+        if held_good is not None:
+            ts, held = held_good
             if time.monotonic() - ts <= _VLLM_STALE_MAX_AGE_S:
                 out = dict(held)
                 out["status"] = "stale"
@@ -2026,7 +2062,9 @@ def collect_vllm_metrics(base_url: str) -> dict[str, Any] | None:
 
     out: dict[str, Any] = {"status": "up"}
     now = time.monotonic()
-    prev = _vllm_prev
+    prev = _vllm_prev.get(state_key)
+    rates = _vllm_req_rates.setdefault(
+        state_key, deque(maxlen=LLM_REQ_RATE_WINDOW))
     elapsed = now - prev["ts"] if prev is not None else 0.0
 
     # --- Model name (from any series' model_name label; extracted every cycle, no TTL cache) ---
@@ -2121,7 +2159,7 @@ def collect_vllm_metrics(base_url: str) -> dict[str, Any] | None:
     if rate_ok and prompt_total is not None and prev.get("prompt") is not None:
         if prompt_total < prev["prompt"]:
             out["prompt_tokens_per_s"] = 0.0  # counter reset
-            _vllm_req_rates.clear()  # restart: history belongs to old proc
+            rates.clear()  # restart: history belongs to old proc
         else:
             out["prompt_tokens_per_s"] = round(
                 max(0.0, prompt_total - prev["prompt"]) / elapsed, 1)
@@ -2196,26 +2234,27 @@ def collect_vllm_metrics(base_url: str) -> dict[str, Any] | None:
                         0.0, d_prompt - (cached_total - prev["cached"])
                     )
                 if d_prompt > 0:
-                    _vllm_req_rates.append(d_prompt / d_ttft)
-    if _vllm_req_rates:
+                    rates.append(d_prompt / d_ttft)
+    if rates:
         out["prompt_tokens_per_s"] = round(
-            sum(_vllm_req_rates) / len(_vllm_req_rates), 1
+            sum(rates) / len(rates), 1
         )
 
     # --- Config (30 s cache) ---
     cfg_entry = _vllm_get_entry(metrics, "vllm:cache_config_info")
     if cfg_entry is not None and cfg_entry.get("series"):
         now_ts = time.monotonic()
-        if _vllm_config_cache is not None:
-            cache_ts, cached_cfg = _vllm_config_cache
+        cache = _vllm_config_cache.get(state_key)
+        if cache is not None:
+            cache_ts, cached_cfg = cache
             if now_ts - cache_ts < _VLLM_CONFIG_TTL:
                 out["config"] = cached_cfg
             else:
                 out["config"] = _parse_vllm_config(cfg_entry)
-                _vllm_config_cache = (now_ts, out["config"])
+                _vllm_config_cache[state_key] = (now_ts, out["config"])
         else:
             out["config"] = _parse_vllm_config(cfg_entry)
-            _vllm_config_cache = (now_ts, out["config"])
+            _vllm_config_cache[state_key] = (now_ts, out["config"])
 
     # --- Usage (derived; vLLM counters are NESTED: cached ⊂ prompt) ---
     if gen_total is not None or prompt_total is not None:
@@ -2258,9 +2297,9 @@ def collect_vllm_metrics(base_url: str) -> dict[str, Any] | None:
         new_prev["itl_sum"] = itl_sum
     if itl_count is not None:
         new_prev["itl_count"] = itl_count
-    _vllm_prev = new_prev
+    _vllm_prev[state_key] = new_prev
 
-    _vllm_last_good = (now, out)
+    _vllm_last_good[state_key] = (now, out)
     return out
 
 
@@ -2270,11 +2309,11 @@ def collect_vllm_metrics(base_url: str) -> dict[str, Any] | None:
 
 # Stale-hold: last successful LiteLLM scrape (monotonic ts + dict).
 _LITELLM_STALE_MAX_AGE_S = 15.0
-_litellm_last_good: tuple[float, dict[str, Any]] | None = None
+_litellm_last_good: dict[str, tuple[float, dict[str, Any]]] = {}
 
 # Previous successful scrape's cumulative counters + histogram sums, used
 # to compute rates and windowed means from per-scrape deltas.
-_litellm_prev: dict[str, Any] | None = None
+_litellm_prev: dict[str, dict[str, Any]] = {}
 
 # Warn-once guard for LLM auto mode: the first time LiteLLM wins, tell the
 # operator it is the active backend and how to pin the choice.
@@ -2282,7 +2321,9 @@ _litellm_tie_warned = False
 
 
 def collect_litellm_metrics(
-    base_url: str, token: str | None = None
+    base_url: str,
+    token: str | None = None,
+    state_key: str = "primary",
 ) -> dict[str, Any] | None:
     """Scrape a LiteLLM proxy ``/metrics`` and build the dashboard snapshot.
 
@@ -2305,12 +2346,14 @@ def collect_litellm_metrics(
     client-facing alias (requested_model → litellm_model_name → model);
     multiple deployments of one model are summed. Used by the UI's
     per-model chart lines (shown only when 2+ models are present).
+
+    ``state_key`` names the scrape target; per-scrape state is keyed.
     """
-    global _litellm_last_good, _litellm_prev
 
     def _stale_or_none() -> dict[str, Any] | None:
-        if _litellm_last_good is not None:
-            ts, held = _litellm_last_good
+        held_good = _litellm_last_good.get(state_key)
+        if held_good is not None:
+            ts, held = held_good
             if time.monotonic() - ts <= _LITELLM_STALE_MAX_AGE_S:
                 out = dict(held)
                 out["status"] = "stale"
@@ -2334,7 +2377,7 @@ def collect_litellm_metrics(
 
     out: dict[str, Any] = {"status": "up"}
     now = time.monotonic()
-    prev = _litellm_prev
+    prev = _litellm_prev.get(state_key)
     elapsed = now - prev["ts"] if prev is not None else 0.0
 
     # --- Model name: requested_model is the client-facing alias; the
@@ -2538,9 +2581,352 @@ def collect_litellm_metrics(
         new_prev["gen_by_model"] = gen_by_model
     if last_rate is not None:
         new_prev["last_rate"] = last_rate
-    _litellm_prev = new_prev
+    _litellm_prev[state_key] = new_prev
 
-    _litellm_last_good = (now, out)
+    _litellm_last_good[state_key] = (now, out)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Strata Monitoring (https://github.com/Niko1221/Strata)
+# ---------------------------------------------------------------------------
+
+# Stale-hold: last successful Strata scrape (monotonic ts + dict).
+_STRATA_STALE_MAX_AGE_S = 15.0
+_strata_last_good: dict[str, tuple[float, dict[str, Any]]] = {}
+
+# Previous successful scrape's cumulative totals + request-ring watermark,
+# used to compute rates and windowed means from deltas.
+_strata_prev: dict[str, dict[str, Any]] = {}
+
+# Warn-once guard for LLM auto mode: the first time Strata wins, tell the
+# operator it is the active backend and how to pin the choice.
+_strata_tie_warned = False
+
+
+def _strata_num(val: Any) -> float | None:
+    """Coerce a Strata JSON number (or None) to float; None otherwise."""
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        return None
+    return float(val)
+
+
+def _parse_strata_slots(data: Any,
+                        n_ctx: float | None) -> list[dict[str, Any]]:
+    """Normalise Strata's ``live.slots`` into the dashboard slot shape.
+
+    A Strata slot is ``{slot, state: "idle"|"reading"|"decoding",
+    held_tokens}`` when idle (holding the KV prefix for a next turn) or
+    ``{slot, state, prompt_tokens, generated, elapsed_s, tok_s}`` while
+    active. The UI slot renderer consumes the llama.cpp fields
+    (id, context_used, context_pct, n_ctx, is_processing, decoded,
+    prompt_total).
+    """
+    slots: list[dict[str, Any]] = []
+    if not isinstance(data, list):
+        return slots
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        active = str(entry.get("state") or "idle") != "idle"
+        prompt = _strata_num(entry.get("prompt_tokens")) or 0.0
+        generated = _strata_num(entry.get("generated")) or 0.0
+        held = _strata_num(entry.get("held_tokens")) or 0.0
+        used = (prompt + generated) if active else held
+        slot: dict[str, Any] = {
+            "id": entry.get("slot", len(slots)),
+            "context_used": int(used),
+            "n_ctx": int(n_ctx) if n_ctx else 0,
+            "context_pct": round(100.0 * used / n_ctx, 1) if n_ctx else 0,
+            "is_processing": active,
+            # Idle slots render as "holding N tok" from prompt_total.
+            "prompt_total": int(prompt or held),
+        }
+        if active:
+            slot["decoded"] = int(generated)
+        slots.append(slot)
+    return slots
+
+
+def collect_strata_metrics(
+    base_url: str, state_key: str = "primary"
+) -> dict[str, Any] | None:
+    """Scrape a Strata inference engine ``/metrics`` and build the snapshot.
+
+    Strata serves a JSON document (not Prometheus text): ``engine``
+    (model/version/context), ``live`` (state, queue, batch slots, live
+    tok/s), ``requests`` (last finished requests, newest first), and
+    ``totals`` (cumulative counters since server start). A reachable
+    endpoint without the ``engine``/``live`` shape (a different service,
+    or non-JSON) keeps the <=15 s stale hold, mirroring the
+    vLLM/LiteLLM collectors. Never raises.
+
+    Counter semantics: ``totals.reused`` is a SUBSET of
+    ``totals.prompt_tokens`` (nested KV prefix reuse, vLLM-style
+    accounting), so the usage total is ``prompt_total + gen_total`` (NOT
+    + reused). Restart resets the counters -> one 0.0 rate tick.
+
+    Latency lines come from the request ring buffer: requests whose
+    ``time`` (epoch s) exceeds the previous scrape's watermark contribute
+    windowed means (TTFT = prompt_ms, E2E = duration_s, ITL ~
+    1000/decode_tok_s). Omitted on the first scrape.
+
+    ``state_key`` names the scrape target; per-scrape state is keyed.
+    """
+
+    def _stale_or_none() -> dict[str, Any] | None:
+        held_good = _strata_last_good.get(state_key)
+        if held_good is not None:
+            ts, held = held_good
+            if time.monotonic() - ts <= _STRATA_STALE_MAX_AGE_S:
+                out = dict(held)
+                out["status"] = "stale"
+                return out
+        return None
+
+    try:
+        with urllib.request.urlopen(
+            base_url.rstrip("/") + "/metrics", timeout=2
+        ) as r:
+            body = r.read().decode()
+        data = json.loads(body)
+    except Exception:  # noqa: BLE001 – collector must never raise
+        return _stale_or_none()
+    if (not isinstance(data, dict)
+            or not isinstance(data.get("engine"), dict)
+            or not isinstance(data.get("live"), dict)):
+        return _stale_or_none()  # endpoint up but not a Strata server
+
+    engine = data["engine"]
+    live = data["live"]
+    totals = (data["totals"] if isinstance(data.get("totals"), dict)
+              else {})
+
+    out: dict[str, Any] = {"status": "up"}
+    now = time.monotonic()
+    prev = _strata_prev.get(state_key)
+    elapsed = now - prev["ts"] if prev is not None else 0.0
+
+    # --- Model + engine facts ---
+    if engine.get("model"):
+        out["model"] = engine["model"]
+    n_ctx = (_strata_num(engine.get("context"))
+             or _strata_num(engine.get("max_context")))
+    config: dict[str, Any] = {}
+    for key in ("version", "kv", "images"):
+        if engine.get(key) is not None:
+            config[key] = engine[key]
+    if n_ctx:
+        config["context"] = int(n_ctx)
+
+    # --- Live gauges ---
+    state = str(live.get("state") or "idle")
+    out["state"] = state
+    parallel = _strata_num(live.get("parallel"))
+    running = _strata_num(live.get("running"))
+    if running is None:
+        running = 1.0 if state in ("reading", "generating") else 0.0
+    out["requests_processing"] = round(running, 1)
+    queued = _strata_num(live.get("queued")) or 0.0
+    waiting = _strata_num(live.get("waiting")) or 0.0
+    out["requests_waiting"] = round(queued + waiting, 1)
+    tok_s = _strata_num(live.get("tok_s"))
+    if tok_s is None:
+        tok_s = _strata_num(live.get("tok_s_mean"))
+    if tok_s is not None:
+        out["live_tok_s"] = round(tok_s, 1)
+    if parallel is not None and parallel >= 1:
+        out["free_slots"] = max(0, int(parallel) - int(running))
+        out["total_slots"] = int(parallel)
+        config["parallel"] = int(parallel)
+    slots = _parse_strata_slots(live.get("slots"), n_ctx)
+    if slots:
+        out["slots"] = slots
+
+    # --- Cumulative totals (counters since server start) ---
+    gen_total = _strata_num(totals.get("output_tokens"))
+    prompt_total = _strata_num(totals.get("prompt_tokens"))
+    reused_total = _strata_num(totals.get("reused"))
+    req_total = _strata_num(totals.get("requests"))
+    draft_total = _strata_num(totals.get("drafts_offered"))
+    accept_total = _strata_num(totals.get("drafts_accepted"))
+
+    if gen_total is not None:
+        out["gen_tokens_total"] = round(gen_total, 1)
+    if prompt_total is not None:
+        out["prompt_tokens_total"] = round(prompt_total, 1)
+    if reused_total is not None:
+        out["prompt_tokens_cached_total"] = round(reused_total, 1)
+    if req_total is not None:
+        out["requests_completed_total"] = round(req_total, 1)
+    if draft_total is not None:
+        out["spec_decode_draft_tokens_total"] = round(draft_total, 1)
+    if accept_total is not None:
+        out["spec_decode_accepted_tokens_total"] = round(accept_total, 1)
+
+    # --- Rates (Δ counters / elapsed; window guards; last rate held) ---
+    # Same convention as LiteLLM: the gap must be within
+    # 0.5–_RATE_MAX_GAP_S; a longer gap holds the last computed rate.
+    rate_ok = prev is not None and 0.5 <= elapsed <= _RATE_MAX_GAP_S
+    if rate_ok:
+        gen_rate: float | None = None
+        prompt_rate: float | None = None
+        if gen_total is not None and prev.get("gen") is not None:
+            gen_rate = 0.0 if gen_total < prev["gen"] else round(
+                max(0.0, gen_total - prev["gen"]) / elapsed, 1)
+        if prompt_total is not None and prev.get("prompt") is not None:
+            prompt_rate = 0.0 if prompt_total < prev["prompt"] else round(
+                max(0.0, prompt_total - prev["prompt"]) / elapsed, 1)
+        last_rate: dict[str, Any] = {"gen": gen_rate, "prompt": prompt_rate}
+    else:
+        last_rate = (prev or {}).get("last_rate")
+    if last_rate is not None and last_rate["gen"] is not None:
+        out["gen_tokens_per_s"] = last_rate["gen"]
+    # NOTE: the prompt counter-delta is only a FALLBACK (before the first
+    # completion the ring is empty and the live prefill below is absent);
+    # the last-5-requests mean below overrides it.
+
+    # Strata's totals.* counters only advance when a request COMPLETES
+    # (the engine updates them on the DONE path), so counter-delta rates
+    # spike once at completion and sit frozen during the whole decode.
+    # The engine exposes live rates separately: `live.tok_s` is the
+    # WINDOWED aggregate (sum of every running request's rate over the
+    # last 2 s - the same figure the engine's own Monitor tab shows),
+    # and `live.prefill_tok_s_mean` the prefill speed. Prefer those
+    # while the engine is busy so the gauges move in real time.
+    # NOTE: `live.slots[].tok_s` is each slot's WHOLE-REQUEST mean
+    # (generated / since-first-token, the same formula as tok_s_mean),
+    # NOT a live rate - summing them over-reports (a long-running or
+    # slowing request's mean outruns its windowed rate), so they must
+    # not be used here.
+    if state == "generating":
+        live_gen = (_strata_num(live.get("tok_s"))
+                    or _strata_num(live.get("tok_s_mean")) or 0.0)
+        if live_gen > 0:
+            out["gen_tokens_per_s"] = round(live_gen, 1)
+    # --- Prompt prefill rate: the last 5 completed requests, vLLM-style ---
+    # vLLM's prompt gauge is a windowed rate (Δprompt / ΣTTFT) that stays
+    # current on every tick; Strata's equivalent is the same Σ/Σ aggregate
+    # over the ring buffer (the server returns it newest-first, so the
+    # first 5 entries are the most recent completions), which does not
+    # spike at completion and freeze during the decode. Each request
+    # contributes its FRESH (uncached) tokens over the read time - the
+    # engine's own definition (prompt_per_second = (prompt_tokens -
+    # cache_n) / prompt_ms): a mostly-cached prompt's 20k tokens in 1 ms
+    # is a cache lookup, not a 20M tok/s prefill. The Σ/Σ weighting
+    # (not a per-request mean) keeps such expert-cache / KV-cache spikes
+    # from dominating: a 2459-token read in 0.2 ms sits next to the
+    # 21k-token read in 17.6 s that the work actually took.
+    ring = data.get("requests")
+    ring = ring if isinstance(ring, list) else []
+    pf_fresh = 0.0
+    pf_ms = 0.0
+    for r in ring[:5]:
+        if not isinstance(r, dict):
+            continue
+        pt = _strata_num(r.get("prompt_tokens"))
+        pms = _strata_num(r.get("prompt_ms"))
+        fresh = None if pt is None else pt - (_strata_num(r.get("reused")) or 0.0)
+        if (fresh is not None and pms is not None
+                and fresh > 0 and pms > 0):
+            pf_fresh += fresh
+            pf_ms += pms
+    if pf_ms > 0:
+        out["prompt_tokens_per_s"] = round(pf_fresh / (pf_ms / 1000.0), 1)
+    elif state == "reading":
+        # Active prefill, no completed requests yet: the live prefill
+        # speed (the only source while the first prompt is being read).
+        prefill = _strata_num(live.get("prefill_tok_s_mean"))
+        if prefill is not None and prefill > 0:
+            out["prompt_tokens_per_s"] = round(prefill, 1)
+    if ("prompt_tokens_per_s" not in out and last_rate is not None
+            and last_rate["prompt"] is not None):
+        out["prompt_tokens_per_s"] = last_rate["prompt"]
+
+    # --- KV prefix reuse + spec decode accept (lifetime ratios) ---
+    if (reused_total is not None and prompt_total is not None
+            and prompt_total > 0):
+        out["prefix_cache_hit_pct"] = round(
+            100.0 * reused_total / prompt_total, 1)
+    if (draft_total is not None and accept_total is not None
+            and draft_total > 0):
+        out["spec_accept_pct"] = round(100.0 * accept_total / draft_total,
+                                       1)
+
+    # --- Request ring buffer: windowed means over NEW completions ---
+    hist = data.get("requests")
+    hist = hist if isinstance(hist, list) else []
+    seen_times = [t for t in (_strata_num(r.get("time"))
+                              for r in hist if isinstance(r, dict))
+                  if t is not None]
+    watermark = prev.get("req_watermark", 0.0) if prev else 0.0
+    fresh = [r for r in hist if isinstance(r, dict)
+             and (_strata_num(r.get("time")) or 0.0) > watermark]
+    if fresh and prev is not None:
+        def _mean(vals: list[float], scale: float = 1.0) -> float | None:
+            return round(sum(vals) / len(vals) * scale, 1) if vals else None
+        ttft = _mean([v for v in (_strata_num(r.get("prompt_ms"))
+                                  for r in fresh) if v is not None], 0.001)
+        e2e = _mean([v for v in (_strata_num(r.get("duration_s"))
+                                 for r in fresh) if v is not None])
+        itl = _mean([1000.0 / v for v in
+                     (_strata_num(r.get("decode_tok_s")) for r in fresh)
+                     if v is not None and v > 0])
+        if ttft is not None:
+            out["ttft_seconds"] = ttft
+        if e2e is not None:
+            out["e2e_latency_seconds"] = e2e
+        if itl is not None:
+            out["itl_ms"] = itl
+        # Completion-tick rate smoothing: totals.* jump in one go for
+        # the finished request(s), so the 1-tick Δ/elapsed rate would
+        # flash a fake spike (whole-request tokens per second). The ring
+        # entries carry the true speeds — decode_tok_s per request and
+        # prompt tokens per prompt_ms (aggregated) — so use them instead
+        # while the engine is not mid-batch (busy ticks already got the
+        # live-rate override above, which stays the better source then).
+        if state not in ("generating", "reading"):
+            decode = _mean([v for v in
+                            (_strata_num(r.get("decode_tok_s"))
+                             for r in fresh) if v is not None and v > 0])
+            if decode is not None:
+                out["gen_tokens_per_s"] = decode
+    req_watermark = max(seen_times) if seen_times else watermark
+
+    # --- Usage (derived; Strata totals are NESTED: reused ⊂ prompt) ---
+    if gen_total is not None or prompt_total is not None:
+        usage: dict[str, Any] = {}
+        total = 0
+        if prompt_total is not None:
+            total += int(round(prompt_total))
+        if gen_total is not None:
+            total += int(round(gen_total))
+        usage["total_tokens"] = total
+        if gen_total is not None:
+            usage["gen_tokens"] = int(round(gen_total))
+        if (reused_total is not None and prompt_total is not None
+                and prompt_total > 0):
+            usage["prompt_cached_pct"] = round(
+                100.0 * reused_total / prompt_total, 1)
+        since = _strata_num(totals.get("since"))
+        if since is not None:
+            usage["uptime_s"] = max(0, int(time.time() - since))
+        out["usage"] = usage
+
+    if config:
+        out["config"] = config
+
+    # --- Update previous state ---
+    new_prev: dict[str, Any] = {"ts": now, "req_watermark": req_watermark}
+    if gen_total is not None:
+        new_prev["gen"] = gen_total
+    if prompt_total is not None:
+        new_prev["prompt"] = prompt_total
+    if last_rate is not None:
+        new_prev["last_rate"] = last_rate
+    _strata_prev[state_key] = new_prev
+
+    _strata_last_good[state_key] = (now, out)
     return out
 
 
@@ -2558,7 +2944,7 @@ _UPSTREAM_STALE_MAX_AGE_S = 15.0
 # any other app-level key is dropped (a newer upstream's extra keys are
 # silently ignored; an older upstream without `systems` works fine).
 _UPSTREAM_KEYS = ("timestamp", "cpu", "cpu_per_core", "memory", "gpus",
-                 "swap", "host_health", "llm_enabled", "llm")
+                 "swap", "host_health", "llm_enabled", "llm", "llms")
 
 # Last good entry per upstream name: {name: (monotonic ts, entry dict)}.
 # Each name is touched by exactly one fetch thread -> no locking needed.
@@ -2615,9 +3001,90 @@ _CONFIG_DEFAULTS = {
     "vllm_url": DEFAULT_VLLM_URL,
     "litellm_url": DEFAULT_LITELLM_URL,
     "litellm_token": None,
+    "strata_url": DEFAULT_STRATA_URL,
+    "default_view": "local",
+    "llms": None,
 }
-_CONFIG_BACKENDS = ("auto", "llama", "vllm", "litellm")
+_CONFIG_BACKENDS = ("auto", "llama", "vllm", "litellm", "strata")
+_CONFIG_VIEWS = ("local", "fleet")
+
+# Backend set for named multi-LLM targets (no auto: auto is probe-chain
+# sugar for the implicit single "primary" target only).
+_CONFIG_TARGET_BACKENDS = ("llama", "vllm", "litellm", "strata")
+_LLM_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,64}$")
+
+# Legacy single-backend settings keys; `llms` conflicts with any of them
+# (checked by RAW presence — config key present / CLI arg not None — not
+# via pick(), which cannot distinguish unset from defaulted).
+_LLM_LEGACY_KEYS = ("llm_backend", "llama_url", "vllm_url", "litellm_url",
+                    "litellm_token", "strata_url")
+
+
+class LLMTarget(NamedTuple):
+    """One LLM scrape target (multi-LLM).
+
+    ``backend`` may be ``"auto"`` only for the implicit legacy target
+    ``"primary"``, which probes the per-type collector URLs; named
+    targets from ``llms:`` are always pinned. ``url`` is unused for the
+    auto target. ``state_key`` for the scrape-state dicts is ``name``.
+    """
+
+    name: str
+    backend: str
+    url: str | None
+    token: str | None = None
 _CONFIG_KNOWN_KEYS = frozenset(set(_CONFIG_DEFAULTS) | {"upstreams"})
+
+
+def _validate_llms(entries: Any, fail) -> list[dict[str, Any]]:
+    """Validate + sanitize an ``llms:`` config block (multi-LLM targets).
+
+    Strict by design (hard exit via ``fail``): a mis-scoped scrape target
+    would silently produce wrong data, unlike an unreachable upstream
+    which self-reports ``down`` in the UI (hence upstreams stay warn+skip).
+    """
+    if not isinstance(entries, list) or not entries:
+        fail("llms must be a non-empty list of {name, backend, url} "
+             "entries (use llama_enabled: false to disable scraping)")
+    seen: set[str] = set()
+    primaries = 0
+    clean: list[dict[str, Any]] = []
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            fail(f"llms[{i}] must be a mapping")
+        name = entry.get("name")
+        if not isinstance(name, str) or not _LLM_NAME_RE.fullmatch(name):
+            fail(f"llms[{i}].name must match [A-Za-z0-9._-]{{1,64}}")
+        if name in seen:
+            fail(f"llms[{i}].name {name!r} duplicated")
+        seen.add(name)
+        backend = entry.get("backend")
+        if backend not in _CONFIG_TARGET_BACKENDS:
+            fail(f"llms[{i}].backend must be one of "
+                 f"{', '.join(_CONFIG_TARGET_BACKENDS)}")
+        url = entry.get("url")
+        if not isinstance(url, str) or not url:
+            fail(f"llms[{i}].url must be a non-empty string")
+        token = entry.get("token")
+        if token is not None and not isinstance(token, str):
+            fail(f"llms[{i}].token must be a string")
+        if token is not None and backend != "litellm":
+            log.warning("llms[%d].token ignored (only litellm uses a "
+                        "Bearer token)", i)
+            token = None
+        primary = entry.get("primary", False)
+        if not isinstance(primary, bool):
+            fail(f"llms[{i}].primary must be a boolean")
+        if primary:
+            primaries += 1
+            if primaries > 1:
+                fail("llms: at most one entry may set primary: true")
+        clean.append({"name": name, "backend": backend, "url": url,
+                      "token": token, "primary": primary})
+    urls = [e["url"] for e in clean]
+    for u in sorted({u for u in urls if urls.count(u) > 1}):
+        log.warning("llms: url %s is configured for more than one target", u)
+    return clean
 
 
 def load_config(path: str | None = None,
@@ -2681,6 +3148,11 @@ def load_config(path: str | None = None,
             _fail("poll_interval must be a number > 0")
     if "llm_backend" in data and data["llm_backend"] not in _CONFIG_BACKENDS:
         _fail(f"llm_backend must be one of {', '.join(_CONFIG_BACKENDS)}")
+    if ("default_view" in data
+            and data["default_view"] not in _CONFIG_VIEWS):
+        _fail(f"default_view must be one of {', '.join(_CONFIG_VIEWS)}")
+    if "llms" in data:
+        data["llms"] = _validate_llms(data["llms"], _fail)
     for key in ("host", "llama_url", "vllm_url", "litellm_url"):
         if key in data and not isinstance(data[key], str):
             _fail(f"{key} must be a string")
@@ -2751,14 +3223,49 @@ def merge_upstreams(config_upstreams: list | None,
 
 def resolve_settings(args: argparse.Namespace,
                     config: dict[str, Any]) -> dict[str, Any]:
-    """Resolve CLI > config > built-in defaults into a settings dict."""
+    """Resolve CLI > config > built-in defaults into a settings dict.
+
+    ``litellm_token`` additionally honors ``RD_LITELLM_TOKEN``: when the
+    env var is set and non-empty it wins over both the CLI flag and
+    the config value.
+    """
     def pick(key: str, cli_value: Any) -> Any:
         return cli_value if cli_value is not None else config.get(
             key, _CONFIG_DEFAULTS[key])
 
+    def pick_token(key: str, cli_value: Any) -> Any:
+        env_token = os.environ.get("RD_LITELLM_TOKEN")
+        return env_token if env_token else pick(key, cli_value)
+
     llama_enabled = config.get("llama_enabled", True)
     if args.no_llama:
         llama_enabled = False  # flag wins when present
+
+    llms_cfg = config.get("llms")
+    if llms_cfg is not None:
+        clash = {k for k in _LLM_LEGACY_KEYS
+                 if getattr(args, k, None) is not None}
+        clash |= {k for k in _LLM_LEGACY_KEYS if k in config}
+        if clash:
+            log.error("llms: configured; drop the legacy LLM settings "
+                      "(%s) or remove llms", ", ".join(sorted(clash)))
+            sys.exit(1)
+        targets = [LLMTarget(e["name"], e["backend"], e["url"], e["token"])
+                   for e in llms_cfg]
+        primary_name = next((e["name"] for e in llms_cfg if e["primary"]),
+                            None)
+        if primary_name:
+            # stable sort: the primary entry leads the list (its snapshot
+            # becomes the legacy `llm` alias)
+            targets.sort(key=lambda t: t.name != primary_name)
+    else:
+        backend = pick("llm_backend", args.llm_backend)
+        url_map = {"llama": pick("llama_url", args.llama_url),
+                   "vllm": pick("vllm_url", args.vllm_url),
+                   "litellm": pick("litellm_url", args.litellm_url),
+                   "strata": pick("strata_url", args.strata_url)}
+        targets = [LLMTarget("primary", backend, url_map.get(backend),
+                             pick_token("litellm_token", args.litellm_token))]
 
     return {
         "host": pick("host", args.host),
@@ -2767,9 +3274,12 @@ def resolve_settings(args: argparse.Namespace,
         "llama_url": pick("llama_url", args.llama_url),
         "vllm_url": pick("vllm_url", args.vllm_url),
         "litellm_url": pick("litellm_url", args.litellm_url),
-        "litellm_token": pick("litellm_token", args.litellm_token),
+        "litellm_token": pick_token("litellm_token", args.litellm_token),
+        "strata_url": pick("strata_url", args.strata_url),
         "llm_backend": pick("llm_backend", args.llm_backend),
+        "default_view": pick("default_view", args.default_view),
         "llama_enabled": llama_enabled,
+        "llm_targets": targets,
         "upstreams": merge_upstreams(config.get("upstreams"),
                                     args.upstream),
     }
@@ -2887,6 +3397,18 @@ def collect_host_health_metrics(
 # Metrics Collector Thread
 # ---------------------------------------------------------------------------
 
+def _url_host_is_local(url: str | None) -> bool:
+    """True when a target URL points at this host (process-card gate)."""
+    if not url:
+        return False
+    try:
+        host = urllib.parse.urlparse(url).hostname or ""
+    except ValueError:
+        return False
+    return (host in ("localhost", "127.0.0.1", "::1", "0.0.0.0")
+            or host == platform.node() or host.endswith(".local"))
+
+
 class MetricsCollector(threading.Thread):
     """Background thread that polls system + GPU metrics and pushes JSON to a queue.
 
@@ -2903,6 +3425,8 @@ class MetricsCollector(threading.Thread):
         llm_backend: str = "auto",
         litellm_url: str = DEFAULT_LITELLM_URL,
         litellm_token: str | None = None,
+        strata_url: str = DEFAULT_STRATA_URL,
+        llm_targets: list[LLMTarget] | None = None,
     ) -> None:
         super().__init__(daemon=True)
         self.poll_interval = poll_interval
@@ -2912,6 +3436,12 @@ class MetricsCollector(threading.Thread):
         self.llm_backend = llm_backend
         self.litellm_url = litellm_url
         self.litellm_token = litellm_token
+        self.strata_url = strata_url
+        # Multi-LLM: ordered LLMTarget list; None = implicit single
+        # "primary" target built from the legacy per-type attributes
+        # above (rebuilt per tick, so __main__'s attribute writes and an
+        # atomic llm_targets rebind both take effect on the next scrape).
+        self.llm_targets = llm_targets
         # Bounded queue – maxsize entries; oldest dropped when full.
         self._queue: queue.Queue[str] = queue.Queue(maxsize=30)
         self.running = True
@@ -2920,11 +3450,16 @@ class MetricsCollector(threading.Thread):
         # make the cycle exceed the rate window). This keeps the
         # token-rate window ~poll_interval even when the main cycle
         # is slow.
-        self._llm_latest: dict[str, Any] | None = None
+        self._llm_latest: list[dict[str, Any]] | None = None
         self._llm_ready = threading.Event()
         self._llm_stop = threading.Event()
         self._llm_thread = threading.Thread(target=self._llm_loop,
-                                           daemon=True)
+                                           daemon=True,
+                                           name=f"rd-llm-{id(self):x}")
+        # Scrape threads of this instance carry the same prefix so tests
+        # can attribute HTTP calls to a specific collector (the module
+        # global starts at import and outlives any single test).
+        self._llm_thread_prefix = f"rd-llm-{id(self):x}"
         # Upstream dashboard aggregation: one fetch thread per upstream
         # (started from __main__ via start_upstreams; the collector is
         # already running by then). _upstream_latest is initialized here
@@ -2960,14 +3495,104 @@ class MetricsCollector(threading.Thread):
     def _llm_loop(self) -> None:
         """LLM scrape on its own cadence (decoupled from the main
         cycle, which includes GPU/health probes). Keeps the token-rate
-        window ~poll_interval even when the main cycle is slow."""
+        window ~poll_interval even when the main cycle is slow.
+
+        Multi-LLM: every configured target is scraped per tick.
+        Several targets run concurrently so one slow target (llama
+        worst case is three 2 s-timeout calls) cannot stretch the other
+        targets' 0.5-15 s rate windows or the 15 s stale-holds."""
         while self.running:
             try:
-                self._llm_latest = self._collect_llm()
+                if self.llama_enabled:
+                    targets = self._targets_snapshot()
+                    if len(targets) <= 1:
+                        self._llm_latest = (
+                            [self._collect_one(targets[0])]
+                            if targets else [])
+                    else:
+                        with ThreadPoolExecutor(
+                                max_workers=len(targets),
+                                thread_name_prefix=self._llm_thread_prefix,
+                        ) as ex:
+                            self._llm_latest = list(
+                                ex.map(self._collect_one, targets))
+                else:
+                    self._llm_latest = None
             except Exception:  # noqa: BLE001
                 log.exception("Error collecting LLM metrics")
             self._llm_ready.set()
             self._llm_stop.wait(self.poll_interval)
+
+    def _targets_snapshot(self) -> list[LLMTarget]:
+        """Current target list (rebuilt per tick so a mid-run rebind of
+        ``llm_targets`` — or of the legacy attributes before any rebind —
+        takes effect on the next scrape)."""
+        targets = self.llm_targets
+        if targets is None:
+            url = {"llama": self.llama_url, "vllm": self.vllm_url,
+                   "litellm": self.litellm_url,
+                   "strata": self.strata_url}.get(self.llm_backend)
+            targets = [LLMTarget("primary", self.llm_backend, url,
+                                 self.litellm_token)]
+        return list(targets)
+
+    def _collect_one(self, target: LLMTarget) -> dict[str, Any]:
+        """Scrape a single target into its snapshot entry.
+
+        Failed scrape (None past the stale-hold) still yields an entry:
+        ``{name, backend, status: "down"}`` — names stay stable in the UI
+        instead of vanishing, and history can gap-tick.
+        """
+        if target.backend == "auto":
+            data = self._collect_llm(state_key=target.name)
+        elif target.backend == "llama":
+            data = collect_llama_metrics(target.url,
+                                         state_key=target.name)
+            if data is not None:
+                data["backend"] = "llama"
+        elif target.backend == "vllm":
+            data = collect_vllm_metrics(target.url, state_key=target.name)
+            if data is not None:
+                data["backend"] = "vllm"
+        elif target.backend == "litellm":
+            data = collect_litellm_metrics(target.url, target.token,
+                                           state_key=target.name)
+            if data is not None:
+                data["backend"] = "litellm"
+        elif target.backend == "strata":
+            data = collect_strata_metrics(target.url,
+                                          state_key=target.name)
+            if data is not None:
+                data["backend"] = "strata"
+        else:
+            data = None
+        if data is None:
+            return {"name": target.name, "backend": target.backend,
+                    "status": "down"}
+        # llama process-card attribution: the local biggest-RSS
+        # llama-server can only be tied to a llama target when the URL is
+        # local AND that target is the dashboard's only llama server
+        # (behavior change vs. the single-backend builds; see README).
+        if data.get("backend") == "llama":
+            url = (target.url if target.backend == "llama"
+                   else self.llama_url)
+            llama_count = sum(1 for t in self._targets_snapshot()
+                              if t.backend == "llama")
+            if target.backend == "auto":
+                llama_count += 1  # the auto winner is a llama server too
+            if llama_count > 1 or not _url_host_is_local(url):
+                data.pop("process", None)
+        data["name"] = target.name
+        return data
+
+    def stop(self, timeout: float = 2.0) -> None:
+        """Shut both loops down promptly (the LLM thread otherwise
+        sleeps out its whole poll interval before noticing
+        ``running`` flipped) — used by tests and shutdown paths."""
+        self.running = False
+        self._llm_stop.set()
+        if self._llm_thread.is_alive():
+            self._llm_thread.join(timeout=timeout)
 
     def start_upstreams(self, entries: list[dict[str, str]]) -> None:
         """Spawn one daemon fetch thread per configured upstream (a no-op
@@ -2996,21 +3621,22 @@ class MetricsCollector(threading.Thread):
                 log.exception("Error collecting upstream %s", name)
             self._upstream_stop.wait(self.poll_interval)
 
-    def _collect_llm(self) -> dict[str, Any] | None:
-        """Stateless LLM backend selection (re-evaluated every cycle).
+    def _collect_llm(self, state_key: str = "primary") -> dict[str, Any] | None:
+        """Auto-mode LLM backend selection over the legacy per-type URLs
+        (re-evaluated every cycle; used for the implicit "auto" target).
 
-        auto semantics: try vLLM first, then the LiteLLM proxy, fall
-        through to llama.cpp. The per-collector 15 s stale-hold IS the
+        auto semantics: try vLLM first, then the LiteLLM proxy, then
+        Strata, fall through to llama.cpp. The per-collector 15 s stale-hold IS the
         hysteresis: a <15 s blip keeps the current backend flagged
         stale; a real outage falls through to the next backend, and
         recovery flips back on the next cycle. A pinned backend skips
         the other branches entirely.
         """
-        global _llm_tie_warned, _litellm_tie_warned
+        global _llm_tie_warned, _litellm_tie_warned, _strata_tie_warned
         if not self.llama_enabled:
             return None
         if self.llm_backend in ("auto", "vllm"):
-            data = collect_vllm_metrics(self.vllm_url)
+            data = collect_vllm_metrics(self.vllm_url, state_key=state_key)
             if data is not None:
                 data["backend"] = "vllm"
                 # Warn once: vLLM is silently preferred in auto mode. We
@@ -3027,7 +3653,8 @@ class MetricsCollector(threading.Thread):
                 return data
         if self.llm_backend in ("auto", "litellm"):
             data = collect_litellm_metrics(self.litellm_url,
-                                           self.litellm_token)
+                                           self.litellm_token,
+                                           state_key=state_key)
             if data is not None:
                 data["backend"] = "litellm"
                 if self.llm_backend == "auto" and not _litellm_tie_warned:
@@ -3038,8 +3665,22 @@ class MetricsCollector(threading.Thread):
                         "instead, pin --llm-backend llama (logged once).",
                         self.litellm_url)
                 return data
+        if self.llm_backend in ("auto", "strata"):
+            data = collect_strata_metrics(self.strata_url,
+                                          state_key=state_key)
+            if data is not None:
+                data["backend"] = "strata"
+                if self.llm_backend == "auto" and not _strata_tie_warned:
+                    _strata_tie_warned = True
+                    log.warning(
+                        "LLM auto mode: using Strata at %s. If llama.cpp "
+                        "is also reachable and you want it instead, pin "
+                        "--llm-backend llama (logged once).",
+                        self.strata_url)
+                return data
         if self.llm_backend in ("auto", "llama"):
-            data = collect_llama_metrics(self.llama_url)
+            data = collect_llama_metrics(self.llama_url,
+                                         state_key=state_key)
             if data is not None:
                 data["backend"] = "llama"
                 return data
@@ -3068,8 +3709,19 @@ class MetricsCollector(threading.Thread):
             # Stable signal for the frontend: the LLM section is on by
             # default; --no-llama skips scraping entirely and hides the card.
             "llm_enabled": self.llama_enabled,
-            "llm": self._llm_latest,
         }
+        # Multi-LLM: ordered entries, one per configured target (down
+        # placeholders included). The legacy `llm` key is the PRIMARY
+        # (first) target's entry — None when it is unreachable, exactly
+        # the old single-backend contract. It is NOT an aggregate across
+        # targets: fleet consumers sum `llms`.
+        entries = ((self._llm_latest or []) if self.llama_enabled else [])
+        metrics["llms"] = entries
+        primary = entries[0] if entries else None
+        metrics["llm"] = (primary
+                          if primary is not None
+                          and primary.get("status") != "down"
+                          else None)
         # Multi-system consolidation: the local system first (same values
         # as the top-level keys), then one entry per configured upstream.
         # `list()` snapshot: start_upstreams may still be appending.
@@ -3113,10 +3765,16 @@ collector = MetricsCollector(poll_interval=1.0)
 collector.start()
 
 
+# Initial system tab shown on page load ("local" | "fleet"); set from
+# settings in __main__ before the server starts.
+_default_view = "local"
+
+
 @app.route("/")
 def index() -> str:
     """Serve the dashboard HTML page."""
-    return render_template("index.html", hostname=platform.node())
+    return render_template("index.html", hostname=platform.node(),
+                           default_view=_default_view)
 
 
 @app.route("/events")
@@ -3187,12 +3845,23 @@ if __name__ == "__main__":
     parser.add_argument("--litellm-token", default=None,
                         help="Bearer token for the LiteLLM /metrics endpoint "
                              "(only needed when require_auth_for_metrics_endpoint is set)")
+    parser.add_argument("--strata-url", default=None,
+                        help="Base URL of a Strata inference engine "
+                             "(expects its JSON /metrics endpoint). "
+                             "The default http://127.0.0.1:8080 works when the dashboard and "
+                             "Strata run on the same host; pass a remote URL otherwise, "
+                             "e.g. http://<strata-host>:8080")
     parser.add_argument("--llm-backend", default=None,
-                        choices=["auto", "llama", "vllm", "litellm"],
+                        choices=["auto", "llama", "vllm", "litellm",
+                                 "strata"],
                         help="LLM backend selection (default: auto). "
                              "auto tries vLLM first, then the LiteLLM proxy, "
-                             "then llama.cpp; pin to 'llama', 'vllm' or 'litellm' "
-                             "to skip the others.")
+                             "then Strata, then llama.cpp; pin to 'llama', "
+                             "'vllm', 'litellm' or 'strata' to skip the others.")
+    parser.add_argument("--default-view", default=None,
+                        choices=["local", "fleet"],
+                        help="System tab shown on page load (default: local). "
+                             "'fleet' opens the multi-system summary view.")
     parser.add_argument("--no-llama", action="store_true",
                         help="disable the LLM section (enabled by default)")
     parser.add_argument("--upstream", action="append", default=[],
@@ -3211,12 +3880,19 @@ if __name__ == "__main__":
     collector.vllm_url = settings["vllm_url"]
     collector.litellm_url = settings["litellm_url"]
     collector.litellm_token = settings["litellm_token"]
+    collector.strata_url = settings["strata_url"]
     collector.llm_backend = settings["llm_backend"]
+    # Multi-LLM: atomic rebind of the target list (single attribute
+    # assignment; the scrape loop snapshots it per tick). The legacy
+    # attributes above stay meaningful for the implicit auto target.
+    collector.llm_targets = settings["llm_targets"]
     collector.start_upstreams(settings["upstreams"])
+    _default_view = settings["default_view"]  # module scope; read by index()
 
     llm_status = "disabled" if not settings["llama_enabled"] else (
-        f"backend={settings['llm_backend']}, vllm={settings['vllm_url']}, "
-        f"litellm={settings['litellm_url']}, llama={settings['llama_url']}")
+        "targets=" + ", ".join(
+            f"{t.name}:{t.backend}" + (f"@{t.url}" if t.url else "")
+            for t in settings["llm_targets"]))
     up_status = (f", upstreams={', '.join(u['name'] for u in settings['upstreams'])}"
                 if settings["upstreams"] else "")
     log.info("Starting Resource Dashboard on http://%s:%d (LLM: %s%s)",

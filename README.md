@@ -7,7 +7,7 @@ A lightweight, real-time web dashboard for monitoring CPU load, memory usage, an
 - **CPU**: Overall and per-core utilization with live trend chart
 - **Memory**: Usage percentage, used/total GB with live trend chart
 - **GPU** (per card): Utilization % and Memory % gauges + trend charts, temperature, clock, power draw, thermal-throttle badges. Sources: **NVIDIA** via `pynvml` → `nvidia-smi`; **AMD** via `amd-smi` → `rocm-smi` → sysfs (see below); **JetPack** via sysfs. AMD throttle badges are present but always report *no throttle* (the tools don't expose a comparable signal); AMD cards show no clock/power on the sysfs-only path.
-- **Local LLM (llama.cpp / vLLM)** — generation & prompt tokens/s, requests in flight, KV cache / context, latency (TTFT/ITL/E2E for vLLM), spec-decode accept, prefix-cache hit, loaded model name. Auto-detects the backend (vLLM wins on tie); pin with `--llm-backend`
+- **Local LLM (llama.cpp / vLLM / LiteLLM / Strata)** — generation & prompt tokens/s, requests in flight, KV cache / context, latency (TTFT/ITL/E2E for vLLM), spec-decode accept, prefix-cache hit, loaded model name. Auto-detects the backend (vLLM wins on tie); pin with `--llm-backend`; or run **several LLM servers at once** via `llms:` (one card per target, parallel scraping)
 - **Real-time updates** via Server-Sent Events (SSE) — no page refreshes needed
 
 ## Prerequisites
@@ -96,8 +96,11 @@ python app.py --host 127.0.0.1 --port 8080
 python app.py --llama-url http://192.168.1.50:5001   # point at your llama-server
 python app.py --vllm-url http://192.168.1.50:8000   # point at your vLLM server
 python app.py --litellm-url http://192.168.1.50:4000  # point at your LiteLLM proxy
+python app.py --strata-url http://192.168.1.50:8080   # point at your Strata engine
 python app.py --llm-backend vllm                     # pin to vLLM (skip auto-detect)
 python app.py --llm-backend litellm                  # pin to LiteLLM (skip auto-detect)
+python app.py --llm-backend strata                   # pin to Strata (skip auto-detect)
+python app.py --default-view fleet                   # open the Fleet tab on load
 python app.py --no-llama                             # hide the LLM section entirely
 python app.py --upstream athena=http://192.168.1.50:5001   # merge another dashboard
 python app.py --config /path/to/config.yaml          # explicit config file
@@ -111,14 +114,31 @@ All CLI options can also be set in a YAML config file. A `config.yaml` in the
 working directory is **auto-detected**; pass `--config PATH` for an explicit
 file. Precedence: **CLI flags > config.yaml > built-in defaults**.
 
+`litellm_token` has one exception: the **`RD_LITELLM_TOKEN`** environment
+variable. When it is set and non-empty it wins over both the CLI flag and
+the config value (env > CLI > config), so the token can be kept out of
+config files and process lists. (An empty `RD_LITELLM_TOKEN` is treated
+as unset.)
+
 ```yaml
 # see config.example.yaml for the full annotated example
 port: 5001
 poll_interval: 1.0
-llm_backend: litellm            # auto | llama | vllm | litellm
+llm_backend: litellm            # auto | llama | vllm | litellm | strata
 litellm_url: http://127.0.0.1:4000
 litellm_token: sk-...
+strata_url: http://127.0.0.1:8080   # Strata inference engine (JSON /metrics)
+default_view: local             # system tab on load: local (default) | fleet
 llama_enabled: true            # false == --no-llama (the flag wins when passed)
+# Multiple LLM servers instead of the single-backend keys above (see the
+# Multiple LLM servers section below for the full rules):
+# llms:
+#   - name: studio
+#     backend: strata
+#     url: http://127.0.0.1:8080
+#   - name: gpu-box
+#     backend: vllm
+#     url: http://192.168.5.30:8000
 upstreams:
   - name: athena
     url: http://athena.lungfish-smelt.ts.net:5001
@@ -147,8 +167,10 @@ python app.py \
   --upstream modelbox=http://192.168.5.207:5001
 ```
 
-The UI adds a tab row: **Fleet** (default) + one tab per system, each with a
-status dot (green up / yellow stale / red down). The Fleet view shows a
+The UI adds a tab row: **Fleet** + one tab per system, each with a
+status dot (green up / yellow stale / red down). The **Local** tab is the
+default view on load; set `default_view: fleet` (config) or
+`--default-view fleet` to open the Fleet summary instead. The Fleet view shows a
 summary strip (per-system CPU / mem / GPU / LLM tokens/s) and a fleet
 **tokens/s chart**: total = filled area, each system = non-filled line over
 it. Per-system tabs show the full detail view (GPU cards, LLM section, CPU/mem
@@ -182,9 +204,9 @@ long-lived SSE `/events` stream, so an aggregating dashboard will show
 such an upstream as
 **stale** (last values held for 15 s) or **down** until it is redeployed.
 
-### Local LLM section (llama.cpp / vLLM / LiteLLM)
+### Local LLM section (llama.cpp / vLLM / LiteLLM / Strata)
 
-The dashboard auto-detects which LLM backend is running. In `auto` mode (default), it probes vLLM first (`--vllm-url`, default `http://127.0.0.1:5001`), then the LiteLLM proxy (`--litellm-url`, default `http://127.0.0.1:4000`), then llama.cpp (`--llama-url`, default `http://127.0.0.1:5001`). If several are up, vLLM wins, then LiteLLM (a one-time log warning tells you how to pin the other). Use `--llm-backend llama`, `--llm-backend vllm` or `--llm-backend litellm` to pin.
+The dashboard auto-detects which LLM backend is running. In `auto` mode (default), it probes vLLM first (`--vllm-url`, default `http://127.0.0.1:5001`), then the LiteLLM proxy (`--litellm-url`, default `http://127.0.0.1:4000`), then Strata (`--strata-url`, default `http://127.0.0.1:8080`), then llama.cpp (`--llama-url`, default `http://127.0.0.1:5001`). If several are up, vLLM wins, then LiteLLM, then Strata (a one-time log warning tells you how to pin the other). Use `--llm-backend llama`, `--llm-backend vllm`, `--llm-backend litellm` or `--llm-backend strata` to pin.
 
 **llama.cpp** (when `llama-server` is reachable with `--metrics`):
 - Gen/prompt tokens/s from per-slot live decode counters in `GET /slots`
@@ -208,7 +230,47 @@ The dashboard auto-detects which LLM backend is running. In `auto` mode (default
 - The model shown is the `requested_model` label (client-facing alias), first seen series
 - Stale-hold: last data held for 15 s after a failed scrape; `--litellm-token` sends a `Bearer` header when `require_auth_for_metrics_endpoint` is set
 
+**Strata** (when `/metrics` responds with the Strata JSON document — `engine` + `live` objects; see [github.com/Niko1221/Strata](https://github.com/Niko1221/Strata); default port 8080):
+- Gen/prompt tokens/s from `totals.output_tokens` / `totals.prompt_tokens` counter deltas (rate window 0.5–15 s; last rate held across longer gaps); Strata's `/metrics` is JSON, not Prometheus text
+- Running/queued+waiting batch requests, live tok/s and engine state (idle / reading / generating) from `live`
+- Per-slot context bars from `live.slots` (idle slots show the KV prefix they hold), free/total batch slots, spec-decode (MTP) accept rate from `totals.drafts_*`
+- KV prefix reuse % (`totals.reused` ⊂ `totals.prompt_tokens`, nested like vLLM's cached accounting)
+- TTFT / E2E / ITL as windowed means over newly finished entries of the `requests` ring buffer (`prompt_ms` / `duration_s` / `decode_tok_s`)
+- Usage summary: total/gen tokens, prompt-cached %, uptime from `totals.since`
+- Stale-hold: last data held for 15 s after a failed scrape
+
 The card shows **unreachable** when the URL is wrong, unroutable, or the server is not running. If a scrape fails, the last data is held for up to 15 s and shown as **stale**. Pass `--no-llama` to disable the section entirely (no scraping, card hidden); it is enabled by default.
+
+### Multiple LLM servers (`llms:`)
+
+A dashboard can scrape any number of inference servers at once (e.g. two Strata engines, or Strata + vLLM + a LiteLLM proxy). Each target gets its own card, its own trend-chart history, and its own stale-hold; targets are scraped in parallel so one slow or down server cannot delay the others.
+
+```yaml
+# config.yaml — replaces the single-backend keys entirely
+llms:
+  - name: studio          # [A-Za-z0-9._-], unique, max 64 chars
+    backend: strata       # llama | vllm | litellm | strata (no auto per target)
+    url: http://127.0.0.1:8080
+  - name: gpu-box
+    backend: vllm
+    url: http://192.168.5.30:8000
+  - name: proxy
+    backend: litellm
+    url: http://127.0.0.1:4000
+    token: sk-...          # optional; Bearer header (litellm only)
+    primary: true          # optional; at most one (default: first entry)
+```
+
+Rules and behaviour:
+
+- `llms:` **replaces** the single-backend settings. Any legacy key (`llm_backend`, `llama_url`, `vllm_url`, `litellm_url`, `litellm_token`, `strata_url`) in the config or on the CLI together with `llms:` exits at startup with `llms: configured; drop the legacy LLM settings (…) or remove llms`. Without `llms:` the single-backend mode works exactly as before (one implicit target named `primary`, auto-detect allowed).
+- Config validation is strict: bad names, unknown/missing backends, empty urls, duplicate names or two `primary:` entries exit with an error (unlike `upstreams:`, which warns and skips).
+- **API**: `/api/metrics` gains an `llms` array — one entry per target in primary-first order, each with `name`, `backend`, `status` (`up` / `stale` / `down`) plus the usual backend fields; unreachable targets appear as `{name, backend, status: "down"}` placeholders, never missing. The legacy `llm` key remains and is the **primary target's entry** (or `null` when it is unreachable) — *not* an aggregate across targets.
+- **Fleet/upstream aggregation**: a fleet dashboard sums each system's `llms` entries (up + stale) for the Gen tok/s strip and the fleet chart, so one line per system regardless of how many servers it hosts. Per-target histories reset independently when a target's backend changes (auto mode only; `llms:` targets are pinned).
+- **Process attribution (behavior change)**: the `process` field (RSS/CPU of the `llama-server` process) is attached only when the dashboard's *sole* target is a llama server whose URL host is the dashboard's own host. Previously it was attached whenever a local llama server was found — with several targets the attribution could point at the wrong server, so remote and multi-target setups now simply omit it (the process line stays hidden).
+- **Rolling update order**: update **aggregating (fleet) dashboards first**, then the leaf dashboards. Fleet dashboards understand both payload shapes (they shim an old-style `llm`-only payload into a single synthetic target), whereas an old fleet dashboard reading a new leaf simply ignores its `llms` array and keeps showing the `llm` primary alias — so the compatible order is aggregator-first.
+- The `--no-llama` switch and `llm_enabled: false` disable all targets at once (`llms: []` in the payload).
+- Per-target llama.cpp usage-state files are named `.llama_usage_state.<name>.json` (the implicit single target keeps the original `.llama_usage_state.json`).
 
 ### AMD GPU support (amd-smi / rocm-smi / sysfs)
 
@@ -228,7 +290,7 @@ Card name / board vendor come from `lspci` (via the sysfs `device` → PCI BDF s
 curl http://127.0.0.1:5000/api/metrics | python -m json.tool
 ```
 
-**Breaking change:** the per-snapshot key `llama` was replaced by `llm` (with a `backend: "llama" | "vllm" | "litellm"` discriminator) and `llama_enabled` by `llm_enabled`; the older output shape is gone.
+**Breaking change:** the per-snapshot key `llama` was replaced by `llm` (with a `backend: "llama" | "vllm" | "litellm" | "strata"` discriminator) and `llama_enabled` by `llm_enabled`; the older output shape is gone.
 
 ## Running Tests
 
