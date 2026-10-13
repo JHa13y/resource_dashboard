@@ -3444,10 +3444,13 @@ def _url_host_is_local(url: str | None) -> bool:
 
 
 class MetricsCollector(threading.Thread):
-    """Background thread that polls system + GPU metrics and pushes JSON to a queue.
+    """Background thread that polls system + GPU metrics and broadcasts each
+    JSON snapshot to every subscriber, plus a cached last-snapshot for
+    one-shot readers (``/api/metrics``).
 
-    The queue is bounded; when full the *oldest* entry is discarded so consumers
-    always see the freshest data.
+    A per-client bounded buffer carries the fan-out; when one is full the
+    *oldest* entry is dropped so a blocked/slow client cannot grow unbounded
+    or starve the other clients or the producer.
     """
 
     def __init__(
@@ -3476,8 +3479,16 @@ class MetricsCollector(threading.Thread):
         # above (rebuilt per tick, so __main__'s attribute writes and an
         # atomic llm_targets rebind both take effect on the next scrape).
         self.llm_targets = llm_targets
-        # Bounded queue – maxsize entries; oldest dropped when full.
-        self._queue: queue.Queue[str] = queue.Queue(maxsize=30)
+        # Broadcast hub: the last serialized snapshot + a monotonic
+        # sequence, fanned out to every subscriber. Replaces the old
+        # single-consumer queue.Queue — each snapshot is now broadcast
+        # (not distributed to one consumer), a blocked/slow client cannot
+        # starve the others or the producer, and /api/metrics reads the
+        # cached snapshot without consuming it.
+        self._hub = threading.Condition()
+        self._last_payload: str | None = None
+        self._sequence = 0
+        self._subscribers: list[queue.Queue[str]] = []
         self.running = True
         # The LLM scrape runs on its own 1 s cadence, decoupled from
         # the main cycle (which includes GPU/health probes that can
@@ -3509,22 +3520,64 @@ class MetricsCollector(threading.Thread):
     # -- public API ----------------------------------------------------------
 
     def get_latest(self, timeout: float | None = None) -> str | None:
-        """Return the most recent metrics JSON string (blocking with *timeout*)."""
-        try:
-            return self._queue.get(timeout=timeout)
-        except queue.Empty:
-            return None
+        """Return the most recent metrics JSON string (non-destructive: reads
+        the cached snapshot, does not consume it). Blocks up to *timeout*
+        waiting for the first snapshot if none exists yet."""
+        with self._hub:
+            if self._last_payload is None and timeout is not None:
+                self._hub.wait(timeout)
+            return self._last_payload
 
     # -- internal ------------------------------------------------------------
 
-    def _drain_old(self) -> None:
-        """Discard all but the newest entry so stale data never accumulates."""
-        while self._queue.qsize() > 1:
+    def publish(self, payload: str) -> None:
+        """Publish one serialized snapshot to the hub (broadcast to every
+        subscriber; the producer never blocks on a slow consumer)."""
+        with self._hub:
+            self._last_payload = payload
+            self._sequence += 1
+            self._hub.notify_all()
+            subscribers = list(self._subscribers)
+        for q in subscribers:
+            # Per-client bounded buffer with drop-oldest: a blocked/slow
+            # client cannot grow unbounded or starve the producer.
+            if q.full():
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    pass
             try:
-                self._queue.get_nowait()
-                self._queue.task_done()
-            except queue.Empty:
-                break
+                q.put_nowait(payload)
+            except queue.Full:
+                pass  # dropped for this slow client only
+
+    def subscribe(self, maxsize: int = 30) -> queue.Queue[str]:
+        """Return a per-client bounded queue that receives every future
+        snapshot (and the current one immediately, if any — a mid-stream
+        subscriber does not wait a cycle)."""
+        q: queue.Queue[str] = queue.Queue(maxsize=maxsize)
+        with self._hub:
+            last = self._last_payload
+            self._subscribers.append(q)
+            # Seed under the lock (atomic with the append) so a concurrent
+            # publish() cannot interleave and put a newer snapshot ahead of
+            # the seeded (older) one — that would break frame ordering.
+            if last is not None:
+                if q.full():
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        pass
+                q.put_nowait(last)
+        return q
+
+    def unsubscribe(self, q: queue.Queue[str]) -> None:
+        """Detach a per-client buffer (e.g. when its SSE client leaves)."""
+        with self._hub:
+            try:
+                self._subscribers.remove(q)
+            except ValueError:
+                pass
 
     def _llm_loop(self) -> None:
         """LLM scrape on its own cadence (decoupled from the main
@@ -3813,10 +3866,7 @@ class MetricsCollector(threading.Thread):
                 log.info("cycle late: collect=%.2fs, %.2fs past its "
                          "slot", collect_s, drift)
             if metrics is not None:
-                payload = json.dumps(metrics)
-                if self._queue.full():
-                    self._drain_old()
-                self._queue.put_nowait(payload)
+                self.publish(json.dumps(metrics))
             time.sleep(max(0.0, next_ts - time.monotonic()))
 
 
@@ -3843,15 +3893,22 @@ def index() -> str:
 
 @app.route("/events")
 def events() -> Response:
-    """SSE endpoint – streams JSON metrics to connected clients."""
+    """SSE endpoint – streams JSON metrics to connected clients. Each client
+    gets its own per-client buffer (broadcast), so a blocked client cannot
+    starve the others or /api/metrics."""
     def generate() -> Generator[str, None, None]:
-        while True:
-            data = collector.get_latest(timeout=5.0)
-            if data is not None:
+        q = collector.subscribe()
+        try:
+            while True:
+                try:
+                    data = q.get(timeout=5.0)
+                except queue.Empty:
+                    # Keepalive comment – prevents proxy / browser timeout
+                    yield ": keepalive\n\n"
+                    continue
                 yield f"data: {data}\n\n"
-            else:
-                # Keepalive comment – prevents proxy / browser timeout
-                yield ": keepalive\n\n"
+        finally:
+            collector.unsubscribe(q)
 
     return Response(
         generate(),

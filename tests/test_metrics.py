@@ -243,20 +243,30 @@ def test_collector_produces_data():
 
 
 def test_collector_queue_bounded():
-    """When the queue is full, old data should be dropped."""
+    """A slow subscriber's per-client buffer is bounded: when full, the
+    *oldest* snapshot is dropped (drop-oldest) so a blocked client cannot
+    grow unbounded or starve the producer."""
     from app import MetricsCollector
 
     collector = MetricsCollector(poll_interval=0.1)
-    # Shrink queue for faster test
-    collector._queue = queue.Queue(maxsize=3)
+    collector.llama_enabled = False
+    # Shrink the per-client buffer for a fast test.
+    q = collector.subscribe(maxsize=3)
     collector.start()
     try:
-        time.sleep(0.6)  # let it produce ~6 items (queue max is 3)
-        # Drain all items
+        time.sleep(0.6)  # let it publish ~6 snapshots (buffer max is 3)
+        # Drain the subscriber's bounded buffer.
         items = []
-        while not collector._queue.empty():
-            items.append(collector._queue.get_nowait())
+        while True:
+            try:
+                items.append(q.get_nowait())
+            except queue.Empty:
+                break
         assert len(items) <= 3
+        # Drop-oldest: the retained items are the most recent, in order.
+        if len(items) >= 2:
+            ts = [json.loads(x)["timestamp"] for x in items]
+            assert ts == sorted(ts)
     finally:
         collector.stop()
         collector.join(timeout=2)
@@ -267,7 +277,6 @@ def test_collector_llm_disabled_performs_no_llm_calls():
     from app import MetricsCollector
 
     collector = MetricsCollector(poll_interval=0.1, llama_enabled=False)
-    collector._queue = queue.Queue(maxsize=3)
     # The module-global collector (started at import) keeps probing in
     # the background; count only calls made by THIS collector's scrape
     # threads (named per instance in MetricsCollector.__init__).
@@ -302,7 +311,6 @@ def test_collector_llm_enabled_by_default():
 
     collector = MetricsCollector(poll_interval=0.1)
     assert collector.llama_enabled is True
-    collector._queue = queue.Queue(maxsize=3)
     with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
         "/metrics": LLAMA_METRICS_SAMPLE.encode(),
         "/props": b'{"model_path": "/models/x.gguf", "total_slots": 1}',
@@ -328,7 +336,6 @@ def test_collector_llm_thread_populates_latest():
     from app import MetricsCollector
 
     collector = MetricsCollector(poll_interval=0.1)
-    collector._queue = queue.Queue(maxsize=3)
     with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
         "/metrics": LLAMA_METRICS_SAMPLE.encode(),
         "/props": b'{"model_path": "/models/x.gguf", "total_slots": 1}',
@@ -345,6 +352,118 @@ def test_collector_llm_thread_populates_latest():
         finally:
             collector.stop()
             collector.join(timeout=2)
+
+
+def test_two_subscribers_receive_same_snapshot():
+    """Two /events clients both receive the SAME snapshot (broadcast, not
+    distribution): the old single-consumer queue gave each client a
+    disjoint frame."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1)
+    collector.llama_enabled = False
+    q1 = collector.subscribe()
+    q2 = collector.subscribe()
+    collector.start()
+    try:
+        # Both subscribers receive the first published snapshot.
+        p1 = q1.get(timeout=5.0)
+        p2 = q2.get(timeout=5.0)
+        assert p1 is not None and p2 is not None
+        m1 = json.loads(p1)
+        m2 = json.loads(p2)
+        # Identical payload (same timestamp + content) = broadcast.
+        assert m1["timestamp"] == m2["timestamp"]
+        assert m1 == m2
+    finally:
+        collector.stop()
+        collector.join(timeout=2)
+
+
+def test_api_metrics_200_while_subscriber_attached(monkeypatch):
+    """/api/metrics returns 200 (the cached snapshot) while a subscriber is
+    attached — the old destructive get_latest() let a blocked SSE client
+    win the only frame, so /api/metrics timed out (503)."""
+    import app as app_mod
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1)
+    collector.llama_enabled = False
+    collector.start()
+    try:
+        # A snapshot exists.
+        assert collector.get_latest(timeout=5.0) is not None
+        # Attach a subscriber (a /events client).
+        q = collector.subscribe()
+        try:
+            monkeypatch.setattr(app_mod, "collector", collector)
+            resp = app_mod.app.test_client().get("/api/metrics")
+            assert resp.status_code == 200
+            body = resp.get_json()
+            assert "cpu" in body and "systems" in body
+        finally:
+            collector.unsubscribe(q)
+    finally:
+        collector.stop()
+        collector.join(timeout=2)
+
+
+def test_midstream_subscriber_gets_current_snapshot_without_waiting():
+    """A client subscribing mid-stream gets the current snapshot
+    immediately (seeded on subscribe), without waiting a full cycle."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.2)
+    collector.llama_enabled = False
+    collector.start()
+    try:
+        # Wait until a snapshot exists (mid-stream = after production began).
+        assert collector.get_latest(timeout=5.0) is not None
+        # A new client subscribes now.
+        q = collector.subscribe()
+        # It must get the current snapshot well under one 0.2 s cycle.
+        t0 = time.monotonic()
+        data = q.get(timeout=0.1)  # 0.1 s < 0.2 s cycle
+        elapsed = time.monotonic() - t0
+        assert data is not None
+        m = json.loads(data)
+        assert "cpu" in m
+        # Delivered without waiting a cycle.
+        assert elapsed < 0.19
+    finally:
+        collector.stop()
+        collector.join(timeout=2)
+
+
+def test_systems_metrics_no_self_nesting():
+    """section-2 guardrail: systems[0].metrics must equal the top-level
+    keys minus `systems` — a refactor that snapshots after assembly would
+    self-nest `systems` inside systems[0].metrics and double the payload."""
+    from app import MetricsCollector
+
+    collector = MetricsCollector(poll_interval=0.1)
+    collector.llama_enabled = False
+    collector.start()
+    try:
+        data = collector.get_latest(timeout=5.0)
+        assert data is not None
+        m = json.loads(data)
+        # Top-level keys are frozen.
+        top = {"timestamp", "cpu", "cpu_per_core", "memory", "gpus",
+               "swap", "host_health", "llm_enabled", "llm", "llms",
+               "systems"}
+        assert set(m.keys()) == top
+        # systems[0] is the local entry.
+        local = m["systems"][0]
+        assert local["name"] == "local"
+        # systems[0].metrics == top-level keys minus `systems`.
+        assert set(local["metrics"].keys()) == (top - {"systems"})
+        # The self-nesting trap: `systems` must NOT appear inside
+        # systems[0].metrics.
+        assert "systems" not in local["metrics"]
+    finally:
+        collector.stop()
+        collector.join(timeout=2)
 
 
 # ---------------------------------------------------------------------------
@@ -2027,7 +2146,6 @@ def test_collector_snapshot_includes_swap():
     from app import MetricsCollector
 
     collector = MetricsCollector(poll_interval=0.1, llama_enabled=False)
-    collector._queue = queue.Queue(maxsize=3)
     with patch("app.psutil.swap_memory",
                return_value=_fake_swap(sin=1024, sout=2048)):
         collector.start()
@@ -2135,7 +2253,6 @@ def test_collector_snapshot_includes_host_health():
     from app import MetricsCollector
 
     collector = MetricsCollector(poll_interval=0.1, llama_enabled=False)
-    collector._queue = queue.Queue(maxsize=3)
     procs = [
         _fake_status_proc(psutil.STATUS_DISK_SLEEP),
         _fake_status_proc(psutil.STATUS_RUNNING),
@@ -2792,7 +2909,6 @@ def test_collect_llm_both_up_vllm_wins():
     from app import MetricsCollector
 
     collector = MetricsCollector(poll_interval=0.1, llm_backend="auto")
-    collector._queue = queue.Queue(maxsize=3)
 
     vllm_body = VLLM_METRICS_SAMPLE.encode()
     llama_body = LLAMA_METRICS_SAMPLE.encode()
@@ -3047,7 +3163,6 @@ def test_snapshot_schema_llm_key_singular():
     from app import MetricsCollector
 
     collector = MetricsCollector(poll_interval=0.1, llm_backend="vllm")
-    collector._queue = queue.Queue(maxsize=3)
     collector.vllm_url = "http://127.0.0.1:9998"
 
     vllm_body = VLLM_METRICS_SAMPLE.encode()
@@ -4644,7 +4759,6 @@ def test_snapshot_systems_array():
               "llm": None, "systems": [{"name": "should-not-nest"}],
               "app_level": 1}
     collector = MetricsCollector(poll_interval=0.1)
-    collector._queue = queue.Queue(maxsize=3)
     collector.llama_enabled = False
     collector.start_upstreams(
         [{"name": "mock", "url": "http://127.0.0.1:9996"}])
@@ -4682,7 +4796,6 @@ def test_collector_upstream_thread_populates_latest():
 
     payload = {"cpu": 7.5, "gpus": []}
     collector = MetricsCollector(poll_interval=0.1)
-    collector._queue = queue.Queue(maxsize=3)
     collector.llama_enabled = False
     collector.start_upstreams(
         [{"name": "mock", "url": "http://127.0.0.1:9996"}])
@@ -4721,7 +4834,6 @@ def test_snapshot_upstream_down_after_hold_expiry():
     orig = app_mod._upstream_last_good
     app_mod._upstream_last_good = {}
     collector = MetricsCollector(poll_interval=0.05)
-    collector._queue = queue.Queue(maxsize=3)
     collector.llama_enabled = False
     try:
         with patch("app.urllib.request.urlopen", side_effect=fake_urlopen), \
@@ -4770,7 +4882,6 @@ def test_start_upstreams_empty_noop():
     from app import MetricsCollector
 
     collector = MetricsCollector(poll_interval=0.1)
-    collector._queue = queue.Queue(maxsize=3)
     collector.llama_enabled = False
     collector.start_upstreams([])
     assert collector._upstream_names == []
@@ -4804,7 +4915,6 @@ def test_snapshot_upstream_initial_down():
     from app import MetricsCollector
 
     collector = MetricsCollector(poll_interval=1.0)
-    collector._queue = queue.Queue(maxsize=3)
     collector.llama_enabled = False
     # A configured upstream before any fetch has landed (no
     # _upstream_last_good entry, thread not run / not yet fetched):
@@ -5530,7 +5640,6 @@ def test_fixed_rate_schedule_holds_period_under_collect_cost():
     from app import MetricsCollector
 
     collector = MetricsCollector(poll_interval=1.0, llama_enabled=False)
-    collector._queue = queue.Queue(maxsize=30)
     stamps: list[float] = []
 
     def fake_collect() -> dict:
@@ -5561,7 +5670,6 @@ def test_cycle_duration_and_drift_logged(caplog):
     from app import MetricsCollector
 
     collector = MetricsCollector(poll_interval=0.2, llama_enabled=False)
-    collector._queue = queue.Queue(maxsize=30)
     collector._collect = lambda: {"timestamp": time.time()}
     with caplog.at_level(logging.DEBUG, logger="app"):
         collector.start()
@@ -5618,7 +5726,6 @@ def test_poll_interval_semantics_unchanged():
 
     collector = MetricsCollector(poll_interval=0.3, llama_enabled=False)
     assert collector.poll_interval == 0.3
-    collector._queue = queue.Queue(maxsize=30)
     stamps: list[float] = []
 
     def fake_collect() -> dict:
