@@ -21,6 +21,8 @@ from unittest.mock import MagicMock, patch
 
 import psutil
 import pytest
+import collectors.gpu as gpu_mod
+import collectors.llm as llm
 
 
 # ---------------------------------------------------------------------------
@@ -37,16 +39,13 @@ def _fake_nvidia_smi(output: str) -> None:
 @pytest.fixture(autouse=True)
 def no_real_nvidia():
     """Ensure real nvidia-smi / pynvml are never called during tests."""
-    with (
-        patch("app._gpu_pynvml", return_value=[]),
-        patch("subprocess.run") as mock_run,
-    ):
+    with patch("subprocess.run") as mock_run:
         mock_run.return_value = MagicMock(stdout="")  # default: no GPUs
         yield mock_run
 
 
 def test_gpu_cli_parses_single_gpu(no_real_nvidia):
-    from app import _gpu_cli
+    from collectors.gpu import _gpu_cli
 
     no_real_nvidia.return_value = MagicMock(
         stdout="85, 4096, 8192, 72, 1410, Active, Not Active, 0000:01:00.0, NVIDIA A100-SXM4-80GB, 0x1EB810DE, 42.5, 400.00\n",
@@ -73,7 +72,7 @@ def test_gpu_cli_parses_single_gpu(no_real_nvidia):
 
 
 def test_gpu_cli_parses_multiple_gpus(no_real_nvidia):
-    from app import _gpu_cli
+    from collectors.gpu import _gpu_cli
 
     no_real_nvidia.return_value = MagicMock(
         stdout=(
@@ -100,7 +99,7 @@ def test_gpu_cli_parses_multiple_gpus(no_real_nvidia):
 
 
 def test_gpu_cli_empty_output(no_real_nvidia):
-    from app import _gpu_cli
+    from collectors.gpu import _gpu_cli
 
     no_real_nvidia.return_value = MagicMock(stdout="")
     result = _gpu_cli()
@@ -109,7 +108,7 @@ def test_gpu_cli_empty_output(no_real_nvidia):
 
 def test_gpu_cli_not_found():
     with patch("subprocess.run", side_effect=FileNotFoundError()):
-        from app import _gpu_cli
+        from collectors.gpu import _gpu_cli
         result = _gpu_cli()
         assert result == []
 
@@ -119,7 +118,7 @@ def test_gpu_cli_not_found():
 # ---------------------------------------------------------------------------
 
 def test_vendor_id_name_maps_known_ids():
-    from app import _vendor_id_name
+    from collectors.gpu import _vendor_id_name
 
     # Known GPU vendor IDs map to their names.
     assert _vendor_id_name("0x10de") == "NVIDIA"
@@ -142,7 +141,7 @@ def test_sysfs_pci_vendor_name_missing_device():
     """A BDF with no sysfs device node (non-Linux host, or a device that
     isn't present) resolves to ``unknown`` — the sysfs read fails cleanly
     and the fallback kicks in. Never raises."""
-    from app import _sysfs_pci_vendor_name
+    from collectors.gpu import _sysfs_pci_vendor_name
 
     # A BDF that doesn't correspond to a real device node.
     assert _sysfs_pci_vendor_name("0000:ff:ff.0") == "unknown"
@@ -179,9 +178,9 @@ def test_gpu_pynvml_basic():
         import app as app_mod
         # Mock the sysfs vendor-ID read so the board vendor is resolved
         # from the hardcoded map (pci.ids-independent).
-        with patch.object(app_mod, "_sysfs_pci_vendor_id",
+        with patch.object(gpu_mod, "_sysfs_pci_vendor_id",
                          return_value="0x10de"):
-            result = app_mod._gpu_pynvml()
+            result = gpu_mod._gpu_pynvml()
 
     assert len(result) == 1
     gpu = result[0]
@@ -196,7 +195,7 @@ def test_gpu_pynvml_basic():
 
 
 def test_gpu_pynvml_not_installed():
-    from app import _gpu_pynvml
+    from collectors.gpu import _gpu_pynvml
 
     with patch.dict("sys.modules", {"pynvml": None}):
         result = _gpu_pynvml()
@@ -273,7 +272,7 @@ def test_collector_llm_disabled_performs_no_llm_calls():
             own_calls.append(t)
         raise ConnectionRefusedError("LLM must not be scraped")
 
-    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen):
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=fake_urlopen):
         collector.start()
         try:
             data = collector.get_latest(timeout=3.0)
@@ -294,7 +293,7 @@ def test_collector_llm_enabled_by_default():
 
     collector = MetricsCollector(poll_interval=0.1)
     assert collector.llama_enabled is True
-    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
         "/metrics": LLAMA_METRICS_SAMPLE.encode(),
         "/props": b'{"model_path": "/models/x.gguf", "total_slots": 1}',
         "/slots": b"[]",
@@ -319,7 +318,7 @@ def test_collector_llm_thread_populates_latest():
     from app import MetricsCollector
 
     collector = MetricsCollector(poll_interval=0.1)
-    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
         "/metrics": LLAMA_METRICS_SAMPLE.encode(),
         "/props": b'{"model_path": "/models/x.gguf", "total_slots": 1}',
         "/slots": b"[]",
@@ -503,7 +502,7 @@ def test_fleet_projection_local_llms_carry_name():
         {"name": "second", "status": "up", "backend": "strata",
          "gen_tokens_per_s": 50.0},
     ]
-    with patch("app.collect_gpu_metrics", return_value=[]), \
+    with patch("collectors.gpu.collect_gpu_metrics", return_value=[]), \
          patch("app.collect_swap_metrics", return_value=None), \
          patch("app.collect_host_health_metrics",
                return_value={"psi_mem_avg10": None, "d_state_procs": 0}):
@@ -554,7 +553,7 @@ def test_fleet_projection_peer_full():
             return False
 
     with patch("urllib.request.urlopen", return_value=FakeResponse()):
-        entry = app.collect_upstream_metrics("http://fake:5000", "fakepeer")
+        entry = llm.collect_upstream_metrics("http://fake:5000", "fakepeer")
     assert entry is not None
     assert entry["name"] == "fakepeer"
     assert entry["status"] == "up"
@@ -613,7 +612,7 @@ def test_fleet_projection_no_self_nesting():
             return False
 
     with patch("urllib.request.urlopen", return_value=FakeResponse()):
-        entry = app.collect_upstream_metrics("http://fake:5000", "fakepeer")
+        entry = llm.collect_upstream_metrics("http://fake:5000", "fakepeer")
     assert entry is not None
     assert "systems" not in entry["metrics"]
 
@@ -623,11 +622,11 @@ def test_fleet_projection_no_self_nesting():
 # ---------------------------------------------------------------------------
 
 def test_collect_gpu_falls_back_to_cli():
-    from app import collect_gpu_metrics
+    from collectors.gpu import collect_gpu_metrics
 
     with (
-        patch("app._gpu_pynvml", return_value=[]),
-        patch("app._gpu_cli") as mock_cli,
+        patch("collectors.gpu._gpu_pynvml", return_value=[]),
+        patch("collectors.gpu._gpu_cli") as mock_cli,
     ):
         mock_cli.return_value = [{"index": 0}]
         result = collect_gpu_metrics()
@@ -636,11 +635,11 @@ def test_collect_gpu_falls_back_to_cli():
 
 
 def test_collect_gpu_prefers_pynvml():
-    from app import collect_gpu_metrics
+    from collectors.gpu import collect_gpu_metrics
 
     with (
-        patch("app._gpu_pynvml") as mock_nv,
-        patch("app._gpu_cli") as mock_cli,
+        patch("collectors.gpu._gpu_pynvml") as mock_nv,
+        patch("collectors.gpu._gpu_cli") as mock_cli,
     ):
         mock_nv.return_value = [{"index": 0}]
         result = collect_gpu_metrics()
@@ -670,7 +669,7 @@ LLAMA_METRICS_SAMPLE = (
 def no_real_llama():
     """Ensure llama-server HTTP endpoints are never actually reached."""
     with patch(
-        "app.urllib.request.urlopen",
+        "collectors.llm.urllib.request.urlopen",
         side_effect=ConnectionRefusedError("no llama-server in tests"),
     ):
         yield
@@ -681,10 +680,10 @@ def reset_llama_props_cache():
     """Reset the module-level /props cache around every test."""
     import app as app_mod
 
-    original = app_mod._llama_props_cache
-    app_mod._llama_props_cache = {}
+    original = llm._llama_props_cache
+    llm._llama_props_cache = {}
     yield
-    app_mod._llama_props_cache = original
+    llm._llama_props_cache = original
 
 
 @pytest.fixture(autouse=True)
@@ -695,17 +694,19 @@ def reset_llama_prev():
     swapping in fresh dicts is the reset."""
     import app as app_mod
 
-    originals = {
-        k: getattr(app_mod, k) for k in (
-            "_llama_prev", "_llama_last_good", "_llama_slot_prev",
-            "_llama_decode_history", "_llama_req_rates",
-        )
-    }
-    for k in originals:
-        setattr(app_mod, k, {})
+    keys = (
+        "_llama_prev", "_llama_last_good", "_llama_slot_prev",
+        "_llama_decode_history",
+    )
+    # Clear in-place so the BaseLLMCollector aliases stay valid.
+    for k in keys:
+        getattr(llm, k).clear()
+    # Clear the per-key rate deques inside the collector.
+    if hasattr(llm, "_llama_collector"):
+        for dq in llm._llama_collector._req_rates.values():
+            dq.clear()
     yield
-    for k, v in originals.items():
-        setattr(app_mod, k, v)
+    # No restore needed – state is per-test and cleared in-place.
 
 
 @pytest.fixture(autouse=True)
@@ -731,11 +732,11 @@ def reset_llama_proc():
     """
     import app as app_mod
 
-    original = app_mod._llama_proc
-    app_mod._llama_proc = {}
-    with patch("app.psutil.process_iter", return_value=[]):
+    original = llm._llama_proc
+    llm._llama_proc = {}
+    with patch("collectors.llm.psutil.process_iter", return_value=[]):
         yield
-    app_mod._llama_proc = original
+    llm._llama_proc = original
 
 
 def _fake_llama_proc(name="llama-server", rss_gb=21.0, cpu=340.0,
@@ -779,7 +780,7 @@ def _http_response(body: bytes):
 
 
 def make_llama_server(routes: dict, calls: list | None = None):
-    """Build a side_effect for ``app.urllib.request.urlopen``.
+    """Build a side_effect for ``llm.urllib.request.urlopen``.
 
     *routes* maps a URL path suffix (e.g. ``"/metrics"``) to either a
     bytes body or an exception instance to raise.
@@ -798,9 +799,9 @@ def make_llama_server(routes: dict, calls: list | None = None):
 
 
 def test_collect_llama_ok():
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
-    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
         "/metrics": LLAMA_METRICS_SAMPLE.encode(),
         "/props": b'{"model_path": "/models/x.gguf", "total_slots": 1}',
         "/slots": b"[]",
@@ -823,7 +824,7 @@ def test_collect_llama_ok():
 
 
 def test_collect_llama_unreachable():
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     # no_real_llama fixture makes urlopen raise ConnectionRefusedError
     assert collect_llama_metrics("http://127.0.0.1:9999") is None
@@ -831,10 +832,10 @@ def test_collect_llama_unreachable():
 
 def test_collect_llama_json_escaped_body():
     """2025 builds JSON-escaped the whole /metrics body (PR #17386)."""
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     escaped = json.dumps(LLAMA_METRICS_SAMPLE)
-    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
         "/metrics": escaped.encode(),
         "/props": b"{}",
         "/slots": b"[]",
@@ -847,10 +848,10 @@ def test_collect_llama_json_escaped_body():
 
 
 def test_collect_llama_no_llamacpp_metrics():
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     for body in ("", "some:other_metric 1\n# HELP foo bar\n"):
-        with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
             "/metrics": body.encode(),
             "/props": b"{}",
             "/slots": b"[]",
@@ -860,18 +861,18 @@ def test_collect_llama_no_llamacpp_metrics():
 
 def test_collect_llama_stale_hold():
     """A failed scrape within the hold window returns last data as stale."""
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     routes = {
         "/metrics": LLAMA_METRICS_SAMPLE.encode(),
         "/props": b'{"model_path": "/models/x.gguf", "total_slots": 1}',
         "/slots": b"[]",
     }
-    with patch("app.urllib.request.urlopen", side_effect=make_llama_server(routes)):
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server(routes)):
         first = collect_llama_metrics("http://127.0.0.1:9999")
     assert first is not None and first["status"] == "up"
 
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=ConnectionRefusedError("down")):
         held = collect_llama_metrics("http://127.0.0.1:9999")
         held_again = collect_llama_metrics("http://127.0.0.1:9999")
@@ -886,7 +887,7 @@ def test_collect_llama_stale_hold():
 def test_collect_llama_stale_expiry():
     """A failed scrape after the 15 s hold window returns None again."""
     import app as app_mod
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     clock = _FakeClock()
     routes = {
@@ -894,37 +895,37 @@ def test_collect_llama_stale_expiry():
         "/props": b"{}",
         "/slots": b"[]",
     }
-    with patch.object(app_mod.time, "monotonic", clock), \
-         patch("app.urllib.request.urlopen", side_effect=make_llama_server(routes)):
+    with patch.object(llm.time, "monotonic", clock), \
+         patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server(routes)):
         assert collect_llama_metrics("http://127.0.0.1:9999")["status"] == "up"
 
     clock.advance(16.0)
-    with patch.object(app_mod.time, "monotonic", clock), \
-         patch("app.urllib.request.urlopen",
+    with patch.object(llm.time, "monotonic", clock), \
+         patch("collectors.llm.urllib.request.urlopen",
                side_effect=ConnectionRefusedError("down")):
         assert collect_llama_metrics("http://127.0.0.1:9999") is None
 
 
 def test_collect_llama_recover_after_stale():
     """A successful scrape after a stale period restores status "up"."""
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     routes = {
         "/metrics": LLAMA_METRICS_SAMPLE.encode(),
         "/props": b"{}",
         "/slots": b"[]",
     }
-    with patch("app.urllib.request.urlopen", side_effect=make_llama_server(routes)):
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server(routes)):
         collect_llama_metrics("http://127.0.0.1:9999")
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=ConnectionRefusedError("down")):
         assert collect_llama_metrics("http://127.0.0.1:9999")["status"] == "stale"
-    with patch("app.urllib.request.urlopen", side_effect=make_llama_server(routes)):
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server(routes)):
         assert collect_llama_metrics("http://127.0.0.1:9999")["status"] == "up"
 
 
 def test_parse_prometheus_skips_labels_and_comments():
-    from app import _parse_prometheus
+    from collectors.llm import _parse_prometheus
 
     text = (
         "# HELP llamacpp:tokens_predicted_total desc\n"
@@ -936,7 +937,7 @@ def test_parse_prometheus_skips_labels_and_comments():
 
 
 def test_collect_llama_props_and_slots():
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     props = {"model_path": "/models/qwen3.8-q6.gguf", "total_slots": 2,
              "is_sleeping": False}
@@ -946,7 +947,7 @@ def test_collect_llama_props_and_slots():
         {"id": 1, "n_ctx": 8192, "n_prompt_tokens": 0, "is_processing": False,
          "next_token": {"n_decoded": 0, "n_remain": 0}},
     ]
-    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
         "/metrics": LLAMA_METRICS_SAMPLE.encode(),
         "/props": json.dumps(props).encode(),
         "/slots": json.dumps(slots).encode(),
@@ -978,7 +979,7 @@ def test_collect_llama_props_and_slots():
 def test_parse_llama_slots_next_token_shapes():
     """next_token arrives as a dict (classic builds) or a LIST of dicts
     (e.g. the LM Studio build); both must parse to a decoded total."""
-    from app import _parse_llama_slots
+    from collectors.llm import _parse_llama_slots
 
     # dict shape
     d = _parse_llama_slots([{
@@ -1013,7 +1014,7 @@ def test_parse_llama_slots_next_token_shapes():
 def test_parse_llama_slots_remain():
     """n_remain (tokens left to generate) is summed over the next_token
     items; -1 (idle) or absent -> None."""
-    from app import _parse_llama_slots
+    from collectors.llm import _parse_llama_slots
 
     # list shape: sum positive n_remain over the items
     slots = _parse_llama_slots([{
@@ -1058,13 +1059,13 @@ def test_parse_llama_slots_remain():
 def test_collect_llama_free_slots():
     """free_slots = total_slots (props) - requests_processing (metrics);
     the key is omitted when either side is unknown."""
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     def run(props: str, metrics: str):
         # Bypass the 30 s /props cache so each run sees its own props body.
         import app as app_mod
-        app_mod._llama_props_cache = {}
-        with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        llm._llama_props_cache = {}
+        with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
             "/metrics": metrics.encode(),
             "/props": props.encode(),
             "/slots": b"[]",
@@ -1087,10 +1088,10 @@ def test_collect_llama_free_slots():
 def test_collect_llama_spec_accept_rate():
     """spec_accept_pct = 100 * accepted / draft (lifetime), rounded to 0.1;
     omitted when spec decode is off (counters absent) or draft == 0."""
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     def run(metrics: str):
-        with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+        with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
             "/metrics": metrics.encode(),
             "/props": b'{"total_slots": 1}',
             "/slots": b"[]",
@@ -1124,7 +1125,7 @@ def test_collect_llama_live_rate_from_slots():
     """Live tokens/s from per-slot decode counters: the /metrics counters
     only advance on request completion on some builds (e.g. LM Studio),
     while n_decoded / n_prompt_tokens_processed update per token."""
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     state = {
         "metrics": ("llamacpp:tokens_predicted_total 0\n"
@@ -1142,8 +1143,8 @@ def test_collect_llama_live_rate_from_slots():
         return _http_response(json.dumps(state["slots"]).encode())
 
     clock = _FakeClock()
-    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen), \
-         patch("app.time.monotonic", clock):
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=fake_urlopen), \
+         patch("collectors.llm.time.monotonic", clock):
         first = collect_llama_metrics("http://127.0.0.1:9999")
         # No previous scrape yet -> counter-delta fallback (0 here)
         assert first["gen_tokens_per_s"] == 0.0
@@ -1164,7 +1165,7 @@ def test_collect_llama_live_rate_from_slots():
 def test_collect_llama_live_rate_task_reset_clamp():
     """n_decoded / n_prompt_tokens_processed reset per task: a drop between
     scrapes must clamp to 0, never a negative rate."""
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     state = {
         "metrics": ("llamacpp:tokens_predicted_total 0\n"
@@ -1182,8 +1183,8 @@ def test_collect_llama_live_rate_task_reset_clamp():
         return _http_response(json.dumps(state["slots"]).encode())
 
     clock = _FakeClock()
-    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen), \
-         patch("app.time.monotonic", clock):
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=fake_urlopen), \
+         patch("collectors.llm.time.monotonic", clock):
         collect_llama_metrics("http://127.0.0.1:9999")
 
         # A new task took the slot: counters dropped (875 -> 10, 500 -> 12)
@@ -1199,7 +1200,7 @@ def test_collect_llama_live_rate_task_reset_clamp():
 def test_collect_llama_live_prompt_rate_includes_cached():
     """The live prompt rate counts cached + uncached prompt tokens, matching
     the server's own prompt t/s (a chat workload is mostly KV-cache hits)."""
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     state = {
         "metrics": ("llamacpp:tokens_predicted_total 0\n"
@@ -1218,8 +1219,8 @@ def test_collect_llama_live_prompt_rate_includes_cached():
         return _http_response(json.dumps(state["slots"]).encode())
 
     clock = _FakeClock()
-    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen), \
-         patch("app.time.monotonic", clock):
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=fake_urlopen), \
+         patch("collectors.llm.time.monotonic", clock):
         collect_llama_metrics("http://127.0.0.1:9999")
 
         # 10 uncached + 790 cached prompt tokens over 2 s
@@ -1235,7 +1236,7 @@ def test_collect_llama_live_prompt_rate_includes_cached():
 def test_collect_llama_live_rate_cached_reset_clamp():
     """n_prompt_tokens_cache resets per task like n_decoded: a drop between
     scrapes must clamp to 0, never a negative rate."""
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     state = {
         "metrics": ("llamacpp:tokens_predicted_total 0\n"
@@ -1261,8 +1262,8 @@ def test_collect_llama_live_rate_cached_reset_clamp():
         slot["next_token"] = [{"n_decoded": decoded}]
 
     clock = _FakeClock()
-    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen), \
-         patch("app.time.monotonic", clock):
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=fake_urlopen), \
+         patch("collectors.llm.time.monotonic", clock):
         collect_llama_metrics("http://127.0.0.1:9999")
 
         # New task took the slot: cached dropped 790 -> 0 (clamped)
@@ -1299,7 +1300,7 @@ def test_collect_llama_prompt_rate_averages_completed_requests():
     fully uncached): a large prefill must not spike for one scrape and
     then drop to 0, and the window must evict the oldest sample after
     5 requests."""
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     state = {
         "metrics": ("llamacpp:tokens_predicted_total 0\n"
@@ -1333,8 +1334,8 @@ def test_collect_llama_prompt_rate_averages_completed_requests():
         return r
 
     clock = _FakeClock()
-    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen), \
-         patch("app.time.monotonic", clock):
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=fake_urlopen), \
+         patch("collectors.llm.time.monotonic", clock):
         # Req 1: 4000 tok over 4 s -> 1000 t/s
         r = run_request(1, 4000, 1000, 4)
         assert r["prompt_tokens_per_s"] == 1000.0
@@ -1366,7 +1367,7 @@ def test_collect_llama_prompt_rate_skips_unmeasurable_prefills():
     """Prefills that finish between scrapes (fast or fully cached) cannot
     be timed: no sample is recorded and the gauge falls back to the
     per-scrape live rate."""
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     state = {
         "metrics": ("llamacpp:tokens_predicted_total 0\n"
@@ -1383,8 +1384,8 @@ def test_collect_llama_prompt_rate_skips_unmeasurable_prefills():
         return _http_response(json.dumps(state["slots"]).encode())
 
     clock = _FakeClock()
-    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen), \
-         patch("app.time.monotonic", clock):
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=fake_urlopen), \
+         patch("collectors.llm.time.monotonic", clock):
         first = collect_llama_metrics("http://127.0.0.1:9999")
         # Fully cached request: complete at first sight, no sample; gauge
         # shows the raw live rate (800 cached tokens / 1 s), not a mean.
@@ -1401,7 +1402,7 @@ def test_collect_llama_prompt_rate_lmstudio_idle_counters():
     (stays 0 even for 12k-token prompts) and resets it when the slot goes
     idle: completion must be detected via n_decoded > 0 (generation start)
     and the sample must not be skipped."""
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     def lm_slot(task, processing, decoded, processed=0):
         return {"id": 0, "n_ctx": 131072, "n_prompt_tokens": 4000,
@@ -1423,8 +1424,8 @@ def test_collect_llama_prompt_rate_lmstudio_idle_counters():
         return _http_response(json.dumps(state["slots"]).encode())
 
     clock = _FakeClock()
-    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen), \
-         patch("app.time.monotonic", clock):
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=fake_urlopen), \
+         patch("collectors.llm.time.monotonic", clock):
         collect_llama_metrics("http://127.0.0.1:9999")  # t0: task starts
         # t1: still mid-prefill (decoded 0) -> no sample yet
         clock.advance(1.0)
@@ -1445,7 +1446,7 @@ def test_collect_llama_prompt_rate_lmstudio_idle_counters():
 def test_collect_llama_prompt_rate_idle_slot_at_first_sight():
     """A slot that is idle at first sight (showing a finished task) must
     not produce a bogus 1-scrape-interval sample."""
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     state = {"metrics": ("llamacpp:tokens_predicted_total 0\n"
                          "llamacpp:prompt_tokens_total 0\n"),
@@ -1459,8 +1460,8 @@ def test_collect_llama_prompt_rate_idle_slot_at_first_sight():
         return _http_response(json.dumps(state["slots"]).encode())
 
     clock = _FakeClock()
-    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen), \
-         patch("app.time.monotonic", clock):
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=fake_urlopen), \
+         patch("collectors.llm.time.monotonic", clock):
         collect_llama_metrics("http://127.0.0.1:9999")
         clock.advance(1.0)
         r = collect_llama_metrics("http://127.0.0.1:9999")
@@ -1473,12 +1474,12 @@ def test_collect_llama_prompt_rate_cleared_on_counter_reset():
     """A server restart (cumulative counters decrease) clears the
     per-request history: the gauge falls back to the live rate."""
     import app as app_mod
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
-    app_mod._llama_req_rates["primary"] = [1000.0]  # pretend a request completed
-    app_mod._llama_prev["primary"] = {"ts": 1000.0, "gen": 1000.0,
+    llm._llama_req_rates["primary"] = [1000.0]  # pretend a request completed
+    llm._llama_prev["primary"] = {"ts": 1000.0, "gen": 1000.0,
                                       "prompt": 1000.0}
-    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
         "/metrics": ("llamacpp:tokens_predicted_total 100\n"
                      "llamacpp:prompt_tokens_total 50\n").encode(),
         "/props": b"{}",
@@ -1487,14 +1488,14 @@ def test_collect_llama_prompt_rate_cleared_on_counter_reset():
         result = collect_llama_metrics("http://127.0.0.1:9999")
 
     # Restart detected (prev 1000 -> now 100): history cleared, no mean
-    assert list(app_mod._llama_req_rates["primary"]) == []
+    assert list(llm._llama_req_rates["primary"]) == []
     assert result["prompt_tokens_per_s"] == 0.0
 
 
 def test_collect_llama_prompt_last_new_task():
     """A new id_task on a slot records that prompt's size + cache share;
     the value is absent until a task has been seen, then persists."""
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     state = {
         "metrics": ("llamacpp:tokens_predicted_total 0\n"
@@ -1521,8 +1522,8 @@ def test_collect_llama_prompt_last_new_task():
         slot["next_token"] = [{"n_decoded": decoded}]
 
     clock = _FakeClock()
-    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen), \
-         patch("app.time.monotonic", clock):
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=fake_urlopen), \
+         patch("collectors.llm.time.monotonic", clock):
         first = collect_llama_metrics("http://127.0.0.1:9999")
         assert "prompt_last" not in first  # no previous scrape to compare
 
@@ -1551,9 +1552,9 @@ def test_collect_llama_prompt_last_new_task():
 
 def test_collect_llama_slots_failure():
     """/slots down must not break the metrics/props data."""
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
-    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
         "/metrics": LLAMA_METRICS_SAMPLE.encode(),
         "/props": b'{"model_path": "/models/x.gguf"}',
         "/slots": ConnectionRefusedError("nope"),
@@ -1570,7 +1571,7 @@ def test_collect_llama_slots_failure():
 def test_collect_llama_props_cached():
     """/props is fetched once per 30 s TTL, then re-fetched when stale."""
     import app as app_mod
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     calls: list[str] = []
     props_body = b'{"model_path": "/models/x.gguf"}'
@@ -1583,16 +1584,16 @@ def test_collect_llama_props_cached():
             return _http_response(props_body)
         return _http_response(b"[]")  # /slots
 
-    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen):
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=fake_urlopen):
         collect_llama_metrics("http://127.0.0.1:9999")
         collect_llama_metrics("http://127.0.0.1:9999")
     assert calls.count("http://127.0.0.1:9999/props") == 1
 
     # Age the cache past the 30 s TTL -> must be re-fetched
-    app_mod._llama_props_cache["primary"] = (
+    llm._llama_props_cache["primary"] = (
         time.monotonic() - 31.0, {"model_path": "/models/x.gguf"}
     )
-    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen):
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=fake_urlopen):
         collect_llama_metrics("http://127.0.0.1:9999")
     assert calls.count("http://127.0.0.1:9999/props") == 2
 
@@ -1612,7 +1613,7 @@ def _llama_fake_server_with_body(state: dict):
 def test_collect_llama_rate_from_counter_deltas():
     """tokens/s must come from per-scrape counter deltas — the windowed
     gauges read 0 permanently on some builds (e.g. LM Studio's)."""
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     state = {"body": (
         "llamacpp:tokens_predicted_total 100\n"
@@ -1622,9 +1623,9 @@ def test_collect_llama_rate_from_counter_deltas():
         "llamacpp:prompt_tokens_seconds 0\n"
     )}
     clock = _FakeClock()
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=_llama_fake_server_with_body(state)), \
-         patch("app.time.monotonic", clock):
+         patch("collectors.llm.time.monotonic", clock):
         first = collect_llama_metrics("http://127.0.0.1:9999")
         # First scrape has no previous state -> gauge fallback (0.0 here)
         assert first["gen_tokens_per_s"] == 0.0
@@ -1649,12 +1650,12 @@ def test_collect_llama_rate_from_counter_deltas():
 def test_collect_llama_counter_reset():
     """A decreasing counter (server restart) must yield 0, not a negative rate."""
     import app as app_mod
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
-    app_mod._llama_prev["primary"] = {
+    llm._llama_prev["primary"] = {
         "ts": time.monotonic(), "gen": 1000.0, "prompt": 1000.0,
     }
-    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
         "/metrics": ("llamacpp:tokens_predicted_total 100\n"
                      "llamacpp:prompt_tokens_total 50\n").encode(),
         "/props": b"{}",
@@ -1670,11 +1671,11 @@ def test_collect_llama_counter_reset():
 def test_collect_llama_first_scrape_fallback_to_gauge():
     """With no previous scrape, rates fall back to the server's windowed
     gauges, or 0.0 when those are absent."""
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     # LLAMA_METRICS_SAMPLE carries gauges 52.94 / 32.3 (and no
     # prompt_tokens_total, so no previous state is recorded).
-    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
         "/metrics": LLAMA_METRICS_SAMPLE.encode(),
         "/props": b"{}",
         "/slots": b"[]",
@@ -1683,7 +1684,7 @@ def test_collect_llama_first_scrape_fallback_to_gauge():
     assert result["gen_tokens_per_s"] == 52.9
     assert result["prompt_tokens_per_s"] == 32.3
 
-    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
         "/metrics": ("llamacpp:tokens_predicted_total 10\n"
                      "llamacpp:prompt_tokens_total 5\n").encode(),
         "/props": b"{}",
@@ -1730,7 +1731,7 @@ def _usage_state_file() -> Path:
 
 
 def test_llama_usage_summary_math_and_state_roundtrip(tmp_path):
-    from app import collect_llama_metrics, _llama_load_usage_state
+    from collectors.llm import collect_llama_metrics, _llama_load_usage_state
 
     # The autouse fixture points RD_LLAMA_USAGE_STATE at this test's tmp
     # dir – which also exercises the env override (the default lives in
@@ -1738,7 +1739,7 @@ def test_llama_usage_summary_math_and_state_roundtrip(tmp_path):
     state_file = _usage_state_file()
     assert state_file.parent == tmp_path
 
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_llama_server(_usage_routes())):
         result = collect_llama_metrics("http://127.0.0.1:9999")
 
@@ -1754,7 +1755,7 @@ def test_llama_usage_summary_math_and_state_roundtrip(tmp_path):
     assert state is not None
     assert state["first_seen"] == state["last_reset"]
     # Second scrape: state re-read from file, no re-init
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_llama_server(_usage_routes())):
         result2 = collect_llama_metrics("http://127.0.0.1:9999")
     assert result2["usage"]["uptime_s"] >= usage["uptime_s"]
@@ -1763,13 +1764,13 @@ def test_llama_usage_summary_math_and_state_roundtrip(tmp_path):
 def test_llama_usage_restart_detection_rebaselines_uptime():
     """A cumulative counter decrease (server restart/reload) re-baselines
     last_reset while keeping first_seen."""
-    from app import collect_llama_metrics, _llama_load_usage_state
+    from collectors.llm import collect_llama_metrics, _llama_load_usage_state
 
     state_file = _usage_state_file()
     old = time.time() - 100_000
     state_file.write_text(json.dumps({"first_seen": old, "last_reset": old}))
 
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_llama_server(
                    _usage_routes(predicted=5000, prompt=9000, cached=8000)
                )):
@@ -1777,7 +1778,7 @@ def test_llama_usage_restart_detection_rebaselines_uptime():
     assert first["usage"]["uptime_s"] >= 99_000  # long-running server
 
     # Server restarts/reloads: cumulative counters drop.
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_llama_server(
                    _usage_routes(predicted=10, prompt=100, cached=50)
                )):
@@ -1790,12 +1791,12 @@ def test_llama_usage_restart_detection_rebaselines_uptime():
 
 
 def test_llama_usage_corrupt_state_file_reinitializes():
-    from app import collect_llama_metrics, _llama_load_usage_state
+    from collectors.llm import collect_llama_metrics, _llama_load_usage_state
 
     state_file = _usage_state_file()
     state_file.write_text("not-json{{{")
 
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_llama_server(_usage_routes())):
         result = collect_llama_metrics("http://127.0.0.1:9999")
 
@@ -1809,16 +1810,16 @@ def test_llama_usage_corrupt_state_file_reinitializes():
 def test_llama_usage_missing_counters_yield_none():
     """No generation seconds yet → gen_avg_tps None; no cached counter →
     prompt_cached_pct None and total excludes it."""
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_llama_server(
                    _usage_routes(predicted_s=0.0)
                )):
         result = collect_llama_metrics("http://127.0.0.1:9999")
     assert result["usage"]["gen_avg_tps"] is None
 
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_llama_server(
                    _usage_routes(include_cached=False)
                )):
@@ -1831,14 +1832,14 @@ def test_llama_usage_state_path_default_and_env_override(tmp_path, monkeypatch):
     import app as app_mod
 
     monkeypatch.delenv("RD_LLAMA_USAGE_STATE", raising=False)
-    default = app_mod._llama_usage_state_path()
+    default = llm._llama_usage_state_path()
     assert default.endswith(".llama_usage_state.json")
     assert os.path.dirname(default) == os.path.dirname(
         os.path.abspath(app_mod.__file__)
     )
     override = str(tmp_path / "custom_state.json")
     monkeypatch.setenv("RD_LLAMA_USAGE_STATE", override)
-    assert app_mod._llama_usage_state_path() == override
+    assert llm._llama_usage_state_path() == override
 
 
 # ---------------------------------------------------------------------------
@@ -1857,10 +1858,10 @@ def _http_error_503(body: bytes) -> urllib.error.HTTPError:
 def test_collect_llama_health_loading():
     """/health 503 (model loading) -> status "loading"; /metrics is not
     even consulted while the model loads."""
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     calls: list = []
-    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
         "/health": _http_error_503(b'{"status":"loading model"}'),
         "/metrics": LLAMA_METRICS_SAMPLE.encode(),
     }, calls=calls)):
@@ -1877,9 +1878,9 @@ def test_collect_llama_health_loading():
 
 def test_collect_llama_health_loading_plain_text_body():
     """A non-JSON 503 body is still surfaced (trimmed raw text)."""
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
-    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
         "/health": _http_error_503(b"  Loading model \n"),
     })):
         result = collect_llama_metrics("http://127.0.0.1:9999")
@@ -1890,9 +1891,9 @@ def test_collect_llama_health_loading_plain_text_body():
 
 def test_collect_llama_health_ok_keeps_metrics_logic():
     """/health 200 -> normal /metrics flow, status stays "up"."""
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
-    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
         "/health": b'{"status":"ok"}',
         "/metrics": LLAMA_METRICS_SAMPLE.encode(),
         "/props": b'{"model_path": "/models/x.gguf", "total_slots": 1}',
@@ -1908,10 +1909,10 @@ def test_collect_llama_health_ok_keeps_metrics_logic():
 def test_collect_llama_health_unreachable_keeps_metrics_logic():
     """The /health fetch itself failing (timeout/down) must not disturb
     the existing up/stale/unreachable /metrics logic."""
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     # no /health route -> health fetch raises -> /metrics decides
-    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
         "/metrics": LLAMA_METRICS_SAMPLE.encode(),
         "/props": b"{}",
         "/slots": b"[]",
@@ -1925,9 +1926,9 @@ def test_collect_llama_health_unreachable_keeps_metrics_logic():
 def test_collect_llama_build_info():
     """/props build_info passes through; omitted when absent."""
     import app as app_mod
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
-    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
         "/metrics": LLAMA_METRICS_SAMPLE.encode(),
         "/props": (b'{"model_path": "/models/x.gguf", '
                    b'"build_info": "b10450-ece963f41"}'),
@@ -1938,8 +1939,8 @@ def test_collect_llama_build_info():
     assert result["build_info"] == "b10450-ece963f41"
 
     # Drop the 30 s /props cache so the second scrape re-fetches props.
-    app_mod._llama_props_cache = {}
-    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+    llm._llama_props_cache = {}
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
         "/metrics": LLAMA_METRICS_SAMPLE.encode(),
         "/props": b'{"model_path": "/models/x.gguf"}',
         "/slots": b"[]",
@@ -1970,7 +1971,7 @@ _PREFILL_SLOT = (b'[{"id": 0, "n_ctx": 1000, "n_prompt_tokens": 500, '
 
 
 def _seed_decode_history(app_mod, value: float, n: int = 9):
-    app_mod._llama_decode_history = {
+    llm._llama_decode_history = {
         "primary": [(1000.0 + i, value) for i in range(n)]
     }
 
@@ -1979,10 +1980,10 @@ def test_collect_llama_stall_flag_when_decode_frozen():
     """n_decode_total frozen across 10 consecutive successful scrapes
     while a slot is mid-generation -> stalled."""
     import app as app_mod
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     _seed_decode_history(app_mod, 5000.0)
-    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
         "/metrics": _decode_metrics_body(5000),
         "/props": b"{}",
         "/slots": _ACTIVE_SLOT,
@@ -1990,17 +1991,17 @@ def test_collect_llama_stall_flag_when_decode_frozen():
         result = collect_llama_metrics("http://127.0.0.1:9999")
 
     assert result["stalled"] is True
-    assert len(app_mod._llama_decode_history["primary"]) == 10
+    assert len(llm._llama_decode_history["primary"]) == 10
 
 
 def test_collect_llama_no_stall_during_prefill():
     """Frozen counter while a slot is still in prefill (decoded == 0) is
     NOT a stall: long prefills call no llama_decode."""
     import app as app_mod
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     _seed_decode_history(app_mod, 5000.0)
-    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
         "/metrics": _decode_metrics_body(5000),
         "/props": b"{}",
         "/slots": _PREFILL_SLOT,
@@ -2014,10 +2015,10 @@ def test_collect_llama_no_stall_when_decode_advances():
     """Any movement of n_decode_total in the 10-scrape window clears the
     stall condition."""
     import app as app_mod
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     _seed_decode_history(app_mod, 5000.0)
-    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
         "/metrics": _decode_metrics_body(5001),
         "/props": b"{}",
         "/slots": _ACTIVE_SLOT,
@@ -2030,9 +2031,9 @@ def test_collect_llama_no_stall_when_decode_advances():
 def test_collect_llama_no_stall_before_history_full():
     """The flag needs 10 consecutive scrapes; a fresh history never fires
     (avoids a false flag right after startup)."""
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
-    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
         "/metrics": _decode_metrics_body(5000),
         "/props": b"{}",
         "/slots": _ACTIVE_SLOT,
@@ -2045,17 +2046,17 @@ def test_collect_llama_no_stall_before_history_full():
 def test_collect_llama_stall_history_window_bounded():
     """History never grows past 10 entries."""
     import app as app_mod
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     _seed_decode_history(app_mod, 5000.0, n=10)
-    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
         "/metrics": _decode_metrics_body(5001),
         "/props": b"{}",
         "/slots": b"[]",
     })):
         collect_llama_metrics("http://127.0.0.1:9999")
 
-    assert len(app_mod._llama_decode_history["primary"]) == 10
+    assert len(llm._llama_decode_history["primary"]) == 10
 
 
 # ---------------------------------------------------------------------------
@@ -2065,11 +2066,11 @@ def test_collect_llama_stall_history_window_bounded():
 def test_llama_process_name_match():
     """psutil name match is identified; model_size_gb guarded (no file)."""
     import app as app_mod
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     proc = _fake_llama_proc(rss_gb=21.0, cpu=340.0, threads=64)
-    with patch("app.psutil.process_iter", return_value=[proc]), \
-         patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+    with patch("collectors.llm.psutil.process_iter", return_value=[proc]), \
+         patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
             "/metrics": LLAMA_METRICS_SAMPLE.encode(),
             "/props": b'{"model_path": "/models/x.gguf", "total_slots": 1}',
             "/slots": b"[]",
@@ -2078,7 +2079,7 @@ def test_llama_process_name_match():
 
     assert result["process"] == {"rss_gb": 21.0, "cpu_pct": 340.0,
                                  "threads": 64}
-    assert app_mod._llama_proc["primary"] is proc
+    assert llm._llama_proc["primary"] is proc
     proc.cpu_percent.assert_called_with(None)  # primed on identification
     # /models/x.gguf does not exist on this host -> key omitted
     assert "model_size_gb" not in result
@@ -2086,12 +2087,12 @@ def test_llama_process_name_match():
 
 def test_llama_process_multiple_matches_largest_rss_wins():
     import app as app_mod
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     small = _fake_llama_proc(rss_gb=5.0)
     big = _fake_llama_proc(rss_gb=30.0)
-    with patch("app.psutil.process_iter", return_value=[small, big]), \
-         patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+    with patch("collectors.llm.psutil.process_iter", return_value=[small, big]), \
+         patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
             "/metrics": LLAMA_METRICS_SAMPLE.encode(),
             "/props": b"{}",
             "/slots": b"[]",
@@ -2099,14 +2100,14 @@ def test_llama_process_multiple_matches_largest_rss_wins():
         result = collect_llama_metrics("http://127.0.0.1:9999")
 
     assert result["process"]["rss_gb"] == 30.0
-    assert app_mod._llama_proc["primary"] is big
+    assert llm._llama_proc["primary"] is big
     small.cpu_percent.assert_not_called()
 
 
 def test_llama_process_cmdline_fallback():
     """No exact name match: a cmdline argument containing llama-server."""
     import app as app_mod
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     other = _fake_llama_proc(name="python3", rss_gb=1.0,
                              cmdline=["python3", "-c", "pass"])
@@ -2114,8 +2115,8 @@ def test_llama_process_cmdline_fallback():
         name="llama-server-bin", rss_gb=21.0,
         cmdline=["/opt/llama/build/bin/llama-server", "--model", "x.gguf"],
     )
-    with patch("app.psutil.process_iter", return_value=[other, server]), \
-         patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+    with patch("collectors.llm.psutil.process_iter", return_value=[other, server]), \
+         patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
             "/metrics": LLAMA_METRICS_SAMPLE.encode(),
             "/props": b"{}",
             "/slots": b"[]",
@@ -2123,37 +2124,37 @@ def test_llama_process_cmdline_fallback():
         result = collect_llama_metrics("http://127.0.0.1:9999")
 
     assert result["process"]["rss_gb"] == 21.0
-    assert app_mod._llama_proc["primary"] is server
+    assert llm._llama_proc["primary"] is server
 
 
 def test_llama_process_reidentify_after_death():
     """A dead retained handle (model reload = new PID) is re-found."""
     import psutil
     import app as app_mod
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     dead = _fake_llama_proc(rss_gb=21.0)
     dead.memory_info.side_effect = psutil.NoSuchProcess(0, "")
     fresh = _fake_llama_proc(rss_gb=22.0)
-    with patch("app.psutil.process_iter", return_value=[fresh]), \
-         patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+    with patch("collectors.llm.psutil.process_iter", return_value=[fresh]), \
+         patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
             "/metrics": LLAMA_METRICS_SAMPLE.encode(),
             "/props": b"{}",
             "/slots": b"[]",
         })):
-        app_mod._llama_proc["primary"] = dead
+        llm._llama_proc["primary"] = dead
         result = collect_llama_metrics("http://127.0.0.1:9999")
 
     assert result["process"]["rss_gb"] == 22.0
-    assert app_mod._llama_proc["primary"] is fresh
+    assert llm._llama_proc["primary"] is fresh
 
 
 def test_llama_process_none_when_absent():
     """No local llama-server (remote/dev mode) -> process null, no red."""
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     # reset_llama_proc fixture: process_iter yields no processes
-    with patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
         "/metrics": LLAMA_METRICS_SAMPLE.encode(),
         "/props": b'{"model_path": "/models/x.gguf", "total_slots": 1}',
         "/slots": b"[]",
@@ -2165,15 +2166,15 @@ def test_llama_process_none_when_absent():
 
 def test_llama_process_model_size(tmp_path):
     """model_size_gb from os.path.getsize on the co-located host."""
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     model = tmp_path / "x.gguf"
     with open(model, "wb") as f:  # sparse: 19.8 GB without writing it
         f.seek(int(19.8 * 2**30))
         f.write(b"\0")
-    with patch("app.psutil.process_iter",
+    with patch("collectors.llm.psutil.process_iter",
                return_value=[_fake_llama_proc()]), \
-         patch("app.urllib.request.urlopen", side_effect=make_llama_server({
+         patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
             "/metrics": LLAMA_METRICS_SAMPLE.encode(),
             "/props": json.dumps(
                 {"model_path": str(model), "total_slots": 1}).encode(),
@@ -2345,7 +2346,7 @@ def test_host_health_psi_parse_and_d_state_count(tmp_path):
         _fake_status_proc(psutil.STATUS_SLEEPING),
         _fake_status_proc(psutil.STATUS_ZOMBIE),
     ]
-    with patch("app.psutil.process_iter", return_value=procs):
+    with patch("collectors.llm.psutil.process_iter", return_value=procs):
         result = collect_host_health_metrics(psi_mem_path=str(psi_file))
 
     assert result["psi_mem_avg10"] == 0.05
@@ -2357,7 +2358,7 @@ def test_host_health_psi_missing_file_returns_none(tmp_path):
     from app import collect_host_health_metrics
 
     procs = [_fake_status_proc(psutil.STATUS_DISK_SLEEP)]
-    with patch("app.psutil.process_iter", return_value=procs):
+    with patch("collectors.llm.psutil.process_iter", return_value=procs):
         result = collect_host_health_metrics(
             psi_mem_path=str(tmp_path / "does-not-exist")
         )
@@ -2373,7 +2374,7 @@ def test_host_health_psi_unparseable_returns_none(tmp_path):
 
     bad = tmp_path / "bad"
     bad.write_text("some avg10=garbage avg60=0.02 total=1\nfull avg10=9.99 total=0\n")
-    with patch("app.psutil.process_iter", return_value=[]):
+    with patch("collectors.llm.psutil.process_iter", return_value=[]):
         assert (
             collect_host_health_metrics(psi_mem_path=str(bad))["psi_mem_avg10"]
             is None
@@ -2381,7 +2382,7 @@ def test_host_health_psi_unparseable_returns_none(tmp_path):
 
     no_some = tmp_path / "no_some"
     no_some.write_text("full avg10=9.99 avg60=0.1 avg300=0.0 total=1\n")
-    with patch("app.psutil.process_iter", return_value=[]):
+    with patch("collectors.llm.psutil.process_iter", return_value=[]):
         assert (
             collect_host_health_metrics(psi_mem_path=str(no_some))["psi_mem_avg10"]
             is None
@@ -2392,7 +2393,7 @@ def test_host_health_process_iter_error_degrades_to_zero(tmp_path):
     """A process-table failure degrades D-state to 0 (never raises)."""
     from app import collect_host_health_metrics
 
-    with patch("app.psutil.process_iter", side_effect=OSError("boom")):
+    with patch("collectors.llm.psutil.process_iter", side_effect=OSError("boom")):
         result = collect_host_health_metrics(psi_mem_path=str(tmp_path / "x"))
 
     assert result["d_state_procs"] == 0
@@ -2409,7 +2410,7 @@ def test_collector_snapshot_includes_host_health():
         _fake_status_proc(psutil.STATUS_DISK_SLEEP),
         _fake_status_proc(psutil.STATUS_RUNNING),
     ]
-    with patch("app.psutil.process_iter", return_value=procs):
+    with patch("collectors.llm.psutil.process_iter", return_value=procs):
         collector.start()
         try:
             data = collector.get_latest(timeout=3.0)
@@ -2500,21 +2501,19 @@ def reset_vllm_state():
     """Reset module-level vLLM scrape history around every test."""
     import app as app_mod
 
-    originals = {
-        k: getattr(app_mod, k) for k in (
-            "_vllm_prev", "_vllm_last_good", "_vllm_config_cache",
-            "_vllm_req_rates",
-        )
-    }
-    for k in originals:
-        setattr(app_mod, k, {})
+    # Clear in-place so the BaseLLMCollector aliases stay valid.
+    llm._vllm_prev.clear()
+    llm._vllm_last_good.clear()
+    llm._vllm_config_cache.clear()
+    if hasattr(llm, "_vllm_collector"):
+        for dq in llm._vllm_collector._req_rates.values():
+            dq.clear()
     yield
-    for k, v in originals.items():
-        setattr(app_mod, k, v)
+    # No restore needed – state is per-test and cleared in-place.
 
 
 def make_vllm_server(body: bytes, calls: list | None = None):
-    """Build a side_effect for ``app.urllib.request.urlopen`` that serves
+    """Build a side_effect for ``llm.urllib.request.urlopen`` that serves
     a vLLM /metrics endpoint. Unknown URL suffixes raise
     ConnectionRefusedError (auto-mode tests exploit this for "other backend
     down")."""
@@ -2530,7 +2529,7 @@ def make_vllm_server(body: bytes, calls: list | None = None):
 # --- _parse_prometheus_labeled tests ----------------------------------------
 
 def test_parse_prometheus_labeled_basic():
-    from app import _parse_prometheus_labeled
+    from collectors.llm import _parse_prometheus_labeled
 
     text = (
         '# HELP vllm:num_requests_running desc\n'
@@ -2562,7 +2561,7 @@ def test_parse_prometheus_labeled_basic():
 
 
 def test_parse_prometheus_labeled_multi_engine():
-    from app import _parse_prometheus_labeled
+    from collectors.llm import _parse_prometheus_labeled
 
     text = (
         'vllm:kv_cache_usage_perc{engine="0",model_name="M"} 0.5\n'
@@ -2573,18 +2572,18 @@ def test_parse_prometheus_labeled_multi_engine():
     result = _parse_prometheus_labeled(text, "vllm:")
 
     # Sum across engines
-    from app import _vllm_sum
+    from collectors.llm import _vllm_sum
     running = _vllm_sum(result.get("vllm:num_requests_running"))
     assert running == 8.0
 
     # Max across engines
-    from app import _vllm_max
+    from collectors.llm import _vllm_max
     kv = _vllm_max(result.get("vllm:kv_cache_usage_perc"))
     assert kv == 0.5
 
 
 def test_parse_prometheus_labeled_garbage_tolerant():
-    from app import _parse_prometheus_labeled
+    from collectors.llm import _parse_prometheus_labeled
 
     text = (
         "# comment\n"
@@ -2601,9 +2600,9 @@ def test_parse_prometheus_labeled_garbage_tolerant():
 # --- collect_vllm_metrics tests ----------------------------------------------
 
 def test_collect_vllm_happy_path():
-    from app import collect_vllm_metrics
+    from collectors.llm import collect_vllm_metrics
 
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_vllm_server(VLLM_METRICS_SAMPLE.encode())):
         result = collect_vllm_metrics("http://127.0.0.1:9999")
 
@@ -2635,31 +2634,31 @@ def test_collect_vllm_happy_path():
 
 
 def test_collect_vllm_no_vllm_metrics_returns_none():
-    from app import collect_vllm_metrics
+    from collectors.llm import collect_vllm_metrics
 
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_vllm_server(b"some:other_metric 1.0\n")):
         assert collect_vllm_metrics("http://127.0.0.1:9999") is None
 
 
 def test_collect_vllm_unreachable():
-    from app import collect_vllm_metrics
+    from collectors.llm import collect_vllm_metrics
 
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=ConnectionRefusedError("down")):
         assert collect_vllm_metrics("http://127.0.0.1:9999") is None
 
 
 def test_collect_vllm_stale_hold():
     """A failed scrape within the hold window returns last data as stale."""
-    from app import collect_vllm_metrics
+    from collectors.llm import collect_vllm_metrics
 
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_vllm_server(VLLM_METRICS_SAMPLE.encode())):
         first = collect_vllm_metrics("http://127.0.0.1:9999")
     assert first is not None and first["status"] == "up"
 
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=ConnectionRefusedError("down")):
         held = collect_vllm_metrics("http://127.0.0.1:9999")
     assert held is not None
@@ -2670,24 +2669,24 @@ def test_collect_vllm_stale_hold():
 def test_collect_vllm_stale_expiry():
     """A failed scrape after the 15 s hold window returns None."""
     import app as app_mod
-    from app import collect_vllm_metrics
+    from collectors.llm import collect_vllm_metrics
 
     clock = _FakeClock()
-    with patch.object(app_mod.time, "monotonic", clock), \
-         patch("app.urllib.request.urlopen",
+    with patch.object(llm.time, "monotonic", clock), \
+         patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_vllm_server(VLLM_METRICS_SAMPLE.encode())):
         assert collect_vllm_metrics("http://127.0.0.1:9999")["status"] == "up"
 
     clock.advance(16.0)
-    with patch.object(app_mod.time, "monotonic", clock), \
-         patch("app.urllib.request.urlopen",
+    with patch.object(llm.time, "monotonic", clock), \
+         patch("collectors.llm.urllib.request.urlopen",
                side_effect=ConnectionRefusedError("down")):
         assert collect_vllm_metrics("http://127.0.0.1:9999") is None
 
 
 def test_collect_vllm_rates_across_two_scrapes():
     """gen/prompt tokens/s from counter deltas over a 1 s gap."""
-    from app import collect_vllm_metrics
+    from collectors.llm import collect_vllm_metrics
 
     body1 = (
         'vllm:generation_tokens_total{engine="0",model_name="M"} 100.0\n'
@@ -2701,7 +2700,7 @@ def test_collect_vllm_rates_across_two_scrapes():
     )
 
     clock = _FakeClock()
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_vllm_server(body1.encode())), \
          patch("app.time.monotonic", clock):
         first = collect_vllm_metrics("http://127.0.0.1:9999")
@@ -2709,7 +2708,7 @@ def test_collect_vllm_rates_across_two_scrapes():
     assert "gen_tokens_per_s" not in first  # first scrape: no prev
 
     clock.advance(1.0)
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_vllm_server(body2.encode())), \
          patch("app.time.monotonic", clock):
         second = collect_vllm_metrics("http://127.0.0.1:9999")
@@ -2723,7 +2722,7 @@ def test_collect_vllm_prompt_rate_averages_completed_requests():
     (Δprompt tokens / ΣTTFT), not the spiky per-scrape delta. TTFT ≈
     prefill + queue time, so a window's sample is that window's effective
     prompt rate."""
-    from app import collect_vllm_metrics
+    from collectors.llm import collect_vllm_metrics
 
     def body(gen, prompt, req, ttft_sum, ttft_count):
         return (
@@ -2735,7 +2734,7 @@ def test_collect_vllm_prompt_rate_averages_completed_requests():
         )
 
     clock = _FakeClock()
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_vllm_server(body(0, 0, 0, 0.0, 0).encode())), \
          patch("app.time.monotonic", clock):
         first = collect_vllm_metrics("http://127.0.0.1:9999")
@@ -2745,7 +2744,7 @@ def test_collect_vllm_prompt_rate_averages_completed_requests():
     # Window 1: 3 requests, 600 prompt tokens, ΣTTFT 0.6 s -> 1000 t/s
     # (raw delta would read 600 — the spike-then-0 pattern).
     clock.advance(1.0)
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_vllm_server(
                    body(10, 600, 3, 0.6, 3).encode())), \
          patch("app.time.monotonic", clock):
@@ -2755,7 +2754,7 @@ def test_collect_vllm_prompt_rate_averages_completed_requests():
     # Window 2: 2 requests, 700 tokens, ΣTTFT 1.4 s -> 500 t/s;
     # gauge = mean(1000, 500) = 750 (raw delta would read 700).
     clock.advance(1.0)
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_vllm_server(
                    body(30, 1300, 5, 2.0, 5).encode())), \
          patch("app.time.monotonic", clock):
@@ -2766,16 +2765,16 @@ def test_collect_vllm_prompt_rate_averages_completed_requests():
 def test_collect_vllm_counter_reset_rebaselines():
     """A decreasing counter (server restart) yields 0 rate."""
     import app as app_mod
-    from app import collect_vllm_metrics
+    from collectors.llm import collect_vllm_metrics
 
-    app_mod._vllm_prev["primary"] = {"ts": 1000.0, "gen": 10000.0,
+    llm._vllm_prev["primary"] = {"ts": 1000.0, "gen": 10000.0,
                                      "prompt": 10000.0}
     body = (
         'vllm:generation_tokens_total{engine="0",model_name="M"} 100.0\n'
         'vllm:prompt_tokens_total{engine="0",model_name="M"} 200.0\n'
     )
     clock = _FakeClock(start=1001.0)
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_vllm_server(body.encode())), \
          patch("app.time.monotonic", clock):
         result = collect_vllm_metrics("http://127.0.0.1:9999")
@@ -2787,19 +2786,19 @@ def test_collect_vllm_counter_reset_rebaselines():
 
 def test_collect_vllm_rate_window_too_short():
     """elapsed < 0.5 s: rate is omitted."""
-    from app import collect_vllm_metrics
+    from collectors.llm import collect_vllm_metrics
 
     body1 = 'vllm:generation_tokens_total{engine="0",model_name="M"} 100.0\n'
     body2 = 'vllm:generation_tokens_total{engine="0",model_name="M"} 160.0\n'
 
     clock = _FakeClock()
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_vllm_server(body1.encode())), \
          patch("app.time.monotonic", clock):
         collect_vllm_metrics("http://127.0.0.1:9999")
 
     clock.advance(0.2)  # < 0.5 s
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_vllm_server(body2.encode())), \
          patch("app.time.monotonic", clock):
         result = collect_vllm_metrics("http://127.0.0.1:9999")
@@ -2809,19 +2808,19 @@ def test_collect_vllm_rate_window_too_short():
 
 def test_collect_vllm_rate_window_too_long():
     """elapsed > 15 s: rate is omitted (gauges still present)."""
-    from app import collect_vllm_metrics
+    from collectors.llm import collect_vllm_metrics
 
     body1 = 'vllm:generation_tokens_total{engine="0",model_name="M"} 100.0\n'
     body2 = 'vllm:generation_tokens_total{engine="0",model_name="M"} 160.0\n'
 
     clock = _FakeClock()
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_vllm_server(body1.encode())), \
          patch("app.time.monotonic", clock):
         collect_vllm_metrics("http://127.0.0.1:9999")
 
     clock.advance(16.0)  # > 15 s
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_vllm_server(body2.encode())), \
          patch("app.time.monotonic", clock):
         result = collect_vllm_metrics("http://127.0.0.1:9999")
@@ -2832,14 +2831,14 @@ def test_collect_vllm_rate_window_too_long():
 
 def test_collect_vllm_prefix_cache_omitted_at_zero():
     """prefix_cache_hit_pct omitted when queries == 0."""
-    from app import collect_vllm_metrics
+    from collectors.llm import collect_vllm_metrics
 
     body = (
         'vllm:prefix_cache_queries_total{engine="0",model_name="M"} 0.0\n'
         'vllm:prefix_cache_hits_total{engine="0",model_name="M"} 0.0\n'
         'vllm:num_requests_running{engine="0",model_name="M"} 1.0\n'
     )
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_vllm_server(body.encode())):
         result = collect_vllm_metrics("http://127.0.0.1:9999")
 
@@ -2848,14 +2847,14 @@ def test_collect_vllm_prefix_cache_omitted_at_zero():
 
 def test_collect_vllm_prefix_cache_populated():
     """prefix_cache_hit_pct = 100 * hits / queries when queries > 0."""
-    from app import collect_vllm_metrics
+    from collectors.llm import collect_vllm_metrics
 
     body = (
         'vllm:prefix_cache_queries_total{engine="0",model_name="M"} 1000.0\n'
         'vllm:prefix_cache_hits_total{engine="0",model_name="M"} 250.0\n'
         'vllm:num_requests_running{engine="0",model_name="M"} 1.0\n'
     )
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_vllm_server(body.encode())):
         result = collect_vllm_metrics("http://127.0.0.1:9999")
 
@@ -2864,7 +2863,7 @@ def test_collect_vllm_prefix_cache_populated():
 
 def test_collect_vllm_ttft_windowed_mean():
     """TTFT windowed mean = Δsum/Δcount; omitted when Δcount ≤ 0."""
-    from app import collect_vllm_metrics
+    from collectors.llm import collect_vllm_metrics
 
     body1 = (
         'vllm:time_to_first_token_seconds_sum{engine="0",model_name="M"} 100.0\n'
@@ -2878,14 +2877,14 @@ def test_collect_vllm_ttft_windowed_mean():
     )
 
     clock = _FakeClock()
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_vllm_server(body1.encode())), \
          patch("app.time.monotonic", clock):
         first = collect_vllm_metrics("http://127.0.0.1:9999")
     assert "ttft_seconds" not in first  # no prev
 
     clock.advance(1.0)
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_vllm_server(body2.encode())), \
          patch("app.time.monotonic", clock):
         second = collect_vllm_metrics("http://127.0.0.1:9999")
@@ -2896,14 +2895,14 @@ def test_collect_vllm_ttft_windowed_mean():
 
 def test_collect_vllm_ttft_no_lifetime_fallback():
     """No TTFT on first scrape (no lifetime fallback)."""
-    from app import collect_vllm_metrics
+    from collectors.llm import collect_vllm_metrics
 
     body = (
         'vllm:time_to_first_token_seconds_sum{engine="0",model_name="M"} 100.0\n'
         'vllm:time_to_first_token_seconds_count{engine="0",model_name="M"} 10.0\n'
         'vllm:num_requests_running{engine="0",model_name="M"} 1.0\n'
     )
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_vllm_server(body.encode())):
         result = collect_vllm_metrics("http://127.0.0.1:9999")
 
@@ -2912,7 +2911,7 @@ def test_collect_vllm_ttft_no_lifetime_fallback():
 
 def test_collect_vllm_itl_windowed_mean():
     """ITL windowed mean × 1000 → ms; omitted when Δcount ≤ 0."""
-    from app import collect_vllm_metrics
+    from collectors.llm import collect_vllm_metrics
 
     body1 = (
         'vllm:inter_token_latency_seconds_sum{engine="0",model_name="M"} 1000.0\n'
@@ -2926,13 +2925,13 @@ def test_collect_vllm_itl_windowed_mean():
     )
 
     clock = _FakeClock()
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_vllm_server(body1.encode())), \
          patch("app.time.monotonic", clock):
         collect_vllm_metrics("http://127.0.0.1:9999")
 
     clock.advance(1.0)
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_vllm_server(body2.encode())), \
          patch("app.time.monotonic", clock):
         second = collect_vllm_metrics("http://127.0.0.1:9999")
@@ -2943,10 +2942,10 @@ def test_collect_vllm_itl_windowed_mean():
 
 def test_collect_vllm_sleep_state_omitted_when_absent():
     """engine_sleep_state absent → sleeping key omitted."""
-    from app import collect_vllm_metrics
+    from collectors.llm import collect_vllm_metrics
 
     body = 'vllm:num_requests_running{engine="0",model_name="M"} 1.0\n'
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_vllm_server(body.encode())):
         result = collect_vllm_metrics("http://127.0.0.1:9999")
 
@@ -2955,7 +2954,7 @@ def test_collect_vllm_sleep_state_omitted_when_absent():
 
 def test_collect_vllm_sleep_state_weights_offloaded():
     """engine_sleep_state with weights_offloaded=1 → sleeping=True."""
-    from app import collect_vllm_metrics
+    from collectors.llm import collect_vllm_metrics
 
     body = (
         'vllm:num_requests_running{engine="0",model_name="M"} 0.0\n'
@@ -2963,7 +2962,7 @@ def test_collect_vllm_sleep_state_weights_offloaded():
         'vllm:engine_sleep_state{engine="0",model_name="M",sleep_state="weights_offloaded"} 1.0\n'
         'vllm:engine_sleep_state{engine="0",model_name="M",sleep_state="discard_all"} 0.0\n'
     )
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_vllm_server(body.encode())):
         result = collect_vllm_metrics("http://127.0.0.1:9999")
 
@@ -2972,14 +2971,14 @@ def test_collect_vllm_sleep_state_weights_offloaded():
 
 def test_collect_vllm_spec_accept_omitted_when_draft_zero():
     """spec_accept_pct omitted when draft == 0."""
-    from app import collect_vllm_metrics
+    from collectors.llm import collect_vllm_metrics
 
     body = (
         'vllm:spec_decode_num_draft_tokens_total{engine="0",model_name="M"} 0.0\n'
         'vllm:spec_decode_num_accepted_tokens_total{engine="0",model_name="M"} 0.0\n'
         'vllm:num_requests_running{engine="0",model_name="M"} 1.0\n'
     )
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_vllm_server(body.encode())):
         result = collect_vllm_metrics("http://127.0.0.1:9999")
 
@@ -2990,7 +2989,7 @@ def test_collect_vllm_config_none_values_omitted():
     """cache_config_info label values that are the literal string "None"
     are omitted from the config dict."""
     import app as app_mod
-    from app import collect_vllm_metrics
+    from collectors.llm import collect_vllm_metrics
 
     body = (
         'vllm:num_requests_running{engine="0",model_name="M"} 1.0\n'
@@ -2999,8 +2998,8 @@ def test_collect_vllm_config_none_values_omitted():
         'gpu_memory_utilization="None",kv_cache_size_tokens="1000",'
         'num_gpu_blocks="100"} 1.0\n'
     )
-    app_mod._vllm_config_cache = {}  # bypass 30s cache
-    with patch("app.urllib.request.urlopen",
+    llm._vllm_config_cache = {}  # bypass 30s cache
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_vllm_server(body.encode())):
         result = collect_vllm_metrics("http://127.0.0.1:9999")
 
@@ -3013,7 +3012,7 @@ def test_collect_vllm_config_none_values_omitted():
 
 def test_collect_vllm_usage_nested_counters():
     """vLLM usage: total = prompt + gen (nested: cached ⊂ prompt)."""
-    from app import collect_vllm_metrics
+    from collectors.llm import collect_vllm_metrics
 
     body = (
         'vllm:prompt_tokens_total{engine="0",model_name="M"} 10000.0\n'
@@ -3021,7 +3020,7 @@ def test_collect_vllm_usage_nested_counters():
         'vllm:prompt_tokens_cached_total{engine="0",model_name="M"} 3000.0\n'
         'process_start_time_seconds 1000000.0\n'
     )
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_vllm_server(body.encode())), \
          patch("app.time.time", return_value=1001000.0):
         result = collect_vllm_metrics("http://127.0.0.1:9999")
@@ -3035,7 +3034,7 @@ def test_collect_vllm_usage_nested_counters():
 
 def test_collect_vllm_version_skew_aliases():
     """Legacy metric names are used when current names are absent."""
-    from app import collect_vllm_metrics
+    from collectors.llm import collect_vllm_metrics
 
     body = (
         'vllm:gpu_cache_usage_perc{engine="0",model_name="M"} 0.5\n'
@@ -3043,7 +3042,7 @@ def test_collect_vllm_version_skew_aliases():
         'vllm:num_generation_tokens{engine="0",model_name="M"} 500.0\n'
         'vllm:num_requests_running{engine="0",model_name="M"} 1.0\n'
     )
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_vllm_server(body.encode())):
         result = collect_vllm_metrics("http://127.0.0.1:9999")
 
@@ -3081,7 +3080,7 @@ def test_collect_llm_both_up_vllm_wins():
     collector.vllm_url = "http://127.0.0.1:9998"
     collector.llama_url = "http://127.0.0.1:9999"
 
-    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen):
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=fake_urlopen):
         data = collector._collect_llm()
 
     assert data is not None
@@ -3106,7 +3105,7 @@ def test_collect_llm_only_vllm_up():
             return _http_response(vllm_body)
         raise ConnectionRefusedError("down")
 
-    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen):
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=fake_urlopen):
         data = collector._collect_llm()
 
     assert data is not None
@@ -3132,7 +3131,7 @@ def test_collect_llm_only_llama_up():
             return _http_response(b"[]")
         raise ConnectionRefusedError("down")
 
-    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen):
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=fake_urlopen):
         data = collector._collect_llm()
 
     assert data is not None
@@ -3148,7 +3147,7 @@ def test_collect_llm_both_down_returns_none():
     collector.vllm_url = "http://127.0.0.1:9998"
     collector.llama_url = "http://127.0.0.1:9999"
 
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=ConnectionRefusedError("both down")):
         data = collector._collect_llm()
 
@@ -3171,12 +3170,12 @@ def test_collect_llm_vllm_stale_stays_vllm():
         raise ConnectionRefusedError("down")
 
     # First: vLLM up
-    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen):
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=fake_urlopen):
         data = collector._collect_llm()
     assert data["backend"] == "vllm" and data["status"] == "up"
 
     # Second: vLLM down, within stale-hold → still vLLM (stale)
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=ConnectionRefusedError("down")):
         data = collector._collect_llm()
     assert data is not None
@@ -3214,7 +3213,7 @@ def test_collect_llm_vllm_recovers_returns_to_vllm():
 
     clock = _FakeClock()
     # 1. vLLM up
-    with patch("app.urllib.request.urlopen", side_effect=up_vllm_down_llama), \
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=up_vllm_down_llama), \
          patch("app.time.monotonic", clock):
         data = collector._collect_llm()
     assert data is not None
@@ -3222,14 +3221,14 @@ def test_collect_llm_vllm_recovers_returns_to_vllm():
 
     # 2. vLLM down beyond the 15 s stale-hold → fall through to llama
     clock.advance(16.0)
-    with patch("app.urllib.request.urlopen", side_effect=down_vllm_up_llama), \
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=down_vllm_up_llama), \
          patch("app.time.monotonic", clock):
         data = collector._collect_llm()
     assert data is not None
     assert data["backend"] == "llama"
 
     # 3. vLLM recovers → selection flips back to vLLM
-    with patch("app.urllib.request.urlopen", side_effect=up_vllm_down_llama), \
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=up_vllm_down_llama), \
          patch("app.time.monotonic", clock):
         data = collector._collect_llm()
     assert data is not None
@@ -3257,7 +3256,7 @@ def test_collect_llm_pinned_llama_ignores_vllm():
             return _http_response(b"[]")
         raise ConnectionRefusedError("down")
 
-    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen):
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=fake_urlopen):
         data = collector._collect_llm()
 
     assert data is not None
@@ -3283,7 +3282,7 @@ def test_collect_llm_pinned_vllm_ignores_llama():
             return _http_response(vllm_body)
         raise ConnectionRefusedError("down")
 
-    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen):
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=fake_urlopen):
         data = collector._collect_llm()
 
     assert data is not None
@@ -3298,7 +3297,7 @@ def test_collect_llm_disabled_returns_none():
 
     collector = MetricsCollector(poll_interval=0.1, llama_enabled=False)
 
-    with patch("app.urllib.request.urlopen") as fake_urlopen:
+    with patch("collectors.llm.urllib.request.urlopen") as fake_urlopen:
         fake_urlopen.side_effect = ConnectionRefusedError("must not be called")
         data = collector._collect_llm()
 
@@ -3322,8 +3321,8 @@ def test_snapshot_schema_llm_key_singular():
             return _http_response(vllm_body)
         raise ConnectionRefusedError("down")
 
-    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen), \
-         patch("app.collect_gpu_metrics", return_value=[]), \
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=fake_urlopen), \
+         patch("collectors.gpu.collect_gpu_metrics", return_value=[]), \
          patch("app.collect_swap_metrics", return_value=None), \
          patch("app.collect_host_health_metrics", return_value={"psi_mem_avg10": None, "d_state_procs": 0}):
         # Populate _llm_latest the way the LLM thread would (this test
@@ -3356,13 +3355,13 @@ def platform_env(tmp_path, monkeypatch):
     lazy platform globals, and pin a deterministic non-tegra kernel."""
     import app
 
-    monkeypatch.setattr(app, "_PLATFORM", None)
-    monkeypatch.setattr(app, "_JETSON_SOC", None)
+    monkeypatch.setattr(gpu_mod, "_PLATFORM", None)
+    monkeypatch.setattr(gpu_mod, "_JETSON_SOC", None)
     dt = tmp_path / "dt"
     dt.mkdir()
-    monkeypatch.setattr(app, "_DT_MODEL_PATHS", (str(dt / "model"),))
-    monkeypatch.setattr(app, "_DT_COMPATIBLE_PATHS", (str(dt / "compatible"),))
-    monkeypatch.setattr(app, "_NV_TEGRA_RELEASE_PATH", str(tmp_path / "nv_tegra_release"))
+    monkeypatch.setattr(gpu_mod, "_DT_MODEL_PATHS", (str(dt / "model"),))
+    monkeypatch.setattr(gpu_mod, "_DT_COMPATIBLE_PATHS", (str(dt / "compatible"),))
+    monkeypatch.setattr(gpu_mod, "_NV_TEGRA_RELEASE_PATH", str(tmp_path / "nv_tegra_release"))
     monkeypatch.setattr("platform.release", lambda: "6.8.0-test")
     return SimpleNamespace(
         model=dt / "model",
@@ -3377,10 +3376,10 @@ def jetson_env(tmp_path, monkeypatch):
     and a 16 GiB unified-pool meminfo (8 GiB available → 50 % used)."""
     import app
 
-    monkeypatch.setattr(app, "_PLATFORM", "jetson")
-    monkeypatch.setattr(app, "_JETSON_SOC", "orin")
-    monkeypatch.setattr(app, "_jetson_devfreq_cache", None)
-    monkeypatch.setattr(app, "_jetson_mode_logged", True)  # keep logs quiet
+    monkeypatch.setattr(gpu_mod, "_PLATFORM", "jetson")
+    monkeypatch.setattr(gpu_mod, "_JETSON_SOC", "orin")
+    monkeypatch.setattr(gpu_mod, "_jetson_devfreq_cache", None)
+    monkeypatch.setattr(gpu_mod, "_jetson_mode_logged", True)  # keep logs quiet
     devfreq = tmp_path / "devfreq"
     devfreq.mkdir()
     thermal = tmp_path / "thermal"
@@ -3423,15 +3422,15 @@ def _add_zone(env, idx, ztype, temp):
 def test_platform_desktop_no_signals(platform_env):
     import app
 
-    assert app._init_platform() == "desktop"
-    assert app._JETSON_SOC == "unknown"
+    assert gpu_mod._init_platform() == "desktop"
+    assert gpu_mod._JETSON_SOC == "unknown"
 
 
 def test_platform_model_jetson(platform_env):
     import app
 
     platform_env.model.write_bytes(b"NVIDIA Jetson AGX Orin Developer Kit\x00")
-    assert app._init_platform() == "jetson"
+    assert gpu_mod._init_platform() == "jetson"
 
 
 def test_platform_model_orin_nx_without_jetson_word(platform_env):
@@ -3439,7 +3438,7 @@ def test_platform_model_orin_nx_without_jetson_word(platform_env):
     import app
 
     platform_env.model.write_bytes(b"NVIDIA Orin NX Developer Kit\x00")
-    assert app._init_platform() == "jetson"
+    assert gpu_mod._init_platform() == "jetson"
 
 
 def test_platform_model_thor_without_nvidia_is_desktop(platform_env):
@@ -3448,7 +3447,7 @@ def test_platform_model_thor_without_nvidia_is_desktop(platform_env):
     import app
 
     platform_env.model.write_bytes(b"Acme Thor Developer Board\x00")
-    assert app._init_platform() == "desktop"
+    assert gpu_mod._init_platform() == "desktop"
 
 
 def test_platform_compatible_only(platform_env):
@@ -3457,8 +3456,8 @@ def test_platform_compatible_only(platform_env):
     platform_env.compatible.write_bytes(
         b"nvidia,p4071-0000+p3834-0008\x00nvidia,tegra264\x00"
     )
-    assert app._init_platform() == "jetson"
-    assert app._JETSON_SOC == "thor"
+    assert gpu_mod._init_platform() == "jetson"
+    assert gpu_mod._JETSON_SOC == "thor"
 
 
 def test_platform_nv_tegra_release_fallback(platform_env):
@@ -3467,15 +3466,15 @@ def test_platform_nv_tegra_release_fallback(platform_env):
     platform_env.nv_tegra_release.write_text(
         "# R38 (release), REVISION: 2.1, GCID: 1234567, EABI: aarch64\n"
     )
-    assert app._init_platform() == "jetson"
-    assert app._JETSON_SOC == "unknown"
+    assert gpu_mod._init_platform() == "jetson"
+    assert gpu_mod._JETSON_SOC == "unknown"
 
 
 def test_platform_tegra_kernel_fallback(platform_env, monkeypatch):
     import app
 
     monkeypatch.setattr("platform.release", lambda: "6.8.12-1021-tegra")
-    assert app._init_platform() == "jetson"
+    assert gpu_mod._init_platform() == "jetson"
 
 
 def test_platform_unreadable_model_file_skipped(platform_env):
@@ -3483,36 +3482,36 @@ def test_platform_unreadable_model_file_skipped(platform_env):
     import app
 
     platform_env.model.mkdir()  # open() raises IsADirectoryError
-    assert app._init_platform() == "desktop"
+    assert gpu_mod._init_platform() == "desktop"
 
 
 def test_platform_result_cached(platform_env):
     """Detection runs once; later file changes do not re-detect."""
     import app
 
-    assert app._init_platform() == "desktop"
+    assert gpu_mod._init_platform() == "desktop"
     platform_env.model.write_bytes(b"NVIDIA Jetson AGX Orin Developer Kit\x00")
-    assert app._init_platform() == "desktop"
-    assert app._JETSON_SOC == "unknown"
+    assert gpu_mod._init_platform() == "desktop"
+    assert gpu_mod._JETSON_SOC == "unknown"
 
 
 # -- SoC parse + board label ---------------------------------------------------
 
 
 def test_soc_from_compatible_tegra264_is_thor():
-    from app import _soc_from_compatible
+    from collectors.gpu import _soc_from_compatible
 
     assert _soc_from_compatible(b"nvidia,p4071+p3834\x00nvidia,tegra264\x00") == "thor"
 
 
 def test_soc_from_compatible_tegra234_is_orin():
-    from app import _soc_from_compatible
+    from collectors.gpu import _soc_from_compatible
 
     assert _soc_from_compatible(b"nvidia,orin-nx-nv\x00nvidia,tegra234\x00") == "orin"
 
 
 def test_soc_from_compatible_garbage_is_unknown():
-    from app import _soc_from_compatible
+    from collectors.gpu import _soc_from_compatible
 
     assert _soc_from_compatible(b"nvidia,tegra210\x00") == "unknown"
     assert _soc_from_compatible(b"") == "unknown"
@@ -3521,22 +3520,22 @@ def test_soc_from_compatible_garbage_is_unknown():
 def test_board_label_soc_names(platform_env, monkeypatch):
     import app
 
-    monkeypatch.setattr(app, "_JETSON_SOC", "thor")
-    assert app._jetson_board_label() == "NVIDIA Thor"
-    monkeypatch.setattr(app, "_JETSON_SOC", "orin")
-    assert app._jetson_board_label() == "NVIDIA Orin"
-    monkeypatch.setattr(app, "_JETSON_SOC", "unknown")
+    monkeypatch.setattr(gpu_mod, "_JETSON_SOC", "thor")
+    assert gpu_mod._jetson_board_label() == "NVIDIA Thor"
+    monkeypatch.setattr(gpu_mod, "_JETSON_SOC", "orin")
+    assert gpu_mod._jetson_board_label() == "NVIDIA Orin"
+    monkeypatch.setattr(gpu_mod, "_JETSON_SOC", "unknown")
     platform_env.model.write_bytes(b"NVIDIA Jetson AGX Thor Developer Kit\x00")
-    assert app._jetson_board_label() == "NVIDIA Jetson AGX Thor Developer Kit"
+    assert gpu_mod._jetson_board_label() == "NVIDIA Jetson AGX Thor Developer Kit"
     platform_env.model.write_bytes(b"")
-    assert app._jetson_board_label() == "NVIDIA Jetson"
+    assert gpu_mod._jetson_board_label() == "NVIDIA Jetson"
 
 
 # -- jetson collector ----------------------------------------------------------
 
 
 def test_jetson_orin_happy_path(jetson_env):
-    from app import collect_jetson_gpu_metrics
+    from collectors.gpu import collect_jetson_gpu_metrics
 
     _add_gpu_node(jetson_env, load=420, cur_freq=1_365_000_000)
     _add_zone(jetson_env, 1, "gpu-thermal", 54_500)
@@ -3564,10 +3563,10 @@ def test_jetson_util_prefers_load_file_over_smi(jetson_env, no_real_nvidia,
     """Capability rule: a devfreq node with device/load wins even on Thor."""
     import app
 
-    monkeypatch.setattr(app, "_JETSON_SOC", "thor")
+    monkeypatch.setattr(gpu_mod, "_JETSON_SOC", "thor")
     _add_gpu_node(jetson_env, name="gpu-gpc-0", load=330, cur_freq=1_500_000_000)
     no_real_nvidia.return_value = MagicMock(stdout="99\n")
-    gpu = app.collect_jetson_gpu_metrics(**jetson_env.args())[0]
+    gpu = gpu_mod.collect_jetson_gpu_metrics(**jetson_env.args())[0]
 
     assert gpu["utilization_pct"] == 33.0
     assert gpu["name"] == "NVIDIA Thor"
@@ -3579,10 +3578,10 @@ def test_jetson_thor_util_from_nvidia_smi(jetson_env, no_real_nvidia,
     """Thor without device/load falls back to nvidia-smi (tolerant parse)."""
     import app
 
-    monkeypatch.setattr(app, "_JETSON_SOC", "thor")
+    monkeypatch.setattr(gpu_mod, "_JETSON_SOC", "thor")
     _add_gpu_node(jetson_env, name="gpu-gpc-0", cur_freq=1_500_000_000)
     no_real_nvidia.return_value = MagicMock(stdout="73\n")
-    gpu = app.collect_jetson_gpu_metrics(**jetson_env.args())[0]
+    gpu = gpu_mod.collect_jetson_gpu_metrics(**jetson_env.args())[0]
 
     assert gpu["utilization_pct"] == 73.0
     assert gpu["graphics_clock_mhz"] == 1500.0
@@ -3593,11 +3592,11 @@ def test_jetson_thor_nvidia_smi_na_omits_util(jetson_env, no_real_nvidia,
                                               monkeypatch):
     import app
 
-    monkeypatch.setattr(app, "_JETSON_SOC", "thor")
+    monkeypatch.setattr(gpu_mod, "_JETSON_SOC", "thor")
     _add_gpu_node(jetson_env, name="gpu-gpc-0", cur_freq=1_500_000_000)
     _add_zone(jetson_env, 1, "gpu-thermal", 49_000)
     no_real_nvidia.return_value = MagicMock(stdout="N/A\n")
-    gpu = app.collect_jetson_gpu_metrics(**jetson_env.args())[0]
+    gpu = gpu_mod.collect_jetson_gpu_metrics(**jetson_env.args())[0]
 
     assert "utilization_pct" not in gpu
     # Everything else still present
@@ -3611,7 +3610,7 @@ def test_jetson_orin_no_node_omits_util_not_zero(jetson_env, no_real_nvidia):
     import app
 
     _add_zone(jetson_env, 1, "gpu-thermal", 45_000)
-    gpu = app.collect_jetson_gpu_metrics(**jetson_env.args())[0]
+    gpu = gpu_mod.collect_jetson_gpu_metrics(**jetson_env.args())[0]
 
     assert "utilization_pct" not in gpu
     assert "graphics_clock_mhz" not in gpu
@@ -3624,14 +3623,14 @@ def test_jetson_devfreq_late_boot_not_cached_absent(jetson_env):
     absence)."""
     import app
 
-    first = app.collect_jetson_gpu_metrics(**jetson_env.args())[0]
+    first = gpu_mod.collect_jetson_gpu_metrics(**jetson_env.args())[0]
     assert "utilization_pct" not in first
 
     _add_gpu_node(jetson_env, load=500, cur_freq=1_000_000_000)
-    second = app.collect_jetson_gpu_metrics(**jetson_env.args())[0]
+    second = gpu_mod.collect_jetson_gpu_metrics(**jetson_env.args())[0]
     assert second["utilization_pct"] == 50.0
     assert second["graphics_clock_mhz"] == 1000.0
-    assert app._jetson_devfreq_cache == "17000000.gpu"
+    assert gpu_mod._jetson_devfreq_cache == "17000000.gpu"
 
 
 def test_jetson_devfreq_strict_pattern(jetson_env):
@@ -3639,11 +3638,11 @@ def test_jetson_devfreq_strict_pattern(jetson_env):
     import app
 
     _add_gpu_node(jetson_env, name="foo-gpu-bar", cur_freq=1_000_000_000)
-    gpu = app.collect_jetson_gpu_metrics(**jetson_env.args())[0]
+    gpu = gpu_mod.collect_jetson_gpu_metrics(**jetson_env.args())[0]
 
     assert "graphics_clock_mhz" not in gpu
     assert "utilization_pct" not in gpu
-    assert app._jetson_devfreq_cache is None
+    assert gpu_mod._jetson_devfreq_cache is None
 
 
 def test_jetson_thermal_max_and_filtering(jetson_env):
@@ -3654,7 +3653,7 @@ def test_jetson_thermal_max_and_filtering(jetson_env):
     _add_zone(jetson_env, 2, "gpu-thermal", 50_000)
     _add_zone(jetson_env, 3, "gpu-thermal", 61_000)
     _add_zone(jetson_env, 4, "cpu-thermal", 99_000)     # wrong type
-    gpu = app.collect_jetson_gpu_metrics(**jetson_env.args())[0]
+    gpu = gpu_mod.collect_jetson_gpu_metrics(**jetson_env.args())[0]
 
     assert gpu["temperature_c"] == 61.0
 
@@ -3666,7 +3665,7 @@ def test_jetson_thermal_zone_missing_temp_skipped(jetson_env):
     zone.mkdir()
     (zone / "type").write_text("gpu-thermal\n")  # no temp file
     _add_zone(jetson_env, 6, "gpu-thermal", 44_000)
-    gpu = app.collect_jetson_gpu_metrics(**jetson_env.args())[0]
+    gpu = gpu_mod.collect_jetson_gpu_metrics(**jetson_env.args())[0]
 
     assert gpu["temperature_c"] == 44.0
 
@@ -3674,7 +3673,7 @@ def test_jetson_thermal_zone_missing_temp_skipped(jetson_env):
 def test_jetson_meminfo_missing_omits_mem_keys(jetson_env):
     import app
 
-    gpu = app.collect_jetson_gpu_metrics(
+    gpu = gpu_mod.collect_jetson_gpu_metrics(
         devfreq_dir=str(jetson_env.devfreq),
         meminfo_path=str(jetson_env.meminfo.parent / "no_meminfo"),
         thermal_dir=str(jetson_env.thermal),
@@ -3688,7 +3687,7 @@ def test_jetson_meminfo_missing_omits_mem_keys(jetson_env):
 def test_jetson_all_absent_never_raises(jetson_env):
     import app
 
-    gpu = app.collect_jetson_gpu_metrics(
+    gpu = gpu_mod.collect_jetson_gpu_metrics(
         devfreq_dir=str(jetson_env.devfreq),  # empty dir
         meminfo_path=str(jetson_env.meminfo.parent / "no_meminfo"),
         thermal_dir=str(jetson_env.thermal),  # empty dir
@@ -3706,19 +3705,19 @@ def test_gpu_metrics_gate_jetson_skips_desktop_paths(jetson_env, no_real_nvidia,
     import app
 
     calls = []
-    monkeypatch.setattr(app, "_gpu_pynvml",
+    monkeypatch.setattr(gpu_mod, "_gpu_pynvml",
                         lambda: calls.append("pynvml") or [{"index": 9}])
-    monkeypatch.setattr(app, "_gpu_cli",
+    monkeypatch.setattr(gpu_mod, "_gpu_cli",
                         lambda: calls.append("cli") or [{"index": 9}])
     # The no-arg call inside collect_gpu_metrics() binds the path defaults at
     # def-time, so re-pointing the module constants is inert - patch the
     # function's __defaults__ instead (keeps the test hermetic: the fake
     # meminfo below is what feeds the assertions, not the host's /sys).
     monkeypatch.setattr(
-        app.collect_jetson_gpu_metrics, "__defaults__",
+        gpu_mod.collect_jetson_gpu_metrics, "__defaults__",
         (str(jetson_env.devfreq), str(jetson_env.meminfo),
          str(jetson_env.thermal)))
-    result = app.collect_gpu_metrics()
+    result = gpu_mod.collect_gpu_metrics()
 
     assert calls == []
     no_real_nvidia.assert_not_called()
@@ -3733,9 +3732,9 @@ def test_gpu_metrics_gate_desktop_unchanged(platform_env, no_real_nvidia,
                                             monkeypatch):
     import app
 
-    assert app._init_platform() == "desktop"
-    monkeypatch.setattr(app, "_gpu_pynvml", lambda: [{"index": 0, "name": "fake"}])
-    result = app.collect_gpu_metrics()
+    assert gpu_mod._init_platform() == "desktop"
+    monkeypatch.setattr(gpu_mod, "_gpu_pynvml", lambda: [{"index": 0, "name": "fake"}])
+    result = gpu_mod.collect_gpu_metrics()
 
     # Desktop path now tags each card with its vendor
     assert result == [{"index": 0, "name": "fake", "vendor": "nvidia"}]
@@ -3745,10 +3744,10 @@ def test_gpu_metrics_gate_desktop_unchanged(platform_env, no_real_nvidia,
 def test_gpu_metrics_jetson_mode_logged_once(jetson_env, monkeypatch, caplog):
     import app
 
-    monkeypatch.setattr(app, "_jetson_mode_logged", False)
+    monkeypatch.setattr(gpu_mod, "_jetson_mode_logged", False)
     with caplog.at_level(logging.INFO):
-        app.collect_gpu_metrics()
-        app.collect_gpu_metrics()
+        gpu_mod.collect_gpu_metrics()
+        gpu_mod.collect_gpu_metrics()
 
     msgs = [r.getMessage() for r in caplog.records]
     assert sum("GPU mode: jetson (SoC: orin)" in m for m in msgs) == 1
@@ -3811,17 +3810,15 @@ def reset_litellm_state():
     """Reset module-level LiteLLM scrape history around every test."""
     import app as app_mod
 
-    original_prev = app_mod._litellm_prev
-    original_last_good = app_mod._litellm_last_good
-    app_mod._litellm_prev = {}
-    app_mod._litellm_last_good = {}
+    # Clear in-place so the BaseLLMCollector aliases stay valid.
+    llm._litellm_prev.clear()
+    llm._litellm_last_good.clear()
     yield
-    app_mod._litellm_prev = original_prev
-    app_mod._litellm_last_good = original_last_good
+    # No restore needed – state is per-test and cleared in-place.
 
 
 def make_litellm_server(body: bytes, calls: list | None = None):
-    """Side_effect for ``app.urllib.request.urlopen`` serving a LiteLLM
+    """Side_effect for ``llm.urllib.request.urlopen`` serving a LiteLLM
     /metrics endpoint. The collector passes a urllib Request object, so
     resolve ``full_url`` and capture headers (token tests)."""
     import urllib.request as _ur
@@ -3838,9 +3835,9 @@ def make_litellm_server(body: bytes, calls: list | None = None):
 
 
 def test_collect_litellm_happy_path():
-    from app import collect_litellm_metrics
+    from collectors.llm import collect_litellm_metrics
 
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_litellm_server(LITELLM_METRICS_SAMPLE.encode())):
         result = collect_litellm_metrics("http://127.0.0.1:9997")
 
@@ -3876,7 +3873,7 @@ def test_collect_litellm_happy_path():
 
 def test_collect_litellm_rates_and_ttft_from_deltas():
     """Second scrape within the 0.5–5 s window yields rates + windowed TTFT."""
-    from app import collect_litellm_metrics
+    from collectors.llm import collect_litellm_metrics
 
     body = LITELLM_METRICS_SAMPLE.replace(
         "litellm_output_tokens_metric_total{api_provider=\"openai\",model_id=\"m1\",requested_model=\"llama-3.1-8b\"} 12000.0",
@@ -3893,13 +3890,13 @@ def test_collect_litellm_rates_and_ttft_from_deltas():
     )
 
     clock = _FakeClock()
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_litellm_server(LITELLM_METRICS_SAMPLE.encode())), \
          patch("app.time.monotonic", clock):
         first = collect_litellm_metrics("http://127.0.0.1:9997")
         assert "gen_tokens_per_s" not in first
         clock.advance(2.0)
-        with patch("app.urllib.request.urlopen",
+        with patch("collectors.llm.urllib.request.urlopen",
                    side_effect=make_litellm_server(body.encode())):
             second = collect_litellm_metrics("http://127.0.0.1:9997")
 
@@ -3912,7 +3909,7 @@ def test_collect_litellm_rates_and_ttft_from_deltas():
 
 
 def test_collect_litellm_counter_reset_clamps_rate():
-    from app import collect_litellm_metrics
+    from collectors.llm import collect_litellm_metrics
 
     reset_body = LITELLM_METRICS_SAMPLE.replace(
         "litellm_output_tokens_metric_total{api_provider=\"openai\",model_id=\"m1\",requested_model=\"llama-3.1-8b\"} 12000.0",
@@ -3920,12 +3917,12 @@ def test_collect_litellm_counter_reset_clamps_rate():
     )
 
     clock = _FakeClock()
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_litellm_server(LITELLM_METRICS_SAMPLE.encode())), \
          patch("app.time.monotonic", clock):
         collect_litellm_metrics("http://127.0.0.1:9997")
         clock.advance(2.0)
-        with patch("app.urllib.request.urlopen",
+        with patch("collectors.llm.urllib.request.urlopen",
                    side_effect=make_litellm_server(reset_body.encode())):
             second = collect_litellm_metrics("http://127.0.0.1:9997")
 
@@ -3946,10 +3943,10 @@ def _two_model_body() -> str:
 
 def test_collect_litellm_per_model_rates():
     """Per-model gen tokens/s from per-model counter deltas (2 models)."""
-    from app import collect_litellm_metrics
+    from collectors.llm import collect_litellm_metrics
 
     clock = _FakeClock()
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_litellm_server(_two_model_body().encode())), \
          patch("app.time.monotonic", clock):
         first = collect_litellm_metrics("http://127.0.0.1:9997")
@@ -3962,7 +3959,7 @@ def test_collect_litellm_per_model_rates():
             'litellm_output_tokens_metric_total{api_provider="openai",model_id="m2",requested_model="gpt-4o-mini"} 345.0',
             'litellm_output_tokens_metric_total{api_provider="openai",model_id="m2",requested_model="gpt-4o-mini"} 385.0',
         )
-        with patch("app.urllib.request.urlopen",
+        with patch("collectors.llm.urllib.request.urlopen",
                    side_effect=make_litellm_server(second_body.encode())):
             second = collect_litellm_metrics("http://127.0.0.1:9997")
 
@@ -3976,10 +3973,10 @@ def test_collect_litellm_per_model_rates():
 
 def test_collect_litellm_per_model_counter_reset_clamps():
     """A per-model counter reset clamps only that model's rate to 0."""
-    from app import collect_litellm_metrics
+    from collectors.llm import collect_litellm_metrics
 
     clock = _FakeClock()
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_litellm_server(_two_model_body().encode())), \
          patch("app.time.monotonic", clock):
         collect_litellm_metrics("http://127.0.0.1:9997")
@@ -3991,7 +3988,7 @@ def test_collect_litellm_per_model_counter_reset_clamps():
             'litellm_output_tokens_metric_total{api_provider="openai",model_id="m2",requested_model="gpt-4o-mini"} 345.0',
             'litellm_output_tokens_metric_total{api_provider="openai",model_id="m2",requested_model="gpt-4o-mini"} 1.0',
         )
-        with patch("app.urllib.request.urlopen",
+        with patch("collectors.llm.urllib.request.urlopen",
                    side_effect=make_litellm_server(reset_body.encode())):
             second = collect_litellm_metrics("http://127.0.0.1:9997")
 
@@ -4002,19 +3999,19 @@ def test_collect_litellm_per_model_counter_reset_clamps():
 
 def test_collect_litellm_per_model_new_model_omitted():
     """A model with no previous baseline is omitted from per-model rates."""
-    from app import collect_litellm_metrics
+    from collectors.llm import collect_litellm_metrics
 
     only_m1 = "\n".join(
         line for line in LITELLM_METRICS_SAMPLE.splitlines()
         if 'model_id="m2"' not in line
     )
     clock = _FakeClock()
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_litellm_server(only_m1.encode())), \
          patch("app.time.monotonic", clock):
         collect_litellm_metrics("http://127.0.0.1:9997")
         clock.advance(2.0)
-        with patch("app.urllib.request.urlopen",
+        with patch("collectors.llm.urllib.request.urlopen",
                    side_effect=make_litellm_server(_two_model_body().encode())):
             second = collect_litellm_metrics("http://127.0.0.1:9997")
 
@@ -4026,19 +4023,19 @@ def test_collect_litellm_per_model_new_model_omitted():
 def test_collect_litellm_rate_gap_within_widened_window():
     """A 12 s gap (within the 0.5–15 s window) computes the rate over
     the actual gap instead of omitting it."""
-    from app import collect_litellm_metrics
+    from collectors.llm import collect_litellm_metrics
 
     body = LITELLM_METRICS_SAMPLE.replace(
         'litellm_output_tokens_metric_total{api_provider="openai",model_id="m1",requested_model="llama-3.1-8b"} 12000.0',
         'litellm_output_tokens_metric_total{api_provider="openai",model_id="m1",requested_model="llama-3.1-8b"} 12300.0',
     )
     clock = _FakeClock()
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_litellm_server(LITELLM_METRICS_SAMPLE.encode())), \
          patch("app.time.monotonic", clock):
         collect_litellm_metrics("http://127.0.0.1:9997")
         clock.advance(12.0)
-        with patch("app.urllib.request.urlopen",
+        with patch("collectors.llm.urllib.request.urlopen",
                    side_effect=make_litellm_server(body.encode())):
             second = collect_litellm_metrics("http://127.0.0.1:9997")
 
@@ -4048,25 +4045,25 @@ def test_collect_litellm_rate_gap_within_widened_window():
 def test_collect_litellm_rate_hold_after_long_gap():
     """A gap > 15 s (e.g. right after an outage) holds the last
     computed rate instead of omitting it — the UI never flashes '–'."""
-    from app import collect_litellm_metrics
+    from collectors.llm import collect_litellm_metrics
 
     body = LITELLM_METRICS_SAMPLE.replace(
         'litellm_output_tokens_metric_total{api_provider="openai",model_id="m1",requested_model="llama-3.1-8b"} 12000.0',
         'litellm_output_tokens_metric_total{api_provider="openai",model_id="m1",requested_model="llama-3.1-8b"} 12250.0',
     )
     clock = _FakeClock()
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_litellm_server(LITELLM_METRICS_SAMPLE.encode())), \
          patch("app.time.monotonic", clock):
         collect_litellm_metrics("http://127.0.0.1:9997")
         clock.advance(2.0)
-        with patch("app.urllib.request.urlopen",
+        with patch("collectors.llm.urllib.request.urlopen",
                    side_effect=make_litellm_server(body.encode())):
             second = collect_litellm_metrics("http://127.0.0.1:9997")
         assert second["gen_tokens_per_s"] == 125.0  # 250 tok / 2 s
         # 20 s outage, then recovery with the same (unchanged) body.
         clock.advance(20.0)
-        with patch("app.urllib.request.urlopen",
+        with patch("collectors.llm.urllib.request.urlopen",
                    side_effect=make_litellm_server(body.encode())):
             third = collect_litellm_metrics("http://127.0.0.1:9997")
 
@@ -4076,10 +4073,10 @@ def test_collect_litellm_rate_hold_after_long_gap():
 
 def test_collect_litellm_bearer_token_sent():
     """A configured token is sent as an Authorization: Bearer header."""
-    from app import collect_litellm_metrics
+    from collectors.llm import collect_litellm_metrics
 
     calls: list = []
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_litellm_server(LITELLM_METRICS_SAMPLE.encode(),
                                                calls=calls)):
         result = collect_litellm_metrics("http://127.0.0.1:9997", token="sk-123")
@@ -4093,7 +4090,7 @@ def test_collect_litellm_bearer_token_sent():
 
     # No token → no Authorization header
     calls.clear()
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_litellm_server(LITELLM_METRICS_SAMPLE.encode(),
                                                calls=calls)):
         collect_litellm_metrics("http://127.0.0.1:9997")
@@ -4102,10 +4099,10 @@ def test_collect_litellm_bearer_token_sent():
 
 
 def test_collect_litellm_no_litellm_metrics_returns_none():
-    from app import collect_litellm_metrics
+    from collectors.llm import collect_litellm_metrics
 
     other_body = b'up 1.0\npython_info{implementation="CPython"} 1.0\n'
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_litellm_server(other_body)):
         result = collect_litellm_metrics("http://127.0.0.1:9997")
 
@@ -4113,29 +4110,29 @@ def test_collect_litellm_no_litellm_metrics_returns_none():
 
 
 def test_collect_litellm_unreachable():
-    from app import collect_litellm_metrics
+    from collectors.llm import collect_litellm_metrics
 
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=ConnectionRefusedError("down")):
         assert collect_litellm_metrics("http://127.0.0.1:9997") is None
 
 
 def test_collect_litellm_stale_hold_then_expiry():
-    from app import collect_litellm_metrics
+    from collectors.llm import collect_litellm_metrics
 
     clock = _FakeClock()
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_litellm_server(LITELLM_METRICS_SAMPLE.encode())), \
          patch("app.time.monotonic", clock):
         good = collect_litellm_metrics("http://127.0.0.1:9997")
         assert good["status"] == "up"
         clock.advance(1.0)
-        with patch("app.urllib.request.urlopen",
+        with patch("collectors.llm.urllib.request.urlopen",
                    side_effect=ConnectionRefusedError("down")):
             stale = collect_litellm_metrics("http://127.0.0.1:9997")
         assert stale is not None and stale["status"] == "stale"
         clock.advance(20.0)  # beyond the 15 s hold
-        with patch("app.urllib.request.urlopen",
+        with patch("collectors.llm.urllib.request.urlopen",
                    side_effect=ConnectionRefusedError("down")):
             assert collect_litellm_metrics("http://127.0.0.1:9997") is None
 
@@ -4157,7 +4154,7 @@ def test_collect_llm_auto_vllm_down_litellm_wins():
             return _http_response(litellm_body)
         raise ConnectionRefusedError("down")
 
-    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen):
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=fake_urlopen):
         data = collector._collect_llm()
 
     assert data is not None
@@ -4186,7 +4183,7 @@ def test_collect_llm_auto_vllm_beats_litellm():
                 return _http_response(LITELLM_METRICS_SAMPLE.encode())
         raise ConnectionRefusedError(f"no route for {url}")
 
-    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen):
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=fake_urlopen):
         data = collector._collect_llm()
 
     assert data is not None
@@ -4221,7 +4218,7 @@ def test_collect_llm_auto_litellm_down_falls_through_to_llama():
             return _http_response(b"{}")
         raise ConnectionRefusedError("down")
 
-    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen):
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=fake_urlopen):
         data = collector._collect_llm()
 
     assert data is not None
@@ -4246,7 +4243,7 @@ def test_collect_llm_pinned_litellm_skips_others():
             return _http_response(LITELLM_METRICS_SAMPLE.encode())
         raise ConnectionRefusedError("down")
 
-    with patch("app.urllib.request.urlopen", side_effect=fake_urlopen):
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=fake_urlopen):
         data = collector._collect_llm()
 
     assert data is not None
@@ -4256,7 +4253,7 @@ def test_collect_llm_pinned_litellm_skips_others():
 
 def test_defaults_vllm_port_5001():
     """The default vLLM host port is 5001 (operator config)."""
-    from app import DEFAULT_VLLM_URL
+    from collectors.llm import DEFAULT_VLLM_URL
 
     assert DEFAULT_VLLM_URL == "http://127.0.0.1:5001"
 
@@ -4327,25 +4324,25 @@ def reset_amd_state():
     """Reset AMD BDF/product-name caches around every test."""
     import app as app_mod
 
-    original_absent = app_mod._amd_absent_since
-    original_bdf_map = app_mod._amd_bdf_map
-    original_bdf_neg = app_mod._amd_bdf_negative
-    original_rocm_cards = app_mod._rocm_cards_cache
-    original_product_names = app_mod._amd_product_names
-    original_product_ts = app_mod._amd_product_names_ts
-    app_mod._amd_absent_since = None
-    app_mod._amd_bdf_map = None
-    app_mod._amd_bdf_negative = {}
-    app_mod._rocm_cards_cache = None
-    app_mod._amd_product_names = {}
-    app_mod._amd_product_names_ts = None
+    original_absent = gpu_mod._amd_absent_since
+    original_bdf_map = gpu_mod._amd_bdf_map
+    original_bdf_neg = gpu_mod._amd_bdf_negative
+    original_rocm_cards = gpu_mod._rocm_cards_cache
+    original_product_names = gpu_mod._amd_product_names
+    original_product_ts = gpu_mod._amd_product_names_ts
+    gpu_mod._amd_absent_since = None
+    gpu_mod._amd_bdf_map = None
+    gpu_mod._amd_bdf_negative = {}
+    gpu_mod._rocm_cards_cache = None
+    gpu_mod._amd_product_names = {}
+    gpu_mod._amd_product_names_ts = None
     yield
-    app_mod._amd_absent_since = original_absent
-    app_mod._amd_bdf_map = original_bdf_map
-    app_mod._amd_bdf_negative = original_bdf_neg
-    app_mod._rocm_cards_cache = original_rocm_cards
-    app_mod._amd_product_names = original_product_names
-    app_mod._amd_product_names_ts = original_product_ts
+    gpu_mod._amd_absent_since = original_absent
+    gpu_mod._amd_bdf_map = original_bdf_map
+    gpu_mod._amd_bdf_negative = original_bdf_neg
+    gpu_mod._rocm_cards_cache = original_rocm_cards
+    gpu_mod._amd_product_names = original_product_names
+    gpu_mod._amd_product_names_ts = original_product_ts
 
 
 def _amd_smi_mock(stdout: str, returncode: int = 0):
@@ -4353,7 +4350,7 @@ def _amd_smi_mock(stdout: str, returncode: int = 0):
 
 
 def test_amd_unwrap():
-    from app import _amd_unwrap
+    from collectors.gpu import _amd_unwrap
 
     assert _amd_unwrap({"value": 49, "unit": "W"}) == 49.0
     assert _amd_unwrap(7) == 7.0
@@ -4364,7 +4361,7 @@ def test_amd_unwrap():
 
 
 def test_bdf_sysfs_form_handles_8_digit_domain():
-    from app import _bdf_sysfs_form
+    from collectors.gpu import _bdf_sysfs_form
 
     # 4-digit domain → unchanged (lowercased).
     assert _bdf_sysfs_form("0000:2d:00.0") == "0000:2d:00.0"
@@ -4379,12 +4376,12 @@ def test_bdf_sysfs_form_handles_8_digit_domain():
 
 
 def test_gpu_amd_smi_happy_path():
-    from app import _gpu_amd_smi
+    from collectors.gpu import _gpu_amd_smi
 
     with (
         patch("shutil.which", return_value="/usr/bin/amd-smi"),
         patch("subprocess.run", return_value=_amd_smi_mock(AMD_SMI_MONITOR_JSON)),
-        patch("app._sysfs_pci_bus_id", return_value=None),
+        patch("collectors.gpu._sysfs_pci_bus_id", return_value=None),
     ):
         gpus = _gpu_amd_smi()
 
@@ -4412,7 +4409,7 @@ def test_gpu_amd_smi_happy_path():
 
 
 def test_gpu_amd_smi_binary_missing():
-    from app import _gpu_amd_smi
+    from collectors.gpu import _gpu_amd_smi
 
     with (
         patch("shutil.which", return_value=None),
@@ -4425,7 +4422,7 @@ def test_gpu_amd_smi_binary_missing():
 
 
 def test_gpu_amd_smi_failure_modes():
-    from app import _gpu_amd_smi
+    from collectors.gpu import _gpu_amd_smi
 
     with patch("shutil.which", return_value="/usr/bin/amd-smi"):
         # Non-zero exit (no AMD GPUs / driver not loaded)
@@ -4445,7 +4442,7 @@ def test_gpu_amd_smi_failure_modes():
 
 
 def test_gpu_rocm_smi_parses_csv_by_header_name():
-    from app import _gpu_rocm_smi
+    from collectors.gpu import _gpu_rocm_smi
 
     with (
         patch("shutil.which", return_value=None),
@@ -4453,7 +4450,7 @@ def test_gpu_rocm_smi_parses_csv_by_header_name():
         patch("os.access", return_value=True),
         patch("subprocess.run",
               return_value=_amd_smi_mock(ROCM_SMI_CSV_SAMPLE)),
-        patch("app._sysfs_pci_bus_id", return_value=None),
+        patch("collectors.gpu._sysfs_pci_bus_id", return_value=None),
     ):
         gpus = _gpu_rocm_smi()
 
@@ -4469,7 +4466,7 @@ def test_gpu_rocm_smi_parses_csv_by_header_name():
 
 
 def test_gpu_rocm_smi_binary_missing():
-    from app import _gpu_rocm_smi
+    from collectors.gpu import _gpu_rocm_smi
 
     with (
         patch("shutil.which", return_value=None),
@@ -4481,7 +4478,7 @@ def test_gpu_rocm_smi_binary_missing():
 
 
 def test_gpu_amd_sysfs_last_resort(tmp_path):
-    from app import _gpu_amd_sysfs
+    from collectors.gpu import _gpu_amd_sysfs
 
     dev = tmp_path / "card0" / "device"
     dev.mkdir(parents=True)
@@ -4495,7 +4492,7 @@ def test_gpu_amd_sysfs_last_resort(tmp_path):
     other.mkdir(parents=True)
     (other / "gpu_busy_percent").write_text("3\n")
 
-    with patch("app._sysfs_pci_bus_id", return_value=None):
+    with patch("collectors.gpu._sysfs_pci_bus_id", return_value=None):
         gpus = _gpu_amd_sysfs(drm_dir=str(tmp_path))
 
     assert len(gpus) == 1
@@ -4509,20 +4506,20 @@ def test_gpu_amd_sysfs_last_resort(tmp_path):
 
 
 def test_gpu_amd_sysfs_missing_dir():
-    from app import _gpu_amd_sysfs
+    from collectors.gpu import _gpu_amd_sysfs
 
     assert _gpu_amd_sysfs(drm_dir="/nonexistent-drm-dir") == []
 
 
 def test_gpu_amd_chain_falls_through_to_sysfs():
     """amd-smi missing → rocm-smi missing → sysfs result wins."""
-    from app import _gpu_amd
+    from collectors.gpu import _gpu_amd
 
     with (
         patch("shutil.which", return_value=None),
         patch("os.path.isfile", return_value=False),
         patch("subprocess.run") as mock_run,
-        patch("app._gpu_amd_sysfs") as mock_sysfs,
+        patch("collectors.gpu._gpu_amd_sysfs") as mock_sysfs,
     ):
         mock_sysfs.return_value = [{"index": 0, "name": "AMD GPU"}]
         gpus = _gpu_amd()
@@ -4533,13 +4530,13 @@ def test_gpu_amd_chain_falls_through_to_sysfs():
 
 
 def test_collect_gpu_falls_back_to_amd():
-    from app import collect_gpu_metrics
+    from collectors.gpu import collect_gpu_metrics
 
     with (
-        patch("app._init_platform", return_value="desktop"),
-        patch("app._gpu_pynvml", return_value=[]),
-        patch("app._gpu_cli", return_value=[]),
-        patch("app._gpu_amd") as mock_amd,
+        patch("collectors.gpu._init_platform", return_value="desktop"),
+        patch("collectors.gpu._gpu_pynvml", return_value=[]),
+        patch("collectors.gpu._gpu_cli", return_value=[]),
+        patch("collectors.gpu._gpu_amd") as mock_amd,
     ):
         mock_amd.return_value = [{"index": 0, "name": "AMD GPU"}]
         result = collect_gpu_metrics()
@@ -4550,7 +4547,7 @@ def test_collect_gpu_falls_back_to_amd():
 
 def test_collect_gpu_mixed_vendors_merges_and_renumbers():
     """NVIDIA + AMD on one box: both are reported, indices 0..n-1."""
-    from app import collect_gpu_metrics
+    from collectors.gpu import collect_gpu_metrics
 
     nvidia = [
         {"index": 0, "name": "RTX 4090", "utilization_pct": 10.0},
@@ -4561,10 +4558,10 @@ def test_collect_gpu_mixed_vendors_merges_and_renumbers():
         {"index": 1, "name": "RX 7900 XTX"},
     ]
     with (
-        patch("app._init_platform", return_value="desktop"),
-        patch("app._gpu_pynvml", return_value=nvidia),
-        patch("app._gpu_cli") as mock_cli,
-        patch("app._gpu_amd", return_value=amd),
+        patch("collectors.gpu._init_platform", return_value="desktop"),
+        patch("collectors.gpu._gpu_pynvml", return_value=nvidia),
+        patch("collectors.gpu._gpu_cli") as mock_cli,
+        patch("collectors.gpu._gpu_amd", return_value=amd),
     ):
         result = collect_gpu_metrics()
 
@@ -4582,7 +4579,7 @@ def test_collect_gpu_mixed_vendors_merges_and_renumbers():
 
 def test_merge_gpu_lists_offset_uses_max_index():
     """If a pynvml index is skipped the AMD offset is max+1, not count."""
-    from app import _merge_gpu_lists
+    from collectors.gpu import _merge_gpu_lists
 
     nvidia = [{"index": 0}, {"index": 2}]  # device 1 failed to init
     amd = [{"index": 0}]
@@ -4591,7 +4588,7 @@ def test_merge_gpu_lists_offset_uses_max_index():
 
 
 def test_merge_gpu_lists_empty_sides():
-    from app import _merge_gpu_lists
+    from collectors.gpu import _merge_gpu_lists
 
     assert _merge_gpu_lists([], []) == []
     assert _merge_gpu_lists([{"index": 5}], []) == [
@@ -4603,7 +4600,7 @@ def test_merge_gpu_lists_empty_sides():
 def test_amd_bdf_resolved_from_amd_smi_bus_id():
     """(a): ``amd-smi list --json`` bus_id is used; the vendor-local gpu
     index is never passed as a global cardN (no sysfs fallback runs)."""
-    from app import (_AMD_SMI_BIN_CANDIDATES, _amd_gpu_bus_id)
+    from collectors.gpu import (_AMD_SMI_BIN_CANDIDATES, _amd_gpu_bus_id)
 
     def fake_find_cli(candidates):
         if candidates == _AMD_SMI_BIN_CANDIDATES:
@@ -4611,9 +4608,9 @@ def test_amd_bdf_resolved_from_amd_smi_bus_id():
         return None
 
     with (
-        patch("app._find_cli_binary", side_effect=fake_find_cli),
+        patch("collectors.gpu._find_cli_binary", side_effect=fake_find_cli),
         patch("subprocess.run", return_value=_amd_smi_mock(AMD_SMI_LIST_JSON)),
-        patch("app._sysfs_pci_bus_id") as mock_sysfs,
+        patch("collectors.gpu._sysfs_pci_bus_id") as mock_sysfs,
     ):
         assert _amd_gpu_bus_id(0) == "0000:2d:00.0"
         assert _amd_gpu_bus_id(1) == "0000:61:00.0"
@@ -4625,7 +4622,7 @@ def test_amd_bdf_resolved_from_amd_smi_bus_id():
 def test_amd_bdf_fallback_rocm_cardn():
     """(b): amd-smi unavailable → rocm-smi's own cardN string (a global
     DRM number, e.g. "card2") is used, not a vendor-local index."""
-    from app import (_AMD_SMI_BIN_CANDIDATES, _ROCM_SMI_BIN_CANDIDATES,
+    from collectors.gpu import (_AMD_SMI_BIN_CANDIDATES, _ROCM_SMI_BIN_CANDIDATES,
                      _amd_gpu_bus_id)
 
     rocm_csv = (
@@ -4647,10 +4644,10 @@ def test_amd_bdf_fallback_rocm_cardn():
                 "card3": "0000:61:00.0"}.get(card)
 
     with (
-        patch("app._find_cli_binary", side_effect=fake_find_cli),
+        patch("collectors.gpu._find_cli_binary", side_effect=fake_find_cli),
         patch("subprocess.run", return_value=_amd_smi_mock(rocm_csv)),
-        patch("app._sysfs_pci_bus_id", side_effect=fake_sysfs) as mock_sysfs,
-        patch("app._sysfs_amd_card_bdfs", return_value=[]),
+        patch("collectors.gpu._sysfs_pci_bus_id", side_effect=fake_sysfs) as mock_sysfs,
+        patch("collectors.gpu._sysfs_amd_card_bdfs", return_value=[]),
     ):
         assert _amd_gpu_bus_id(0) == "0000:2d:00.0"  # rocm's "card2"
         assert _amd_gpu_bus_id(1) == "0000:61:00.0"  # rocm's "card3"
@@ -4663,7 +4660,7 @@ def test_amd_bdf_fallback_sysfs_vendor_filter(tmp_path):
     """(c): both tools unavailable → ``/sys/class/drm/card*`` filtered
     by ``device/vendor == 0x1002``; an NVIDIA card0 is not picked for
     an AMD gpu."""
-    from app import _amd_gpu_bus_id
+    from collectors.gpu import _amd_gpu_bus_id
 
     _fake_drm(tmp_path, {
         "card0": ("0x10de", "0000:44:00.0"),   # NVIDIA — must be skipped
@@ -4672,7 +4669,7 @@ def test_amd_bdf_fallback_sysfs_vendor_filter(tmp_path):
     })
 
     with (
-        patch("app._find_cli_binary", return_value=None),
+        patch("collectors.gpu._find_cli_binary", return_value=None),
         patch("subprocess.run") as mock_run,
     ):
         assert _amd_gpu_bus_id(0, drm_dir=str(tmp_path)) == "0000:2d:00.0"
@@ -4685,7 +4682,7 @@ def test_amd_bdf_fake_drm_nvidia_card0(tmp_path):
     indices are 0/1 — the AMD cards resolve to their own (AMD) BDFs,
     not card0's. The old bug passed the vendor-local index as a global
     cardN, so AMD gpu 0 resolved to the NVIDIA card."""
-    from app import _amd_gpu_bus_id, _sysfs_pci_bus_id
+    from collectors.gpu import _amd_gpu_bus_id, _sysfs_pci_bus_id
 
     _fake_drm(tmp_path, {
         "card0": ("0x10de", "0000:44:00.0"),   # NVIDIA
@@ -4693,7 +4690,7 @@ def test_amd_bdf_fake_drm_nvidia_card0(tmp_path):
         "card2": ("0x1002", "0000:61:00.0"),   # AMD gpu 1
     })
 
-    with patch("app._find_cli_binary", return_value=None):
+    with patch("collectors.gpu._find_cli_binary", return_value=None):
         # What the old bug resolved: vendor-local index 0 → global card0
         # (the NVIDIA card's BDF).
         assert _sysfs_pci_bus_id(0, str(tmp_path)) == "0000:44:00.0"
@@ -4707,7 +4704,7 @@ def test_colliding_bdf_merge_guard(caplog):
     the guard flags (logs) and the payload contains no two entries with
     the same normalized BDF. The domain width differs across vendors
     (``00000000:`` vs ``0000:``) — normalization must catch it."""
-    from app import _merge_gpu_lists
+    from collectors.gpu import _merge_gpu_lists
 
     nvidia = [{"index": 0, "name": "RTX 3090",
                "pci_bus_id": "00000000:61:00.0"}]
@@ -4739,7 +4736,7 @@ def test_sysfs_pci_vendor_id_reads_vendor_file(tmp_path):
     """The raw PCI vendor ID is read from the sysfs ``vendor`` file
     (pci.ids-independent). A fake device layout with a ``vendor`` file
     behind the BDF is resolved to the raw ID string."""
-    from app import _sysfs_pci_vendor_id
+    from collectors.gpu import _sysfs_pci_vendor_id
 
     # Build a fake /sys/bus/pci/devices layout: {bdf: vendor_hex}.
     pci_dir = tmp_path / "pci"
@@ -4761,7 +4758,7 @@ def test_sysfs_pci_vendor_name_unknown_id_falls_back(tmp_path):
     """An unknown vendor ID falls back to the raw ID string (deterministic,
     pci.ids-independent). A fake device layout with an unknown vendor ID
     resolves to the raw ID string, not a name."""
-    from app import _sysfs_pci_vendor_name
+    from collectors.gpu import _sysfs_pci_vendor_name
 
     pci_dir = tmp_path / "pci"
     (pci_dir / "0000:2d:00.0").mkdir(parents=True)
@@ -4774,7 +4771,7 @@ def test_sysfs_pci_vendor_name_unknown_id_falls_back(tmp_path):
 def test_sysfs_pci_vendor_name_known_id_maps(tmp_path):
     """A known vendor ID is mapped to its name via the hardcoded map.
     A fake device layout with a known vendor ID resolves to the name."""
-    from app import _sysfs_pci_vendor_name
+    from collectors.gpu import _sysfs_pci_vendor_name
 
     pci_dir = tmp_path / "pci"
     (pci_dir / "0000:2d:00.0").mkdir(parents=True)
@@ -4791,7 +4788,7 @@ def test_gpu_name_prefers_tool_product_name():
     """The tool's own product/asic name (``amd-smi static --asic``) is
     preferred over lspci for the AMD path, so the label is not hostage
     to pci.ids freshness."""
-    from app import _gpu_amd_smi
+    from collectors.gpu import _gpu_amd_smi
 
     monitor = json.dumps([
         {"gpu": 0, "gfx": {"value": 5, "unit": "%"},
@@ -4819,7 +4816,7 @@ def test_gpu_name_prefers_tool_product_name():
     with (
         patch("shutil.which", return_value="/usr/bin/amd-smi"),
         patch("subprocess.run", side_effect=fake_run),
-        patch("app._amd_gpu_bus_id", return_value="0000:2d:00.0"),
+        patch("collectors.gpu._amd_gpu_bus_id", return_value="0000:2d:00.0"),
     ):
         gpus = _gpu_amd_smi()
 
@@ -4833,7 +4830,7 @@ def test_gpu_name_never_matches_bdf_shape():
     layout where lspci would return a BDF-shaped name (the poisoned
     first-``Device:``-line case) and assert no emitted GPU name matches a
     BDF/slot shape — the fix rejects it and falls back."""
-    from app import _gpu_amd_smi, _is_implausible_gpu_name
+    from collectors.gpu import _gpu_amd_smi, _is_implausible_gpu_name
 
     # lspci -vm with only a BDF-shaped Device: line (the bug: the
     # only/first Device: line is the slot, not the product name).
@@ -4856,7 +4853,7 @@ def test_gpu_name_never_matches_bdf_shape():
     with (
         patch("shutil.which", return_value="/usr/bin/amd-smi"),
         patch("subprocess.run", side_effect=fake_run),
-        patch("app._amd_gpu_bus_id", return_value="0000:2d:00.0"),
+        patch("collectors.gpu._amd_gpu_bus_id", return_value="0000:2d:00.0"),
     ):
         gpus = _gpu_amd_smi()
 
@@ -4879,22 +4876,22 @@ def test_gpu_amd_negative_cache_skips_reprobe():
         return []
 
     with (
-        patch.object(app_mod, "_gpu_amd_smi", side_effect=fake_amd_smi),
-        patch.object(app_mod, "_gpu_rocm_smi", return_value=[]) as mock_rocm,
-        patch.object(app_mod, "_gpu_amd_sysfs", return_value=[]) as mock_sysfs,
+        patch.object(gpu_mod, "_gpu_amd_smi", side_effect=fake_amd_smi),
+        patch.object(gpu_mod, "_gpu_rocm_smi", return_value=[]) as mock_rocm,
+        patch.object(gpu_mod, "_gpu_amd_sysfs", return_value=[]) as mock_sysfs,
     ):
-        assert app_mod._gpu_amd() == []
+        assert gpu_mod._gpu_amd() == []
         assert calls["n"] == 1
         rocm_calls = mock_rocm.call_count
         sysfs_calls = mock_sysfs.call_count
         # Second poll within the window: negative-cached, nothing runs
-        assert app_mod._gpu_amd() == []
+        assert gpu_mod._gpu_amd() == []
         assert calls["n"] == 1
         assert mock_rocm.call_count == rocm_calls
         assert mock_sysfs.call_count == sysfs_calls
         # TTL elapses → re-probe (driver may have been loaded)
-        app_mod._amd_absent_since -= app_mod._AMD_NEGATIVE_REPROBE_S + 1
-        assert app_mod._gpu_amd() == []
+        gpu_mod._amd_absent_since -= gpu_mod._AMD_NEGATIVE_REPROBE_S + 1
+        assert gpu_mod._gpu_amd() == []
         assert calls["n"] == 2
 
 
@@ -4903,18 +4900,18 @@ def test_gpu_amd_negative_cache_cleared_on_success():
 
     results = iter([[], [{"index": 0}], []])
     with (
-        patch.object(app_mod, "_gpu_amd_smi", side_effect=lambda: next(results)),
-        patch.object(app_mod, "_gpu_rocm_smi", return_value=[]),
-        patch.object(app_mod, "_gpu_amd_sysfs", return_value=[]),
+        patch.object(gpu_mod, "_gpu_amd_smi", side_effect=lambda: next(results)),
+        patch.object(gpu_mod, "_gpu_rocm_smi", return_value=[]),
+        patch.object(gpu_mod, "_gpu_amd_sysfs", return_value=[]),
     ):
-        assert app_mod._gpu_amd() == []
-        assert app_mod._amd_absent_since is not None
+        assert gpu_mod._gpu_amd() == []
+        assert gpu_mod._amd_absent_since is not None
         # GPU appears → negative cache cleared…
-        app_mod._amd_absent_since -= 1000.0  # force re-probe due
-        assert app_mod._gpu_amd() == [{"index": 0}]
-        assert app_mod._amd_absent_since is None
+        gpu_mod._amd_absent_since -= 1000.0  # force re-probe due
+        assert gpu_mod._gpu_amd() == [{"index": 0}]
+        assert gpu_mod._amd_absent_since is None
         # …so the next poll probes again (no cache on the success path)
-        assert app_mod._gpu_amd() == []
+        assert gpu_mod._gpu_amd() == []
 
 
 # ---------------------------------------------------------------------------
@@ -5100,10 +5097,9 @@ def test_upstream_entry_malformed_skipped():
 
 def test_collect_upstream_happy_path():
     import app as app_mod
-    from app import collect_upstream_metrics
+    from collectors.llm import collect_upstream_metrics
 
-    orig = app_mod._upstream_last_good
-    app_mod._upstream_last_good = {}
+    llm._upstream_last_good.clear()
     try:
         payload = {
             "timestamp": 1.0, "cpu": 12.5, "cpu_per_core": [1.0],
@@ -5111,7 +5107,7 @@ def test_collect_upstream_happy_path():
             "host_health": {}, "llm_enabled": True, "llm": None,
             "systems": [{"name": "nested"}], "app_level_key": "x",
         }
-        with patch("app.urllib.request.urlopen",
+        with patch("collectors.llm.urllib.request.urlopen",
                    side_effect=make_llama_server(
                        {"/api/metrics": json.dumps(payload).encode()})):
             # trailing slash on the configured URL is normalized away
@@ -5125,53 +5121,51 @@ def test_collect_upstream_happy_path():
         assert "systems" not in m        # no recursion
         assert "app_level_key" not in m  # strict sanitizer
     finally:
-        app_mod._upstream_last_good = orig
+        pass  # state cleared in-place
 
 
 def test_collect_upstream_unreachable_returns_none():
     import app as app_mod
-    from app import collect_upstream_metrics
+    from collectors.llm import collect_upstream_metrics
 
-    orig = app_mod._upstream_last_good
-    app_mod._upstream_last_good = {}
+    llm._upstream_last_good.clear()
     try:
-        with patch("app.urllib.request.urlopen",
+        with patch("collectors.llm.urllib.request.urlopen",
                    side_effect=ConnectionRefusedError("down")):
             assert collect_upstream_metrics(
                 "http://127.0.0.1:9996", "mock") is None
     finally:
-        app_mod._upstream_last_good = orig
+        pass  # state cleared in-place
 
 
 def test_collect_upstream_stale_hold_then_expiry():
     import app as app_mod
-    from app import collect_upstream_metrics
+    from collectors.llm import collect_upstream_metrics
 
     clock = _FakeClock()
     payload = {"cpu": 5.0, "gpus": []}
-    orig = app_mod._upstream_last_good
-    app_mod._upstream_last_good = {}
+    llm._upstream_last_good.clear()
     try:
-        with patch("app.urllib.request.urlopen",
+        with patch("collectors.llm.urllib.request.urlopen",
                    side_effect=make_llama_server(
                        {"/api/metrics": json.dumps(payload).encode()})), \
              patch("app.time.monotonic", clock):
             good = collect_upstream_metrics("http://127.0.0.1:9996", "mock")
             assert good is not None and good["status"] == "up"
             clock.advance(1.0)
-            with patch("app.urllib.request.urlopen",
+            with patch("collectors.llm.urllib.request.urlopen",
                        side_effect=ConnectionRefusedError("down")):
                 stale = collect_upstream_metrics(
                     "http://127.0.0.1:9996", "mock")
             assert stale is not None and stale["status"] == "stale"
             assert stale["metrics"]["cpu"] == 5.0
             clock.advance(20.0)  # beyond the 15 s hold
-            with patch("app.urllib.request.urlopen",
+            with patch("collectors.llm.urllib.request.urlopen",
                        side_effect=ConnectionRefusedError("down")):
                 assert collect_upstream_metrics(
                     "http://127.0.0.1:9996", "mock") is None
     finally:
-        app_mod._upstream_last_good = orig
+        pass  # state cleared in-place
 
 
 # ---------------------------------------------------------------------------
@@ -5205,7 +5199,7 @@ def test_snapshot_systems_array():
         [{"name": "mock", "url": "http://127.0.0.1:9996"}])
     collector.start()
     try:
-        with patch("app.urllib.request.urlopen",
+        with patch("collectors.llm.urllib.request.urlopen",
                    side_effect=make_llama_server(
                        {"/api/metrics": json.dumps(payload).encode()})):
             metrics = _wait_for_snapshot_with(
@@ -5242,7 +5236,7 @@ def test_collector_upstream_thread_populates_latest():
         [{"name": "mock", "url": "http://127.0.0.1:9996"}])
     collector.start()
     try:
-        with patch("app.urllib.request.urlopen",
+        with patch("collectors.llm.urllib.request.urlopen",
                    side_effect=make_llama_server(
                        {"/api/metrics": json.dumps(payload).encode()})):
             deadline = time.time() + 5
@@ -5272,12 +5266,11 @@ def test_snapshot_upstream_down_after_hold_expiry():
         return _http_response(json.dumps(payload).encode())
 
     clock = _FakeClock()
-    orig = app_mod._upstream_last_good
-    app_mod._upstream_last_good = {}
+    llm._upstream_last_good.clear()
     collector = MetricsCollector(poll_interval=0.05)
     collector.llama_enabled = False
     try:
-        with patch("app.urllib.request.urlopen", side_effect=fake_urlopen), \
+        with patch("collectors.llm.urllib.request.urlopen", side_effect=fake_urlopen), \
              patch("app.time.monotonic", clock):
             collector.start_upstreams(
                 [{"name": "mock", "url": "http://127.0.0.1:9996"}])
@@ -5316,7 +5309,7 @@ def test_snapshot_upstream_down_after_hold_expiry():
     finally:
         collector.stop()
         collector.join(timeout=2)
-        app_mod._upstream_last_good = orig
+        pass  # state cleared in-place
 
 
 def test_start_upstreams_empty_noop():
@@ -5376,14 +5369,12 @@ def reset_strata_state():
     """Reset module-level Strata scrape history around a test."""
     import app as app_mod
 
-    originals = (app_mod._strata_prev, app_mod._strata_last_good,
-                 app_mod._strata_tie_warned)
-    app_mod._strata_prev = {}
-    app_mod._strata_last_good = {}
-    app_mod._strata_tie_warned = False
+    # Clear in-place so the BaseLLMCollector aliases stay valid.
+    llm._strata_prev.clear()
+    llm._strata_last_good.clear()
+    llm._strata_tie_warned = False
     yield
-    (app_mod._strata_prev, app_mod._strata_last_good,
-     app_mod._strata_tie_warned) = originals
+    # No restore needed – state is per-test and cleared in-place.
 
 
 def _strata_doc(**over):
@@ -5414,7 +5405,7 @@ def _strata_doc(**over):
 
 
 def make_strata_server(body: bytes):
-    """Side_effect for app.urllib.request.urlopen serving Strata /metrics.
+    """Side_effect for llm.urllib.request.urlopen serving Strata /metrics.
 
     The Strata collector passes a plain URL string (no Request), unlike
     the header-carrying LiteLLM path.
@@ -5427,10 +5418,10 @@ def make_strata_server(body: bytes):
 
 
 def test_collect_strata_happy_path(reset_strata_state):
-    from app import collect_strata_metrics
+    from collectors.llm import collect_strata_metrics
 
     body = json.dumps(_strata_doc()).encode()
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_strata_server(body)):
         result = collect_strata_metrics("http://127.0.0.1:9998")
 
@@ -5474,7 +5465,7 @@ def test_collect_strata_happy_path(reset_strata_state):
 
 def test_collect_strata_rates_and_request_windows(reset_strata_state):
     """Second scrape yields Δ-counter rates + means over NEW requests."""
-    from app import collect_strata_metrics
+    from collectors.llm import collect_strata_metrics
 
     clock = _FakeClock()
     first = json.dumps(_strata_doc()).encode()
@@ -5490,7 +5481,7 @@ def test_collect_strata_rates_and_request_windows(reset_strata_state):
     second = json.dumps(doc2).encode()
 
     with patch("app.time.monotonic", clock), \
-         patch("app.urllib.request.urlopen",
+         patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_strata_server(first)):
         r1 = collect_strata_metrics("http://127.0.0.1:9998")
     assert "gen_tokens_per_s" not in r1
@@ -5498,7 +5489,7 @@ def test_collect_strata_rates_and_request_windows(reset_strata_state):
 
     clock.advance(2.0)
     with patch("app.time.monotonic", clock), \
-         patch("app.urllib.request.urlopen",
+         patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_strata_server(second)):
         r2 = collect_strata_metrics("http://127.0.0.1:9998")
     # Completion tick (engine idle): the ring's TRUE speeds replace the
@@ -5513,7 +5504,7 @@ def test_collect_strata_rates_and_request_windows(reset_strata_state):
     # Third scrape, same ring buffer: watermark excludes old requests
     clock.advance(2.0)
     with patch("app.time.monotonic", clock), \
-         patch("app.urllib.request.urlopen",
+         patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_strata_server(second)):
         r3 = collect_strata_metrics("http://127.0.0.1:9998")
     assert "ttft_seconds" not in r3
@@ -5524,12 +5515,12 @@ def test_collect_strata_rates_and_request_windows(reset_strata_state):
 def test_collect_strata_live_rates_preferred_while_busy(reset_strata_state):
     """Strata totals.* only advance at request completion; while the
     engine is busy the live fields must drive the gauges instead."""
-    from app import collect_strata_metrics
+    from collectors.llm import collect_strata_metrics
 
     clock = _FakeClock()
     first = json.dumps(_strata_doc()).encode()
     with patch("app.time.monotonic", clock), \
-         patch("app.urllib.request.urlopen",
+         patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_strata_server(first)):
         collect_strata_metrics("http://127.0.0.1:9998")  # baseline
 
@@ -5537,7 +5528,7 @@ def test_collect_strata_live_rates_preferred_while_busy(reset_strata_state):
         clock.advance(2.0)
         body = json.dumps(doc).encode()
         with patch("app.time.monotonic", clock), \
-             patch("app.urllib.request.urlopen",
+             patch("collectors.llm.urllib.request.urlopen",
                    side_effect=make_strata_server(body)):
             return collect_strata_metrics("http://127.0.0.1:9998")
 
@@ -5600,13 +5591,13 @@ def test_collect_strata_prompt_prefill_last5(reset_strata_state):
     speed as a vLLM-style windowed aggregate (Σ fresh tokens / Σ read
     time), staying current on every tick instead of spiking at
     completion and freezing."""
-    from app import collect_strata_metrics
+    from collectors.llm import collect_strata_metrics
 
     def req(t, tok, ms):
         return {"time": t, "prompt_tokens": tok, "prompt_ms": ms}
 
     def scrape(doc):
-        with patch("app.urllib.request.urlopen",
+        with patch("collectors.llm.urllib.request.urlopen",
                    side_effect=make_strata_server(
                        json.dumps(doc).encode())):
             return collect_strata_metrics("http://127.0.0.1:9998")
@@ -5688,28 +5679,28 @@ def test_collect_strata_prompt_prefill_last5(reset_strata_state):
 
 def test_collect_strata_rejects_non_strata_payloads(reset_strata_state):
     """JSON without engine+live shape, or non-JSON text -> None."""
-    from app import collect_strata_metrics
+    from collectors.llm import collect_strata_metrics
 
     for body in (b'{"hello": "world"}', b'not json at all'):
-        with patch("app.urllib.request.urlopen",
+        with patch("collectors.llm.urllib.request.urlopen",
                    side_effect=make_strata_server(body)):
             assert collect_strata_metrics("http://127.0.0.1:9998") is None
 
 
 def test_collect_strata_stale_hold_and_expiry(reset_strata_state):
     """Failed scrape holds the last snapshot as stale for 15 s."""
-    from app import collect_strata_metrics
+    from collectors.llm import collect_strata_metrics
 
     clock = _FakeClock()
     body = json.dumps(_strata_doc()).encode()
     with patch("app.time.monotonic", clock), \
-         patch("app.urllib.request.urlopen",
+         patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_strata_server(body)):
         assert collect_strata_metrics("http://127.0.0.1:9998")["status"] == "up"
 
     clock.advance(2.0)
     with patch("app.time.monotonic", clock), \
-         patch("app.urllib.request.urlopen",
+         patch("collectors.llm.urllib.request.urlopen",
                side_effect=ConnectionRefusedError("down")):
         held = collect_strata_metrics("http://127.0.0.1:9998")
         assert held["status"] == "stale"
@@ -5722,11 +5713,11 @@ def test_collect_llm_auto_prefers_strata_over_llama(reset_strata_state):
     from app import MetricsCollector
 
     collector = MetricsCollector(poll_interval=0.1, llm_backend="auto")
-    with patch("app.collect_vllm_metrics", return_value=None), \
-         patch("app.collect_litellm_metrics", return_value=None), \
-         patch("app.collect_strata_metrics",
+    with patch("collectors.llm.collect_vllm_metrics", return_value=None), \
+         patch("collectors.llm.collect_litellm_metrics", return_value=None), \
+         patch("collectors.llm.collect_strata_metrics",
                return_value={"status": "up"}), \
-         patch("app.collect_llama_metrics") as fake_llama:
+         patch("collectors.llm.collect_llama_metrics") as fake_llama:
         data = collector._collect_llm()
     assert data == {"status": "up", "backend": "strata"}
     fake_llama.assert_not_called()
@@ -5737,10 +5728,10 @@ def test_collect_llm_pinned_strata_skips_others():
 
     collector = MetricsCollector(poll_interval=0.1, llm_backend="strata",
                                  strata_url="http://s:8080")
-    with patch("app.collect_vllm_metrics") as fake_vllm, \
-         patch("app.collect_litellm_metrics") as fake_litellm, \
-         patch("app.collect_llama_metrics") as fake_llama, \
-         patch("app.collect_strata_metrics",
+    with patch("collectors.llm.collect_vllm_metrics") as fake_vllm, \
+         patch("collectors.llm.collect_litellm_metrics") as fake_litellm, \
+         patch("collectors.llm.collect_llama_metrics") as fake_llama, \
+         patch("collectors.llm.collect_strata_metrics",
                return_value={"status": "up"}) as fake_strata:
         data = collector._collect_llm()
     assert data["backend"] == "strata"
@@ -5805,7 +5796,7 @@ def _multi_strata_router(bodies: dict):
 
 def test_multi_llm_state_keyed_per_target(reset_strata_state):
     """Two same-type targets keep independent rate windows and stale holds."""
-    from app import collect_strata_metrics
+    from collectors.llm import collect_strata_metrics
 
     clock = _FakeClock()
     doc_a, doc_b = _strata_doc(), _strata_doc()
@@ -5816,7 +5807,7 @@ def test_multi_llm_state_keyed_per_target(reset_strata_state):
     router = _multi_strata_router({"h1": body_a, "h2": body_b})
 
     with patch("app.time.monotonic", clock), \
-         patch("app.urllib.request.urlopen", side_effect=router):
+         patch("collectors.llm.urllib.request.urlopen", side_effect=router):
         a1 = collect_strata_metrics("http://h1:8080", state_key="strata-a")
         b1 = collect_strata_metrics("http://h2:8080", state_key="strata-b")
     assert "gen_tokens_per_s" not in a1  # first scrape per key, independent
@@ -5829,7 +5820,7 @@ def test_multi_llm_state_keyed_per_target(reset_strata_state):
     router2 = _multi_strata_router({"h1": json.dumps(doc_a).encode(),
                                     "h2": doc_b_body})
     with patch("app.time.monotonic", clock), \
-         patch("app.urllib.request.urlopen", side_effect=router2):
+         patch("collectors.llm.urllib.request.urlopen", side_effect=router2):
         a2 = collect_strata_metrics("http://h1:8080", state_key="strata-a")
         b2 = collect_strata_metrics("http://h2:8080", state_key="strata-b")
     assert a2["gen_tokens_per_s"] == 100.0
@@ -5841,7 +5832,7 @@ def test_multi_llm_state_keyed_per_target(reset_strata_state):
     clock.advance(2.0)
     router3 = _multi_strata_router({"h1": None, "h2": doc_b_body})
     with patch("app.time.monotonic", clock), \
-         patch("app.urllib.request.urlopen", side_effect=router3):
+         patch("collectors.llm.urllib.request.urlopen", side_effect=router3):
         a3 = collect_strata_metrics("http://h1:8080", state_key="strata-a")
         b3 = collect_strata_metrics("http://h2:8080", state_key="strata-b")
     assert a3["status"] == "stale"
@@ -5850,7 +5841,7 @@ def test_multi_llm_state_keyed_per_target(reset_strata_state):
 
 def _collector_snapshot(collector):
     """_collect() with host-metric probes stubbed."""
-    with patch("app.collect_gpu_metrics", return_value=[]), \
+    with patch("collectors.gpu.collect_gpu_metrics", return_value=[]), \
          patch("app.collect_swap_metrics", return_value=None), \
          patch("app.collect_host_health_metrics",
                return_value={"psi_mem_avg10": None, "d_state_procs": 0}):
@@ -5871,7 +5862,7 @@ def test_collector_multi_llm_entries_and_alias(reset_strata_state):
     router = _multi_strata_router(
         {"h1:8080": json.dumps(doc_a).encode(),
          "h2:8081": json.dumps(doc_b).encode()})
-    with patch("app.urllib.request.urlopen", side_effect=router):
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=router):
         collector._llm_latest = [
             collector._collect_one(t) for t in collector._targets_snapshot()]
     snapshot = _collector_snapshot(collector)
@@ -5897,7 +5888,7 @@ def test_collector_multi_llm_down_placeholders(reset_strata_state):
     router = _multi_strata_router(
         {"h1:8080": None,  # down
          "h2:8081": json.dumps(_strata_doc()).encode()})
-    with patch("app.urllib.request.urlopen", side_effect=router):
+    with patch("collectors.llm.urllib.request.urlopen", side_effect=router):
         collector._llm_latest = [
             collector._collect_one(t) for t in collector._targets_snapshot()]
     snapshot = _collector_snapshot(collector)
@@ -5993,10 +5984,9 @@ def test_llms_config_validation_errors(tmp_path):
 
 def test_upstream_sanitizer_forwards_llms():
     import app as app_mod
-    from app import collect_upstream_metrics
+    from collectors.llm import collect_upstream_metrics
 
-    orig = app_mod._upstream_last_good
-    app_mod._upstream_last_good = {}
+    llm._upstream_last_good.clear()
     try:
         payload = {
             "timestamp": 1.0, "cpu": 5.0, "memory": {}, "gpus": [],
@@ -6008,7 +5998,7 @@ def test_upstream_sanitizer_forwards_llms():
             ],
             "systems": [{"name": "nested"}],
         }
-        with patch("app.urllib.request.urlopen",
+        with patch("collectors.llm.urllib.request.urlopen",
                    side_effect=make_llama_server(
                        {"/api/metrics": json.dumps(payload).encode()})):
             out = collect_upstream_metrics("http://127.0.0.1:9996", "mock")
@@ -6017,11 +6007,11 @@ def test_upstream_sanitizer_forwards_llms():
         assert m["llms"][1]["name"] == "second"
         assert "systems" not in m
     finally:
-        app_mod._upstream_last_good = orig
+        pass  # state cleared in-place
 
 
 def test_llama_usage_state_path_per_target(tmp_path, monkeypatch):
-    from app import _llama_usage_state_path
+    from collectors.llm import _llama_usage_state_path
 
     monkeypatch.setenv("RD_LLAMA_USAGE_STATE",
                        str(tmp_path / "llama_usage_state.json"))
@@ -6040,7 +6030,7 @@ def test_llama_process_dropped_for_multi_llama_targets():
         LLMTarget("llama-a", "llama", "http://127.0.0.1:8080"),
         LLMTarget("llama-b", "llama", "http://127.0.0.1:8081"),
     ]
-    with patch("app.collect_llama_metrics",
+    with patch("collectors.llm.collect_llama_metrics",
                return_value={"status": "up", "process": {"rss_gb": 3.0}}):
         entry = collector._collect_one(collector.llm_targets[0])
     assert "process" not in entry
@@ -6052,7 +6042,7 @@ def test_llama_process_kept_for_sole_local_target():
     collector = MetricsCollector(poll_interval=0.1)
     collector.llm_targets = [LLMTarget("primary", "llama",
                                        "http://127.0.0.1:8080")]
-    with patch("app.collect_llama_metrics",
+    with patch("collectors.llm.collect_llama_metrics",
                return_value={"status": "up", "process": {"rss_gb": 3.0}}):
         entry = collector._collect_one(collector.llm_targets[0])
     assert entry["process"] == {"rss_gb": 3.0}
@@ -6064,7 +6054,7 @@ def test_llama_process_dropped_for_remote_url():
     collector = MetricsCollector(poll_interval=0.1)
     collector.llm_targets = [LLMTarget("primary", "llama",
                                        "http://192.168.5.207:5001")]
-    with patch("app.collect_llama_metrics",
+    with patch("collectors.llm.collect_llama_metrics",
                return_value={"status": "up", "process": {"rss_gb": 3.0}}):
         entry = collector._collect_one(collector.llm_targets[0])
     assert "process" not in entry
@@ -6132,7 +6122,7 @@ def test_sysfs_pci_vendor_name_never_raises(tmp_path):
     node, a malformed BDF, or an absent vendor file all resolve to a
     fallback (``unknown`` or the raw ID string) without stalling the
     snapshot path."""
-    from app import _sysfs_pci_vendor_name
+    from collectors.gpu import _sysfs_pci_vendor_name
 
     # A BDF with no device node → "unknown" (no raise).
     assert _sysfs_pci_vendor_name("0000:ff:ff.0", str(tmp_path)) == "unknown"
@@ -6218,14 +6208,14 @@ def test_llm_busy_latch_publishes_latest():
 def test_strata_slot_diagnosability_fields(reset_strata_state):
     """The Strata LLM entry carries state_seen, slots_busy, last_busy_ts,
     slots_state_mismatch with correct types/values for a busy payload."""
-    from app import collect_strata_metrics
+    from collectors.llm import collect_strata_metrics
 
     doc = _strata_doc()
     doc["live"]["state"] = "generating"
     doc["live"]["running"] = 1
     body = json.dumps(doc).encode()
     with patch("app.time.time", return_value=12345.0), \
-         patch("app.urllib.request.urlopen",
+         patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_strata_server(body)):
         result = collect_strata_metrics("http://127.0.0.1:9998")
 
@@ -6246,7 +6236,7 @@ def test_strata_is_processing_cheap_guard(reset_strata_state):
     """A slot whose state string is idle but has generated tokens (or
     elapsed time) is marked is_processing (the cheap guard catches short
     requests whose state lags the activity)."""
-    from app import collect_strata_metrics
+    from collectors.llm import collect_strata_metrics
 
     # Positive: a slot with state "idle" but generated > 0 (a short
     # request whose state string lags the actual activity).
@@ -6255,7 +6245,7 @@ def test_strata_is_processing_cheap_guard(reset_strata_state):
         {"slot": 0, "state": "idle", "held_tokens": 0,
          "generated": 10, "elapsed_s": 0.5},
     ]
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_strata_server(json.dumps(doc).encode())):
         result = collect_strata_metrics("http://127.0.0.1:9998",
                                        state_key="pos")
@@ -6270,7 +6260,7 @@ def test_strata_is_processing_cheap_guard(reset_strata_state):
     doc2["live"]["slots"] = [
         {"slot": 0, "state": "idle", "held_tokens": 5},
     ]
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_strata_server(json.dumps(doc2).encode())):
         result2 = collect_strata_metrics("http://127.0.0.1:9998",
                                         state_key="neg")
@@ -6282,7 +6272,7 @@ def test_strata_slots_state_mismatch(reset_strata_state):
     """slots_state_mismatch = any(active) != (running > 0): True when
     slot-level activity disagrees with the engine-level running count,
     False when they agree."""
-    from app import collect_strata_metrics
+    from collectors.llm import collect_strata_metrics
 
     # Case 1 (mismatch): a busy slot but running = 0.
     doc1 = _strata_doc()
@@ -6291,7 +6281,7 @@ def test_strata_slots_state_mismatch(reset_strata_state):
         {"slot": 0, "state": "decoding", "prompt_tokens": 100,
          "generated": 10, "elapsed_s": 1.0},
     ]
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_strata_server(json.dumps(doc1).encode())):
         r1 = collect_strata_metrics("http://127.0.0.1:9998", state_key="m1")
     assert r1["slots_state_mismatch"] is True
@@ -6303,7 +6293,7 @@ def test_strata_slots_state_mismatch(reset_strata_state):
         {"slot": 0, "state": "decoding", "prompt_tokens": 100,
          "generated": 10, "elapsed_s": 1.0},
     ]
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_strata_server(json.dumps(doc2).encode())):
         r2 = collect_strata_metrics("http://127.0.0.1:9998", state_key="a1")
     assert r2["slots_state_mismatch"] is False
@@ -6314,7 +6304,7 @@ def test_strata_slots_state_mismatch(reset_strata_state):
     doc3["live"]["slots"] = [
         {"slot": 0, "state": "idle", "held_tokens": 5},
     ]
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_strata_server(json.dumps(doc3).encode())):
         r3 = collect_strata_metrics("http://127.0.0.1:9998", state_key="i1")
     assert r3["slots_state_mismatch"] is False
@@ -6323,12 +6313,12 @@ def test_strata_slots_state_mismatch(reset_strata_state):
 def test_strata_empty_slot_list_not_silently_dropped(reset_strata_state):
     """An empty slot list is not silently discarded: out["slots"] is
     present (as []) so the empty case is explicit / diagnosable."""
-    from app import collect_strata_metrics
+    from collectors.llm import collect_strata_metrics
 
     doc = _strata_doc()
     doc["live"]["slots"] = []
     body = json.dumps(doc).encode()
-    with patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_strata_server(body)):
         result = collect_strata_metrics("http://127.0.0.1:9998")
 
@@ -6350,7 +6340,7 @@ def test_stop_joins_upstream_threads():
     from app import MetricsCollector
 
     collector = MetricsCollector(poll_interval=0.1, llama_enabled=False)
-    with patch("app.collect_upstream_metrics", return_value=None):
+    with patch("collectors.llm.collect_upstream_metrics", return_value=None):
         collector.start_upstreams(
             [{"name": "peer-a", "url": "http://127.0.0.1:9997"}])
         assert len(collector._upstream_threads) == 1
@@ -6393,7 +6383,7 @@ def test_upstream_backoff_on_failure():
 
     orig_wait = collector._upstream_stop.wait
     collector._upstream_stop.wait = fake_wait
-    with patch("app.collect_upstream_metrics", side_effect=fake_collect):
+    with patch("collectors.llm.collect_upstream_metrics", side_effect=fake_collect):
         try:
             collector._upstream_loop("peer-a", "http://127.0.0.1:9997")
         finally:
@@ -6405,7 +6395,7 @@ def test_upstream_backoff_on_failure():
     # A subsequent failure backs off again from the reset value.
     assert wait_durations[3] > wait_durations[2]
     # The backoff is capped (never exceeds _UPSTREAM_BACKOFF_CAP_S).
-    assert max(wait_durations) <= app_mod._UPSTREAM_BACKOFF_CAP_S
+    assert max(wait_durations) <= llm._UPSTREAM_BACKOFF_CAP_S
 
 
 def test_upstream_removal_after_n_failures():
@@ -6427,7 +6417,7 @@ def test_upstream_removal_after_n_failures():
 
     orig_wait = collector._upstream_stop.wait
     collector._upstream_stop.wait = fake_wait
-    with patch("app.collect_upstream_metrics", side_effect=fake_collect):
+    with patch("collectors.llm.collect_upstream_metrics", side_effect=fake_collect):
         try:
             collector._upstream_loop("peer-a", "http://127.0.0.1:9997")
         finally:
@@ -6435,38 +6425,38 @@ def test_upstream_removal_after_n_failures():
     # The upstream is removed after N consecutive failures.
     assert "peer-a" in collector._upstream_removed
     # The loop stopped after exactly N failures (not more).
-    assert collect_count == app_mod._UPSTREAM_REMOVAL_AFTER_FAILURES
+    assert collect_count == llm._UPSTREAM_REMOVAL_AFTER_FAILURES
 
 
 def test_llama_proc_keyed_per_target():
     """_llama_proc is keyed per target (two different llama targets
     retain different process handles; no cross-target clobbering)."""
     import app as app_mod
-    from app import collect_llama_metrics
+    from collectors.llm import collect_llama_metrics
 
     proc_a = _fake_llama_proc(rss_gb=10.0)
     proc_b = _fake_llama_proc(rss_gb=20.0)
     routes = {"/metrics": LLAMA_METRICS_SAMPLE.encode(),
              "/props": b"{}", "/slots": b"[]"}
     # Target A: process_iter yields only proc_a.
-    with patch("app.psutil.process_iter", return_value=[proc_a]), \
-         patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.psutil.process_iter", return_value=[proc_a]), \
+         patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_llama_server(routes)):
         result_a = collect_llama_metrics("http://127.0.0.1:8080",
                                         state_key="target-a")
     assert result_a["process"]["rss_gb"] == 10.0
-    assert app_mod._llama_proc["target-a"] is proc_a
+    assert llm._llama_proc["target-a"] is proc_a
     # Target B: process_iter yields only proc_b (a different handle).
-    with patch("app.psutil.process_iter", return_value=[proc_b]), \
-         patch("app.urllib.request.urlopen",
+    with patch("collectors.llm.psutil.process_iter", return_value=[proc_b]), \
+         patch("collectors.llm.urllib.request.urlopen",
                side_effect=make_llama_server(routes)):
         result_b = collect_llama_metrics("http://127.0.0.1:8081",
                                         state_key="target-b")
     assert result_b["process"]["rss_gb"] == 20.0
-    assert app_mod._llama_proc["target-b"] is proc_b
+    assert llm._llama_proc["target-b"] is proc_b
     # No cross-target clobbering: target-a's handle is still proc_a.
-    assert app_mod._llama_proc["target-a"] is proc_a
-    assert app_mod._llama_proc["target-a"] is not app_mod._llama_proc["target-b"]
+    assert llm._llama_proc["target-a"] is proc_a
+    assert llm._llama_proc["target-a"] is not llm._llama_proc["target-b"]
 
 
 # ---------------------------------------------------------------------------
