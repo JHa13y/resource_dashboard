@@ -175,7 +175,6 @@ def test_gpu_pynvml_basic():
     with patch.dict("sys.modules", {"pynvml": mock_nvml}):
         if "app" in sys.modules:
             del sys.modules["app"]
-        import app as app_mod
         # Mock the sysfs vendor-ID read so the board vendor is resolved
         # from the hardcoded map (pci.ids-independent).
         with patch.object(gpu_mod, "_sysfs_pci_vendor_id",
@@ -525,7 +524,6 @@ def test_fleet_projection_peer_full():
     swap, host_health), dropping the fields the UI never reads from a
     peer (timestamp, cpu_per_core, legacy llm). A peer's own `systems`
     is dropped by the sanitizer (not in the projection key set)."""
-    import app
 
     fake_payload = {
         "timestamp": 1234.5,
@@ -577,7 +575,6 @@ def test_fleet_projection_no_self_nesting():
     """T5: for both the local system and a peer, systems[].metrics does
     not contain `systems` (the section-2 trap, asserted in the
     projection context)."""
-    import app
     from app import MetricsCollector
 
     # Local system: the projection is built before metrics["systems"]
@@ -678,7 +675,6 @@ def no_real_llama():
 @pytest.fixture(autouse=True)
 def reset_llama_props_cache():
     """Reset the module-level /props cache around every test."""
-    import app as app_mod
 
     original = llm._llama_props_cache
     llm._llama_props_cache = {}
@@ -692,7 +688,6 @@ def reset_llama_prev():
 
     Multi-LLM: all scrape-state containers are target-name-keyed dicts;
     swapping in fresh dicts is the reset."""
-    import app as app_mod
 
     keys = (
         "_llama_prev", "_llama_last_good", "_llama_slot_prev",
@@ -730,7 +725,6 @@ def reset_llama_proc():
     tests never depend on (or slow down on) the host's real process table.
     Tests that need a fake server re-patch it.
     """
-    import app as app_mod
 
     original = llm._llama_proc
     llm._llama_proc = {}
@@ -886,7 +880,6 @@ def test_collect_llama_stale_hold():
 
 def test_collect_llama_stale_expiry():
     """A failed scrape after the 15 s hold window returns None again."""
-    import app as app_mod
     from collectors.llm import collect_llama_metrics
 
     clock = _FakeClock()
@@ -1063,7 +1056,6 @@ def test_collect_llama_free_slots():
 
     def run(props: str, metrics: str):
         # Bypass the 30 s /props cache so each run sees its own props body.
-        import app as app_mod
         llm._llama_props_cache = {}
         with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
             "/metrics": metrics.encode(),
@@ -1473,7 +1465,6 @@ def test_collect_llama_prompt_rate_idle_slot_at_first_sight():
 def test_collect_llama_prompt_rate_cleared_on_counter_reset():
     """A server restart (cumulative counters decrease) clears the
     per-request history: the gauge falls back to the live rate."""
-    import app as app_mod
     from collectors.llm import collect_llama_metrics
 
     llm._llama_req_rates["primary"] = [1000.0]  # pretend a request completed
@@ -1570,7 +1561,6 @@ def test_collect_llama_slots_failure():
 
 def test_collect_llama_props_cached():
     """/props is fetched once per 30 s TTL, then re-fetched when stale."""
-    import app as app_mod
     from collectors.llm import collect_llama_metrics
 
     calls: list[str] = []
@@ -1649,7 +1639,6 @@ def test_collect_llama_rate_from_counter_deltas():
 
 def test_collect_llama_counter_reset():
     """A decreasing counter (server restart) must yield 0, not a negative rate."""
-    import app as app_mod
     from collectors.llm import collect_llama_metrics
 
     llm._llama_prev["primary"] = {
@@ -1925,7 +1914,6 @@ def test_collect_llama_health_unreachable_keeps_metrics_logic():
 
 def test_collect_llama_build_info():
     """/props build_info passes through; omitted when absent."""
-    import app as app_mod
     from collectors.llm import collect_llama_metrics
 
     with patch("collectors.llm.urllib.request.urlopen", side_effect=make_llama_server({
@@ -2065,7 +2053,6 @@ def test_collect_llama_stall_history_window_bounded():
 
 def test_llama_process_name_match():
     """psutil name match is identified; model_size_gb guarded (no file)."""
-    import app as app_mod
     from collectors.llm import collect_llama_metrics
 
     proc = _fake_llama_proc(rss_gb=21.0, cpu=340.0, threads=64)
@@ -2086,7 +2073,6 @@ def test_llama_process_name_match():
 
 
 def test_llama_process_multiple_matches_largest_rss_wins():
-    import app as app_mod
     from collectors.llm import collect_llama_metrics
 
     small = _fake_llama_proc(rss_gb=5.0)
@@ -2106,7 +2092,6 @@ def test_llama_process_multiple_matches_largest_rss_wins():
 
 def test_llama_process_cmdline_fallback():
     """No exact name match: a cmdline argument containing llama-server."""
-    import app as app_mod
     from collectors.llm import collect_llama_metrics
 
     other = _fake_llama_proc(name="python3", rss_gb=1.0,
@@ -2130,7 +2115,6 @@ def test_llama_process_cmdline_fallback():
 def test_llama_process_reidentify_after_death():
     """A dead retained handle (model reload = new PID) is re-found."""
     import psutil
-    import app as app_mod
     from collectors.llm import collect_llama_metrics
 
     dead = _fake_llama_proc(rss_gb=21.0)
@@ -2499,7 +2483,6 @@ VLLM_METRICS_SAMPLE = (
 @pytest.fixture(autouse=True)
 def reset_vllm_state():
     """Reset module-level vLLM scrape history around every test."""
-    import app as app_mod
 
     # Clear in-place so the BaseLLMCollector aliases stay valid.
     llm._vllm_prev.clear()
@@ -2668,7 +2651,6 @@ def test_collect_vllm_stale_hold():
 
 def test_collect_vllm_stale_expiry():
     """A failed scrape after the 15 s hold window returns None."""
-    import app as app_mod
     from collectors.llm import collect_vllm_metrics
 
     clock = _FakeClock()
@@ -2764,7 +2746,6 @@ def test_collect_vllm_prompt_rate_averages_completed_requests():
 
 def test_collect_vllm_counter_reset_rebaselines():
     """A decreasing counter (server restart) yields 0 rate."""
-    import app as app_mod
     from collectors.llm import collect_vllm_metrics
 
     llm._vllm_prev["primary"] = {"ts": 1000.0, "gen": 10000.0,
@@ -2988,7 +2969,6 @@ def test_collect_vllm_spec_accept_omitted_when_draft_zero():
 def test_collect_vllm_config_none_values_omitted():
     """cache_config_info label values that are the literal string "None"
     are omitted from the config dict."""
-    import app as app_mod
     from collectors.llm import collect_vllm_metrics
 
     body = (
@@ -3353,7 +3333,6 @@ _MEMINFO_16GB = (
 def platform_env(tmp_path, monkeypatch):
     """Point all platform-detection inputs at an empty tmp tree, reset the
     lazy platform globals, and pin a deterministic non-tegra kernel."""
-    import app
 
     monkeypatch.setattr(gpu_mod, "_PLATFORM", None)
     monkeypatch.setattr(gpu_mod, "_JETSON_SOC", None)
@@ -3374,7 +3353,6 @@ def platform_env(tmp_path, monkeypatch):
 def jetson_env(tmp_path, monkeypatch):
     """Reset jetson globals to a known state; provide empty fake sysfs dirs
     and a 16 GiB unified-pool meminfo (8 GiB available → 50 % used)."""
-    import app
 
     monkeypatch.setattr(gpu_mod, "_PLATFORM", "jetson")
     monkeypatch.setattr(gpu_mod, "_JETSON_SOC", "orin")
@@ -3420,14 +3398,12 @@ def _add_zone(env, idx, ztype, temp):
 
 
 def test_platform_desktop_no_signals(platform_env):
-    import app
 
     assert gpu_mod._init_platform() == "desktop"
     assert gpu_mod._JETSON_SOC == "unknown"
 
 
 def test_platform_model_jetson(platform_env):
-    import app
 
     platform_env.model.write_bytes(b"NVIDIA Jetson AGX Orin Developer Kit\x00")
     assert gpu_mod._init_platform() == "jetson"
@@ -3435,7 +3411,6 @@ def test_platform_model_jetson(platform_env):
 
 def test_platform_model_orin_nx_without_jetson_word(platform_env):
     """Vendor-board model string without the literal "Jetson" (oracle m5)."""
-    import app
 
     platform_env.model.write_bytes(b"NVIDIA Orin NX Developer Kit\x00")
     assert gpu_mod._init_platform() == "jetson"
@@ -3444,14 +3419,12 @@ def test_platform_model_orin_nx_without_jetson_word(platform_env):
 def test_platform_model_thor_without_nvidia_is_desktop(platform_env):
     """Custom board with "thor" in the model but no nvidia co-occurrence →
     desktop (oracle m1 false-positive guard)."""
-    import app
 
     platform_env.model.write_bytes(b"Acme Thor Developer Board\x00")
     assert gpu_mod._init_platform() == "desktop"
 
 
 def test_platform_compatible_only(platform_env):
-    import app
 
     platform_env.compatible.write_bytes(
         b"nvidia,p4071-0000+p3834-0008\x00nvidia,tegra264\x00"
@@ -3461,7 +3434,6 @@ def test_platform_compatible_only(platform_env):
 
 
 def test_platform_nv_tegra_release_fallback(platform_env):
-    import app
 
     platform_env.nv_tegra_release.write_text(
         "# R38 (release), REVISION: 2.1, GCID: 1234567, EABI: aarch64\n"
@@ -3471,7 +3443,6 @@ def test_platform_nv_tegra_release_fallback(platform_env):
 
 
 def test_platform_tegra_kernel_fallback(platform_env, monkeypatch):
-    import app
 
     monkeypatch.setattr("platform.release", lambda: "6.8.12-1021-tegra")
     assert gpu_mod._init_platform() == "jetson"
@@ -3479,7 +3450,6 @@ def test_platform_tegra_kernel_fallback(platform_env, monkeypatch):
 
 def test_platform_unreadable_model_file_skipped(platform_env):
     """An unreadable model path (a directory) is an OSError → skipped."""
-    import app
 
     platform_env.model.mkdir()  # open() raises IsADirectoryError
     assert gpu_mod._init_platform() == "desktop"
@@ -3487,7 +3457,6 @@ def test_platform_unreadable_model_file_skipped(platform_env):
 
 def test_platform_result_cached(platform_env):
     """Detection runs once; later file changes do not re-detect."""
-    import app
 
     assert gpu_mod._init_platform() == "desktop"
     platform_env.model.write_bytes(b"NVIDIA Jetson AGX Orin Developer Kit\x00")
@@ -3518,7 +3487,6 @@ def test_soc_from_compatible_garbage_is_unknown():
 
 
 def test_board_label_soc_names(platform_env, monkeypatch):
-    import app
 
     monkeypatch.setattr(gpu_mod, "_JETSON_SOC", "thor")
     assert gpu_mod._jetson_board_label() == "NVIDIA Thor"
@@ -3561,7 +3529,6 @@ def test_jetson_orin_happy_path(jetson_env):
 def test_jetson_util_prefers_load_file_over_smi(jetson_env, no_real_nvidia,
                                                 monkeypatch):
     """Capability rule: a devfreq node with device/load wins even on Thor."""
-    import app
 
     monkeypatch.setattr(gpu_mod, "_JETSON_SOC", "thor")
     _add_gpu_node(jetson_env, name="gpu-gpc-0", load=330, cur_freq=1_500_000_000)
@@ -3576,7 +3543,6 @@ def test_jetson_util_prefers_load_file_over_smi(jetson_env, no_real_nvidia,
 def test_jetson_thor_util_from_nvidia_smi(jetson_env, no_real_nvidia,
                                           monkeypatch):
     """Thor without device/load falls back to nvidia-smi (tolerant parse)."""
-    import app
 
     monkeypatch.setattr(gpu_mod, "_JETSON_SOC", "thor")
     _add_gpu_node(jetson_env, name="gpu-gpc-0", cur_freq=1_500_000_000)
@@ -3590,7 +3556,6 @@ def test_jetson_thor_util_from_nvidia_smi(jetson_env, no_real_nvidia,
 
 def test_jetson_thor_nvidia_smi_na_omits_util(jetson_env, no_real_nvidia,
                                               monkeypatch):
-    import app
 
     monkeypatch.setattr(gpu_mod, "_JETSON_SOC", "thor")
     _add_gpu_node(jetson_env, name="gpu-gpc-0", cur_freq=1_500_000_000)
@@ -3607,7 +3572,6 @@ def test_jetson_thor_nvidia_smi_na_omits_util(jetson_env, no_real_nvidia,
 
 def test_jetson_orin_no_node_omits_util_not_zero(jetson_env, no_real_nvidia):
     """Late-boot Orin (no devfreq node yet): util omitted, never 0, never CLI."""
-    import app
 
     _add_zone(jetson_env, 1, "gpu-thermal", 45_000)
     gpu = gpu_mod.collect_jetson_gpu_metrics(**jetson_env.args())[0]
@@ -3621,7 +3585,6 @@ def test_jetson_orin_no_node_omits_util_not_zero(jetson_env, no_real_nvidia):
 def test_jetson_devfreq_late_boot_not_cached_absent(jetson_env):
     """Node absent on tick 1, present on tick 2 → picked up (no cached
     absence)."""
-    import app
 
     first = gpu_mod.collect_jetson_gpu_metrics(**jetson_env.args())[0]
     assert "utilization_pct" not in first
@@ -3635,7 +3598,6 @@ def test_jetson_devfreq_late_boot_not_cached_absent(jetson_env):
 
 def test_jetson_devfreq_strict_pattern(jetson_env):
     """Non-matching devfreq names are ignored (no loose 'contains gpu')."""
-    import app
 
     _add_gpu_node(jetson_env, name="foo-gpu-bar", cur_freq=1_000_000_000)
     gpu = gpu_mod.collect_jetson_gpu_metrics(**jetson_env.args())[0]
@@ -3646,7 +3608,6 @@ def test_jetson_devfreq_strict_pattern(jetson_env):
 
 
 def test_jetson_thermal_max_and_filtering(jetson_env):
-    import app
 
     _add_zone(jetson_env, 0, "tj-thermal", 90_000)      # wrong type
     _add_zone(jetson_env, 1, "gpu-thermal", -256_000)   # no sensor
@@ -3659,7 +3620,6 @@ def test_jetson_thermal_max_and_filtering(jetson_env):
 
 
 def test_jetson_thermal_zone_missing_temp_skipped(jetson_env):
-    import app
 
     zone = jetson_env.thermal / "thermal_zone5"
     zone.mkdir()
@@ -3671,7 +3631,6 @@ def test_jetson_thermal_zone_missing_temp_skipped(jetson_env):
 
 
 def test_jetson_meminfo_missing_omits_mem_keys(jetson_env):
-    import app
 
     gpu = gpu_mod.collect_jetson_gpu_metrics(
         devfreq_dir=str(jetson_env.devfreq),
@@ -3685,7 +3644,6 @@ def test_jetson_meminfo_missing_omits_mem_keys(jetson_env):
 
 
 def test_jetson_all_absent_never_raises(jetson_env):
-    import app
 
     gpu = gpu_mod.collect_jetson_gpu_metrics(
         devfreq_dir=str(jetson_env.devfreq),  # empty dir
@@ -3702,7 +3660,6 @@ def test_jetson_all_absent_never_raises(jetson_env):
 def test_gpu_metrics_gate_jetson_skips_desktop_paths(jetson_env, no_real_nvidia,
                                                     monkeypatch):
     """Platform "jetson" ⇒ _gpu_pynvml and _gpu_cli are never called."""
-    import app
 
     calls = []
     monkeypatch.setattr(gpu_mod, "_gpu_pynvml",
@@ -3730,7 +3687,6 @@ def test_gpu_metrics_gate_jetson_skips_desktop_paths(jetson_env, no_real_nvidia,
 
 def test_gpu_metrics_gate_desktop_unchanged(platform_env, no_real_nvidia,
                                             monkeypatch):
-    import app
 
     assert gpu_mod._init_platform() == "desktop"
     monkeypatch.setattr(gpu_mod, "_gpu_pynvml", lambda: [{"index": 0, "name": "fake"}])
@@ -3742,7 +3698,6 @@ def test_gpu_metrics_gate_desktop_unchanged(platform_env, no_real_nvidia,
 
 
 def test_gpu_metrics_jetson_mode_logged_once(jetson_env, monkeypatch, caplog):
-    import app
 
     monkeypatch.setattr(gpu_mod, "_jetson_mode_logged", False)
     with caplog.at_level(logging.INFO):
@@ -3808,7 +3763,6 @@ LITELLM_METRICS_SAMPLE = (
 @pytest.fixture(autouse=True)
 def reset_litellm_state():
     """Reset module-level LiteLLM scrape history around every test."""
-    import app as app_mod
 
     # Clear in-place so the BaseLLMCollector aliases stay valid.
     llm._litellm_prev.clear()
@@ -4322,7 +4276,6 @@ def _fake_drm(drm_dir, cards):
 @pytest.fixture(autouse=True)
 def reset_amd_state():
     """Reset AMD BDF/product-name caches around every test."""
-    import app as app_mod
 
     original_absent = gpu_mod._amd_absent_since
     original_bdf_map = gpu_mod._amd_bdf_map
@@ -4867,7 +4820,6 @@ def test_gpu_name_never_matches_bdf_shape():
 
 def test_gpu_amd_negative_cache_skips_reprobe():
     """No AMD GPU → amd-smi is not re-run every poll; re-probe after TTL."""
-    import app as app_mod
 
     calls = {"n": 0}
 
@@ -4896,7 +4848,6 @@ def test_gpu_amd_negative_cache_skips_reprobe():
 
 
 def test_gpu_amd_negative_cache_cleared_on_success():
-    import app as app_mod
 
     results = iter([[], [{"index": 0}], []])
     with (
@@ -5096,7 +5047,6 @@ def test_upstream_entry_malformed_skipped():
 # ---------------------------------------------------------------------------
 
 def test_collect_upstream_happy_path():
-    import app as app_mod
     from collectors.llm import collect_upstream_metrics
 
     llm._upstream_last_good.clear()
@@ -5125,7 +5075,6 @@ def test_collect_upstream_happy_path():
 
 
 def test_collect_upstream_unreachable_returns_none():
-    import app as app_mod
     from collectors.llm import collect_upstream_metrics
 
     llm._upstream_last_good.clear()
@@ -5139,7 +5088,6 @@ def test_collect_upstream_unreachable_returns_none():
 
 
 def test_collect_upstream_stale_hold_then_expiry():
-    import app as app_mod
     from collectors.llm import collect_upstream_metrics
 
     clock = _FakeClock()
@@ -5254,7 +5202,6 @@ def test_collector_upstream_thread_populates_latest():
 
 
 def test_snapshot_upstream_down_after_hold_expiry():
-    import app as app_mod
     from app import MetricsCollector
 
     payload = {"cpu": 7.5, "gpus": []}
@@ -5367,7 +5314,6 @@ def test_snapshot_upstream_initial_down():
 @pytest.fixture()
 def reset_strata_state():
     """Reset module-level Strata scrape history around a test."""
-    import app as app_mod
 
     # Clear in-place so the BaseLLMCollector aliases stay valid.
     llm._strata_prev.clear()
@@ -5983,7 +5929,6 @@ def test_llms_config_validation_errors(tmp_path):
 
 
 def test_upstream_sanitizer_forwards_llms():
-    import app as app_mod
     from collectors.llm import collect_upstream_metrics
 
     llm._upstream_last_good.clear()
@@ -6360,7 +6305,6 @@ def test_stop_joins_upstream_threads():
 def test_upstream_backoff_on_failure():
     """A failing upstream backs off (retry interval increases on failure,
     resets on success; does not hammer a dead upstream every cycle)."""
-    import app as app_mod
     from app import MetricsCollector
 
     collector = MetricsCollector(poll_interval=0.1, llama_enabled=False)
@@ -6401,7 +6345,6 @@ def test_upstream_backoff_on_failure():
 def test_upstream_removal_after_n_failures():
     """After N consecutive failures, the upstream is removed (the loop
     stops fetching it)."""
-    import app as app_mod
     from app import MetricsCollector
 
     collector = MetricsCollector(poll_interval=0.1, llama_enabled=False)
@@ -6431,7 +6374,6 @@ def test_upstream_removal_after_n_failures():
 def test_llama_proc_keyed_per_target():
     """_llama_proc is keyed per target (two different llama targets
     retain different process handles; no cross-target clobbering)."""
-    import app as app_mod
     from collectors.llm import collect_llama_metrics
 
     proc_a = _fake_llama_proc(rss_gb=10.0)

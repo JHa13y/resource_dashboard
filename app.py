@@ -14,22 +14,18 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import csv
-import io
 import json
 import logging
 import os
 import platform
 import queue
 import re
-import subprocess
 import sys
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Generator, NamedTuple
 
@@ -45,11 +41,6 @@ from collectors.llm import (
     DEFAULT_VLLM_URL,
     _UPSTREAM_BACKOFF_CAP_S,
     _UPSTREAM_REMOVAL_AFTER_FAILURES,
-    collect_litellm_metrics,
-    collect_llama_metrics,
-    collect_strata_metrics,
-    collect_upstream_metrics,
-    collect_vllm_metrics,
 )
 
 # ---------------------------------------------------------------------------
