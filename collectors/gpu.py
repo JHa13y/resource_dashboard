@@ -390,8 +390,10 @@ def _gpu_cli() -> list[dict[str, Any]]:
 # rocm-smi. JSON is the most stable machine contract — CSV column order is
 # insertion-order and can shift between versions, and the human tables
 # change by platform (XCP column, dynamic GTT/VRAM header). amd-smi
-# reports VRAM in MB; legacy rocm-smi reports VRAM in BYTES (1024×). "N/A"
-# is the universal missing-value token and is treated as absent, never 0.
+# reports VRAM in MB or GB depending on build (the ``unit`` field is
+# respected by ``_amd_vram_gb``); legacy rocm-smi reports VRAM in BYTES
+# (1024×). "N/A" is the universal missing-value token and is treated as
+# absent, never 0.
 
 _AMD_SMI_BIN_CANDIDATES = ("amd-smi", "/opt/rocm/bin/amd-smi")
 _ROCM_SMI_BIN_CANDIDATES = ("rocm-smi", "/opt/rocm/bin/rocm-smi")
@@ -524,7 +526,9 @@ def _amd_smi_list_bus_ids() -> dict[int, str] | None:
         idx = entry.get("gpu")
         if not isinstance(idx, int) or isinstance(idx, bool):
             continue
-        bus = entry.get("bus_id")
+        # ``bdf`` is the current amd-smi field; ``bus_id`` is the legacy
+        # name (older builds) — try both.
+        bus = entry.get("bdf") or entry.get("bus_id")
         if isinstance(bus, str) and bus.strip():
             mapping[idx] = bus.strip()
     if not mapping:
@@ -611,6 +615,10 @@ def _amd_smi_product_names(binary: str) -> dict[int, str]:
         payload = json.loads(result.stdout)
     except ValueError:
         return {}
+    # Accept both a bare list and the ``{"gpu_data": [...]}`` wrapper
+    # (amd-smi versions differ).
+    if isinstance(payload, dict):
+        payload = payload.get("gpu_data")
     if not isinstance(payload, list):
         return {}
     names: dict[int, str] = {}
@@ -620,8 +628,15 @@ def _amd_smi_product_names(binary: str) -> dict[int, str]:
         idx = entry.get("gpu")
         if not isinstance(idx, int) or isinstance(idx, bool):
             continue
-        for field in _AMD_PRODUCT_NAME_FIELDS:
-            val = entry.get(field)
+        # Market name: nested ``asic.market_name`` (current amd-smi) first,
+        # then the top-level field list (older builds). Every candidate is
+        # implausibility-checked.
+        candidates: list[Any] = []
+        asic = entry.get("asic")
+        if isinstance(asic, dict):
+            candidates.append(asic.get("market_name"))
+        candidates.extend(entry.get(f) for f in _AMD_PRODUCT_NAME_FIELDS)
+        for val in candidates:
             if (isinstance(val, str) and val.strip()
                     and not _is_implausible_gpu_name(val)):
                 names[idx] = val.strip()
@@ -712,22 +727,49 @@ def _amd_unwrap(val: Any) -> float | None:
     return float(val)
 
 
+def _amd_vram_gb(val: Any) -> float | None:
+    """Unwrap an amd-smi vram leaf and return GiB, respecting the unit.
+    ``{"value": N, "unit": "GB"}`` → N (already GiB); ``"MB"`` → N/1024;
+    a bare scalar or an absent/unknown unit → N/1024 (legacy behaviour,
+    preserves older MB-reporting builds). ``"N/A"``/None/malformed → None."""
+    if isinstance(val, dict):
+        value = val.get("value")
+        unit = val.get("unit")
+        unit = unit.upper() if isinstance(unit, str) else ""
+    else:
+        value, unit = val, ""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    if unit == "GB":
+        return value
+    # "MB", absent, or unknown unit → legacy (assume MB → GiB).
+    return value / 1024
+
+
 def _amd_smi_entry_to_gpu(entry: dict[str, Any], idx: int) -> dict[str, Any] | None:
     """Map one ``amd-smi monitor --json`` object to the dashboard GPU dict.
 
-    Field map (monitor keys, VRAM in MB): ``gfx`` → utilization %,
-    ``vram_used``/``vram_total`` → memory, ``hotspot_temperature`` (fall
+    Field map (monitor keys, VRAM unit-aware GB/MB): ``gfx`` → utilization %,
+    ``vram_used``/``vram_total`` → memory in GiB (unit-aware via
+    ``_amd_vram_gb``), ``hotspot_temperature`` (fall
     back to ``memory_temperature`` — ``edge`` is N/A on datacenter cards),
-    ``gfx_clock`` → MHz, ``power_usage`` → W. Rows with no usable data
+    ``gfx_clk`` (fallback ``gfx_clock``) → MHz, ``power_usage`` → W. Rows with
+    no usable data
     (e.g. secondary XCP rows on partitioned MI300X) are dropped.
     """
     util = _amd_unwrap(entry.get("gfx"))
-    vram_used = _amd_unwrap(entry.get("vram_used"))
-    vram_total = _amd_unwrap(entry.get("vram_total"))
+    vram_used = _amd_vram_gb(entry.get("vram_used"))
+    vram_total = _amd_vram_gb(entry.get("vram_total"))
     temp = _amd_unwrap(entry.get("hotspot_temperature"))
     if temp is None:
         temp = _amd_unwrap(entry.get("memory_temperature"))
-    clock = _amd_unwrap(entry.get("gfx_clock"))
+    # ``gfx_clk`` is the current amd-smi field; ``gfx_clock`` is the legacy
+    # name — try both.
+    clock_raw = entry.get("gfx_clk")
+    if clock_raw is None:
+        clock_raw = entry.get("gfx_clock")
+    clock = _amd_unwrap(clock_raw)
     power = _amd_unwrap(entry.get("power_usage"))
 
     if util is None and vram_used is None:
@@ -763,10 +805,11 @@ def _amd_smi_entry_to_gpu(entry: dict[str, Any], idx: int) -> dict[str, Any] | N
         gpu["pci_bus_id"] = bus_id
     if util is not None:
         gpu["utilization_pct"] = util
+    # ``_amd_vram_gb`` already returns GiB (unit-aware) — no /1024 here.
     if vram_used is not None:
-        gpu["memory_used_gb"] = round(vram_used / 1024, 1)
+        gpu["memory_used_gb"] = round(vram_used, 1)
     if vram_total is not None:
-        gpu["memory_total_gb"] = round(vram_total / 1024, 1)
+        gpu["memory_total_gb"] = round(vram_total, 1)
     if vram_used is not None and vram_total:
         gpu["memory_pct"] = round(vram_used / vram_total * 100, 1)
     if temp is not None:

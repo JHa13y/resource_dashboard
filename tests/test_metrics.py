@@ -6734,3 +6734,256 @@ def test_gpu_pynvml_name_not_folded_when_vendor_unknown():
     gpu = result[0]
     assert gpu["name"] == "NVIDIA A100-SXM4-80GB"  # not folded
     assert gpu["board_vendor"] == "NVIDIA"  # chip vendor, unchanged
+
+
+# ---------------------------------------------------------------------------
+# T14: amd-smi field-mismatch fixes (live 192.168.5.220 owner bug report)
+# ---------------------------------------------------------------------------
+
+def test_t14_amd_smi_list_bus_ids_reads_bdf():
+    """T14: ``amd-smi list --json`` returns ``bdf`` (not ``bus_id``) —
+    the tool's own BDF data is read, so two cards resolve to distinct
+    BDFs (the pre-fix bug read ``bus_id`` → empty mapping → sysfs →
+    collision → one card dropped)."""
+    from collectors.gpu import _AMD_SMI_BIN_CANDIDATES, _amd_smi_list_bus_ids
+
+    payload = json.dumps([
+        {"gpu": 0, "bdf": "0000:2d:00.0"},
+        {"gpu": 1, "bdf": "0000:43:00.0"},
+    ])
+
+    def fake_find_cli(candidates):
+        if candidates == _AMD_SMI_BIN_CANDIDATES:
+            return "/usr/bin/amd-smi"
+        return None
+
+    with (
+        patch("collectors.gpu._find_cli_binary", side_effect=fake_find_cli),
+        patch("subprocess.run", return_value=_amd_smi_mock(payload)),
+    ):
+        mapping = _amd_smi_list_bus_ids()
+    assert mapping == {0: "0000:2d:00.0", 1: "0000:43:00.0"}
+
+
+def test_t14_amd_smi_list_bus_ids_bus_id_fallback():
+    """T14: when ``bdf`` is absent (older amd-smi), ``bus_id`` is the
+    fallback — the fix must not break the legacy field."""
+    from collectors.gpu import _AMD_SMI_BIN_CANDIDATES, _amd_smi_list_bus_ids
+
+    payload = json.dumps([
+        {"gpu": 0, "bus_id": "0000:2d:00.0"},
+        {"gpu": 1, "bus_id": "0000:43:00.0"},
+    ])
+
+    def fake_find_cli(candidates):
+        if candidates == _AMD_SMI_BIN_CANDIDATES:
+            return "/usr/bin/amd-smi"
+        return None
+
+    with (
+        patch("collectors.gpu._find_cli_binary", side_effect=fake_find_cli),
+        patch("subprocess.run", return_value=_amd_smi_mock(payload)),
+    ):
+        mapping = _amd_smi_list_bus_ids()
+    assert mapping == {0: "0000:2d:00.0", 1: "0000:43:00.0"}
+
+
+def test_t14_amd_smi_product_names_gpu_data_wrapper():
+    """T14: ``amd-smi static --asic --json`` wraps the list in
+    ``gpu_data`` and nests the name under ``asic.market_name`` — both
+    are unwrapped, so the real market name is read (the pre-fix bug
+    required a bare list + a top-level field → fell back to "AMD
+    GPU")."""
+    from collectors.gpu import _amd_smi_product_names
+
+    payload = json.dumps({"gpu_data": [
+        {"gpu": 0, "asic": {"market_name": "AMD Radeon AI PRO R9700",
+                            "vendor_id": "0x1002"}},
+        {"gpu": 1, "asic": {"market_name": "AMD Radeon AI PRO R9700"}},
+    ]})
+    with patch("subprocess.run", return_value=_amd_smi_mock(payload)):
+        names = _amd_smi_product_names("/usr/bin/amd-smi")
+    assert names == {0: "AMD Radeon AI PRO R9700",
+                    1: "AMD Radeon AI PRO R9700"}
+
+
+def test_t14_amd_smi_product_names_bare_list_fallback():
+    """T14: a bare list with top-level name fields (older amd-smi)
+    still works — the wrapper is not required, and a string ``asic``
+    field is still honoured."""
+    from collectors.gpu import _amd_smi_product_names
+
+    payload = json.dumps([
+        {"gpu": 0, "market_name": "AMD Instinct MI300X"},
+        {"gpu": 1, "asic": "gfx926"},
+    ])
+    with patch("subprocess.run", return_value=_amd_smi_mock(payload)):
+        names = _amd_smi_product_names("/usr/bin/amd-smi")
+    assert names == {0: "AMD Instinct MI300X", 1: "gfx926"}
+
+
+def test_t14_amd_vram_gb_unit_aware():
+    """T14: ``_amd_vram_gb`` respects the unit — GB as-is (already
+    GiB), MB /1024, bare/absent/unknown unit /1024 (legacy, preserves
+    older MB-reporting builds)."""
+    from collectors.gpu import _amd_vram_gb
+
+    # GB → as-is (already GiB).
+    assert _amd_vram_gb({"value": 30.9, "unit": "GB"}) == 30.9
+    # Case-insensitive GB.
+    assert _amd_vram_gb({"value": 30.9, "unit": "gb"}) == 30.9
+    # MB → /1024.
+    assert _amd_vram_gb({"value": 283, "unit": "MB"}) == 283 / 1024
+    # Bare scalar → /1024 (legacy, assume MB).
+    assert _amd_vram_gb(283) == 283 / 1024
+    # Absent unit → /1024 (legacy).
+    assert _amd_vram_gb({"value": 283}) == 283 / 1024
+    # Unknown unit → /1024 (legacy).
+    assert _amd_vram_gb({"value": 283, "unit": "??"}) == 283 / 1024
+    # "N/A" / None / malformed / bool → None.
+    assert _amd_vram_gb({"value": "N/A", "unit": "GB"}) is None
+    assert _amd_vram_gb(None) is None
+    assert _amd_vram_gb({"value": None}) is None
+    assert _amd_vram_gb(True) is None
+
+
+def test_t14_amd_smi_entry_to_gpu_gfx_clk_and_unit_vram():
+    """T14: the live ``amd-smi monitor --json`` shape — clock from
+    ``gfx_clk`` (not ``gfx_clock``), vram in GB (not MB)."""
+    from collectors.gpu import (_AMD_SMI_BIN_CANDIDATES,
+                               _amd_smi_entry_to_gpu)
+
+    def fake_find_cli(candidates):
+        if candidates == _AMD_SMI_BIN_CANDIDATES:
+            return "/usr/bin/amd-smi"
+        return None
+
+    entry = {
+        "gpu": 0,
+        "gfx": {"value": 3, "unit": "%"},
+        "gfx_clk": {"value": 51, "unit": "MHz"},
+        "vram_used": {"value": 30.9, "unit": "GB"},
+        "vram_total": {"value": 31.9, "unit": "GB"},
+        "hotspot_temperature": {"value": 42, "unit": "C"},
+        "power_usage": {"value": 22, "unit": "W"},
+    }
+    with (
+        patch("collectors.gpu._find_cli_binary", side_effect=fake_find_cli),
+        patch("subprocess.run", return_value=_amd_smi_mock(
+            json.dumps([{"gpu": 0, "bdf": "0000:2d:00.0"}]))) ,
+        patch("collectors.gpu._sysfs_pci_vendor_name", return_value="AMD"),
+        patch("collectors.gpu._lspci_vendor_map", return_value={}),
+    ):
+        gpu = _amd_smi_entry_to_gpu(entry, 0)
+    # Clock from gfx_clk.
+    assert gpu["graphics_clock_mhz"] == 51.0
+    # VRAM in GB → as-is (not /1024).
+    assert gpu["memory_used_gb"] == 30.9
+    assert gpu["memory_total_gb"] == 31.9
+    # memory_pct from the two GB values.
+    assert gpu["memory_pct"] == round(30.9 / 31.9 * 100, 1)
+    # BDF from bdf.
+    assert gpu["pci_bus_id"] == "0000:2d:00.0"
+
+
+def test_t14_amd_smi_entry_to_gpu_gfx_clock_fallback():
+    """T14: when ``gfx_clk`` is absent (older amd-smi), ``gfx_clock``
+    is the fallback; MB vram is still /1024."""
+    from collectors.gpu import (_AMD_SMI_BIN_CANDIDATES,
+                               _amd_smi_entry_to_gpu)
+
+    def fake_find_cli(candidates):
+        if candidates == _AMD_SMI_BIN_CANDIDATES:
+            return "/usr/bin/amd-smi"
+        return None
+
+    entry = {
+        "gpu": 0,
+        "gfx": {"value": 3, "unit": "%"},
+        "gfx_clock": {"value": 43, "unit": "MHz"},
+        "vram_used": {"value": 283, "unit": "MB"},
+        "vram_total": {"value": 196592, "unit": "MB"},
+        "hotspot_temperature": {"value": 44, "unit": "C"},
+        "power_usage": {"value": 17, "unit": "W"},
+    }
+    with (
+        patch("collectors.gpu._find_cli_binary", side_effect=fake_find_cli),
+        patch("subprocess.run", return_value=_amd_smi_mock(
+            json.dumps([{"gpu": 0, "bdf": "0000:2d:00.0"}]))) ,
+        patch("collectors.gpu._sysfs_pci_vendor_name", return_value="AMD"),
+        patch("collectors.gpu._lspci_vendor_map", return_value={}),
+    ):
+        gpu = _amd_smi_entry_to_gpu(entry, 0)
+    assert gpu["graphics_clock_mhz"] == 43.0
+    # MB → /1024.
+    assert gpu["memory_used_gb"] == round(283 / 1024, 1)
+    assert gpu["memory_total_gb"] == round(196592 / 1024, 1)
+
+
+def test_t14_two_amd_cards_distinct_bdf_survive_merge():
+    """T14 end-to-end: two AMD cards whose BDFs come from ``bdf``
+    (distinct) both survive the colliding-BDF guard and are renumbered
+    dense; the name comes from ``asic.market_name`` and the clock from
+    ``gfx_clk`` — the pre-fix bugs (missing 2nd card, "AMD GPU" name,
+    "–" clock) are all gone."""
+    from collectors.gpu import (_AMD_SMI_BIN_CANDIDATES, _gpu_amd_smi,
+                               _merge_gpu_lists)
+
+    list_payload = json.dumps([
+        {"gpu": 0, "bdf": "0000:2d:00.0"},
+        {"gpu": 1, "bdf": "0000:43:00.0"},
+    ])
+    static_payload = json.dumps({"gpu_data": [
+        {"gpu": 0, "asic": {"market_name": "AMD Radeon AI PRO R9700"}},
+        {"gpu": 1, "asic": {"market_name": "AMD Radeon AI PRO R9700"}},
+    ]})
+    monitor_payload = json.dumps([
+        {"gpu": 0, "gfx": {"value": 3, "unit": "%"},
+         "gfx_clk": {"value": 51, "unit": "MHz"},
+         "vram_used": {"value": 30.9, "unit": "GB"},
+         "vram_total": {"value": 31.9, "unit": "GB"},
+         "hotspot_temperature": {"value": 42, "unit": "C"},
+         "power_usage": {"value": 22, "unit": "W"}},
+        {"gpu": 1, "gfx": {"value": 5, "unit": "%"},
+         "gfx_clk": {"value": 49, "unit": "MHz"},
+         "vram_used": {"value": 30.5, "unit": "GB"},
+         "vram_total": {"value": 31.9, "unit": "GB"},
+         "hotspot_temperature": {"value": 43, "unit": "C"},
+         "power_usage": {"value": 21, "unit": "W"}},
+    ])
+
+    def fake_find_cli(candidates):
+        if candidates == _AMD_SMI_BIN_CANDIDATES:
+            return "/usr/bin/amd-smi"
+        return None
+
+    def fake_run(cmd, **kwargs):
+        if "list" in cmd:
+            return _amd_smi_mock(list_payload)
+        if "static" in cmd:
+            return _amd_smi_mock(static_payload)
+        return _amd_smi_mock(monitor_payload)
+
+    with (
+        patch("collectors.gpu._find_cli_binary", side_effect=fake_find_cli),
+        patch("subprocess.run", side_effect=fake_run),
+        patch("collectors.gpu._sysfs_pci_vendor_name", return_value="AMD"),
+        patch("collectors.gpu._lspci_vendor_map", return_value={}),
+    ):
+        amd = _gpu_amd_smi()
+
+    # Both cards present (the pre-fix bug dropped the 2nd R9700).
+    assert len(amd) == 2
+    # Distinct BDFs from ``bdf`` (not the sysfs-collision fallback).
+    bdfs = sorted(g.get("pci_bus_id") for g in amd)
+    assert bdfs == ["0000:2d:00.0", "0000:43:00.0"]
+    # Name from ``asic.market_name`` (not "AMD GPU").
+    assert all(g["name"] == "AMD Radeon AI PRO R9700" for g in amd)
+    # Clock from ``gfx_clk`` (not "–").
+    assert sorted(g["graphics_clock_mhz"] for g in amd) == [49.0, 51.0]
+    # VRAM in GB → as-is (not /1024).
+    assert sorted(g["memory_used_gb"] for g in amd) == [30.5, 30.9]
+    # Both survive the merge (no false collision), renumbered dense.
+    merged = _merge_gpu_lists([], amd)
+    assert [g["index"] for g in merged] == [0, 1]
+    assert [g["vendor"] for g in merged] == ["amd", "amd"]

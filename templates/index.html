@@ -1213,14 +1213,10 @@ function updateGPUs(gpus) {
       card.id = `gpu-${gpu.index}`;
       card.className = 'gpu-card';
 
-      const vendor = (typeof gpu.board_vendor === 'string' ? gpu.board_vendor : '').trim();
-      const isVendor = !!vendor && vendor.toLowerCase() !== 'unknown' && !/^0x[0-9a-f]+$/i.test(vendor);
-      // On mixed-vendor boxes make the chip vendor explicit on AMD cards
-      // (NVIDIA is the historical default and stays unadorned).
-      const chip = gpu.vendor === 'amd' ? 'AMD · ' : '';
-      const title = isVendor
-        ? `GPU ${gpu.index} · ${chip}${vendor} · ${gpu.name || `GPU ${gpu.index}`}`
-        : `GPU ${gpu.index}: ${chip}${gpu.name || `GPU ${gpu.index}`}`;
+      // The name carries the chip vendor + board/package vendor (e.g.
+      // "NVIDIA GeForce RTX 3090 (Gigabyte)", "AMD Radeon AI PRO R9700
+      // (ASRock)"), so the title is just the name — no redundant vendor.
+      const title = `GPU ${gpu.index} · ${gpu.name || `GPU ${gpu.index}`}`;
 
       card.innerHTML = `
         <div class="gpu-header">
