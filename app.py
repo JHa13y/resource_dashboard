@@ -23,9 +23,7 @@ import re
 import sys
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Generator, NamedTuple
 
