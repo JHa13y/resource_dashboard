@@ -95,6 +95,104 @@ def _sysfs_pci_vendor_name(bdf: str,
 
 
 # ---------------------------------------------------------------------------
+# Board/package vendor (lspci ``SVendor:`` — the physical card maker, e.g.
+# "Gigabyte"/"Dell"/"ASRock"). Re-introduced in T13 (T10 removed it) so the
+# board/package vendor can be folded into the GPU name. Best-effort: lspci
+# may be missing/time out → "" (no parentheses); never raises, never blocks
+# the snapshot path unboundedly (5 s timeout + negative cache).
+# ---------------------------------------------------------------------------
+_lspci_cache: dict[str, str] | None = None  # bus_id → board/package vendor
+_lspci_negative: dict[str, float] = {}  # bus_id → failed_at (negative cache)
+_LSPICI_NEGATIVE_TTL = 300.0
+_lspci_missing_logged = False
+
+
+def _parse_lspci_subsystem(output: str) -> str:
+    """Extract the board/package vendor name from lspci output.
+
+    An "SVendor:" line is preferred; the first token after it is returned
+    (e.g. "Gigabyte", "Dell"). If no SVendor line exists, falls back to the
+    first token after a "Subsystem:" line. Returns an empty string when
+    neither line is present so callers can apply their own fallbacks.
+    """
+    for line in output.splitlines():
+        if "SVendor:" in line:
+            vendor_part = line.split("SVendor:", 1)[1].strip()
+            return vendor_part.split()[0] if vendor_part else ""
+    for line in output.splitlines():
+        if "Subsystem:" in line:
+            vendor_part = line.split("Subsystem:", 1)[1].strip()
+            return vendor_part.split()[0] if vendor_part else ""
+    return ""
+
+
+def _lspci_vendor_map(bus_ids: list[str]) -> dict[str, str]:
+    """Board/package vendor (lspci ``SVendor:``) per BDF. Best-effort with a
+    positive cache + a negative cache (``_LSPICI_NEGATIVE_TTL``) so a
+    missing/timing-out lspci never blocks the snapshot path unboundedly.
+    Returns "" for any BDF whose vendor can't be determined. Never raises."""
+    global _lspci_cache, _lspci_missing_logged
+    if _lspci_cache is None:
+        _lspci_cache = {}
+    now = time.monotonic()
+
+    mapping: dict[str, str] = {}
+    for bus_id in bus_ids:
+        if not bus_id:
+            mapping[bus_id] = ""
+            continue
+        if bus_id in _lspci_cache:
+            mapping[bus_id] = _lspci_cache[bus_id]
+            continue
+        failed_at = _lspci_negative.get(bus_id)
+        if failed_at is not None and \
+                (now - failed_at) < _LSPICI_NEGATIVE_TTL:
+            mapping[bus_id] = ""  # cached failure — no subprocess
+            continue
+        try:
+            result = subprocess.run(  # noqa: S603 – static args only
+                ["lspci", "-s", bus_id, "-vm"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            vendor_name = _parse_lspci_subsystem(result.stdout)
+        except FileNotFoundError:
+            if not _lspci_missing_logged:
+                log.info("lspci not found – board/package vendor lookup "
+                         "unavailable (negative-cached %.0fs)",
+                         _LSPICI_NEGATIVE_TTL)
+                _lspci_missing_logged = True
+            _lspci_negative.update({b: now for b in bus_ids if b})
+            break
+        except subprocess.TimeoutExpired:
+            log.warning("lspci timed out for %s (negative-cached %.0fs)",
+                       bus_id, _LSPICI_NEGATIVE_TTL)
+            _lspci_negative.update({b: now for b in bus_ids if b})
+            break
+        _lspci_cache[bus_id] = vendor_name
+        mapping[bus_id] = vendor_name
+    return mapping
+
+
+def _fold_board_vendor_into_name(name: str, bus_id: str) -> str:
+    """Fold the board/package vendor (lspci ``SVendor:``) into the GPU name
+    in parentheses (e.g. ``"NVIDIA RTX 3090"`` → ``"NVIDIA RTX 3090
+    (Gigabyte)"``). If the board/package vendor is unknown (empty), the name
+    is returned unchanged (no parentheses). Best-effort: never raises."""
+    if not bus_id or bus_id == "unknown":
+        return name
+    board_vendor = _lspci_vendor_map([bus_id]).get(bus_id, "")
+    if not board_vendor:
+        return name
+    # Avoid a redundant "(Gigabyte)" when the name already contains the
+    # board/package vendor (case-insensitive).
+    if board_vendor.lower() in name.lower():
+        return name
+    return f"{name} ({board_vendor})"
+
+
+# ---------------------------------------------------------------------------
 # GPU Monitoring
 # ---------------------------------------------------------------------------
 
@@ -152,6 +250,9 @@ def _gpu_pynvml() -> list[dict[str, Any]]:
             # Board/GPU vendor from the raw PCI vendor ID (sysfs ``vendor``
             # file) via a hardcoded map — pci.ids-independent.
             board_vendor = _sysfs_pci_vendor_name(bus_id)
+            # Fold the board/package vendor (lspci ``SVendor:``) into the
+            # name (e.g. "NVIDIA RTX 3090 (Gigabyte)"). T13.
+            name = _fold_board_vendor_into_name(name, bus_id)
 
             # Throttle-reason bitmask
             throttle_bits = pynvml.nvmlDeviceGetCurrentClocksThrottleReasons(handle)
@@ -232,6 +333,9 @@ def _gpu_cli() -> list[dict[str, Any]]:
             # file) via a hardcoded map — pci.ids-independent.
             bus_id = row[7].strip()
             board_vendor = _sysfs_pci_vendor_name(bus_id)
+            # Name + fold the board/package vendor (lspci ``SVendor:``) into
+            # it (e.g. "NVIDIA RTX 3090 (Gigabyte)"). T13.
+            name = _fold_board_vendor_into_name(row[8].strip(), bus_id)
 
             # Optional power fields – nvidia-smi reports "[Not Supported]"
             # (or "[N/A]") when the query is unavailable on this GPU.
@@ -258,7 +362,7 @@ def _gpu_cli() -> list[dict[str, Any]]:
                     "hw_thermal_slowdown": row[5].strip().lower() == "active",
                     "sw_thermal_slowdown": row[6].strip().lower() == "active",
                 },
-                "name": row[8].strip(),
+                "name": name,
                 "pci_bus_id": bus_id,
                 "board_vendor": board_vendor,
             }
@@ -642,6 +746,9 @@ def _amd_smi_entry_to_gpu(entry: dict[str, Any], idx: int) -> dict[str, Any] | N
     tool_name = _amd_product_name(idx)
     if tool_name:
         name = tool_name
+    # Fold the board/package vendor (lspci ``SVendor:``) into the name
+    # (e.g. "Radeon RX 7900 XTX (ASRock)"). T13.
+    name = _fold_board_vendor_into_name(name, bus_id)
 
     gpu: dict[str, Any] = {
         "index": idx,
@@ -791,6 +898,9 @@ def _gpu_rocm_smi() -> list[dict[str, Any]]:
         board_vendor = _sysfs_pci_vendor_name(bus_id) if bus_id else "unknown"
         # No tool product name on the rocm path — "AMD GPU".
         name = "AMD GPU"
+        # Fold the board/package vendor (lspci ``SVendor:``) into the name.
+        # T13.
+        name = _fold_board_vendor_into_name(name, bus_id)
 
         gpu: dict[str, Any] = {
             "index": idx,
@@ -858,6 +968,9 @@ def _gpu_amd_sysfs(
         board_vendor = _sysfs_pci_vendor_name(bus_id) if bus_id else "unknown"
         # No tool product name on the sysfs path — "AMD GPU".
         name = "AMD GPU"
+        # Fold the board/package vendor (lspci ``SVendor:``) into the name.
+        # T13.
+        name = _fold_board_vendor_into_name(name, bus_id)
 
         gpu: dict[str, Any] = {
             "index": idx,

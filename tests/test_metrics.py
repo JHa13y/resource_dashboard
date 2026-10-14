@@ -6588,3 +6588,149 @@ def test_main_bootstrap_idempotent(monkeypatch):
     finally:
         fresh.stop()
         fresh.join(timeout=2)
+
+
+# ---------------------------------------------------------------------------
+# T13 — fold the board/package vendor (lspci ``SVendor:``) into the GPU name
+# ---------------------------------------------------------------------------
+
+def test_parse_lspci_subsystem_svendor():
+    """_parse_lspci_subsystem extracts the first token after the SVendor: line."""
+    from collectors.gpu import _parse_lspci_subsystem
+    output = (
+        "Slot:\t01:00.0\n"
+        "Class:\tVGA compatible controller\n"
+        "Vendor:\tNVIDIA Corporation\n"
+        "Device:\tGA102 [GeForce RTX 3080]\n"
+        "SVendor:\tGigabyte Technology Co., Ltd\n"
+        "SDevice:\tDevice 1234\n"
+    )
+    assert _parse_lspci_subsystem(output) == "Gigabyte"
+
+
+def test_parse_lspci_subsystem_subsystem_fallback():
+    """_parse_lspci_subsystem falls back to the Subsystem: line when there is
+    no SVendor: line."""
+    from collectors.gpu import _parse_lspci_subsystem
+    output = (
+        "01:00.0 VGA compatible controller: NVIDIA Corporation GA102\n"
+        "\t\tSubsystem: Dell Device 5678\n"
+    )
+    assert _parse_lspci_subsystem(output) == "Dell"
+
+
+def test_parse_lspci_subsystem_empty():
+    """_parse_lspci_subsystem returns an empty string when neither line is
+    present."""
+    from collectors.gpu import _parse_lspci_subsystem
+    assert _parse_lspci_subsystem("\n\n") == ""
+    assert _parse_lspci_subsystem("") == ""
+
+
+def test_fold_board_vendor_into_name_known():
+    """_fold_board_vendor_into_name appends the board/package vendor in
+    parentheses when it is known."""
+    from collectors.gpu import _fold_board_vendor_into_name
+    with patch.object(gpu_mod, "_lspci_vendor_map",
+                     return_value={"0000:01:00.0": "Gigabyte"}):
+        assert _fold_board_vendor_into_name(
+            "NVIDIA A100-SXM4-80GB", "0000:01:00.0") \
+            == "NVIDIA A100-SXM4-80GB (Gigabyte)"
+
+
+def test_fold_board_vendor_into_name_unknown():
+    """_fold_board_vendor_into_name returns the name unchanged when the
+    board/package vendor is unknown (empty)."""
+    from collectors.gpu import _fold_board_vendor_into_name
+    with patch.object(gpu_mod, "_lspci_vendor_map",
+                     return_value={"0000:01:00.0": ""}):
+        assert _fold_board_vendor_into_name(
+            "NVIDIA A100-SXM4-80GB", "0000:01:00.0") \
+            == "NVIDIA A100-SXM4-80GB"
+
+
+def test_fold_board_vendor_into_name_no_bus_id():
+    """_fold_board_vendor_into_name returns the name unchanged when there is
+    no bus_id (or it is 'unknown')."""
+    from collectors.gpu import _fold_board_vendor_into_name
+    assert _fold_board_vendor_into_name(
+        "NVIDIA A100-SXM4-80GB", "") == "NVIDIA A100-SXM4-80GB"
+    assert _fold_board_vendor_into_name(
+        "NVIDIA A100-SXM4-80GB", "unknown") == "NVIDIA A100-SXM4-80GB"
+
+
+def test_fold_board_vendor_into_name_already_in_name():
+    """_fold_board_vendor_into_name does not append a redundant vendor when
+    the name already contains it (case-insensitive)."""
+    from collectors.gpu import _fold_board_vendor_into_name
+    with patch.object(gpu_mod, "_lspci_vendor_map",
+                     return_value={"0000:01:00.0": "Gigabyte"}):
+        assert _fold_board_vendor_into_name(
+            "Gigabyte GeForce RTX 3090", "0000:01:00.0") \
+            == "Gigabyte GeForce RTX 3090"
+
+
+def test_gpu_pynvml_name_folded_board_vendor():
+    """_gpu_pynvml folds the board/package vendor into the name (e.g.
+    'NVIDIA A100-SXM4-80GB (Gigabyte)') when the lspci SVendor read is
+    mocked to return a known vendor. board_vendor stays the chip vendor."""
+    mock_nvml = MagicMock()
+    mock_nvml.nvmlInit.return_value = 0
+    mock_nvml.nvmlDeviceGetCount.return_value = 1
+    mock_nvml.nvmlDeviceGetUtilizationRates.return_value = MagicMock(gpu=73)
+    mock_nvml.nvmlDeviceGetMemoryInfo.return_value = MagicMock(used=4_000_000_000, total=8_000_000_000)
+    mock_nvml.nvmlDeviceGetTemperature.return_value = 67
+    mock_nvml.nvmlDeviceGetClockInfo.return_value = 1500
+    mock_nvml.nvmlDeviceGetCurrentClocksThrottleReasons.return_value = 0x40
+    mock_nvml.NVML_CLOCKS_THROTTLE_REASON_HW_THERMAL_SLOWDOWN = 0x40
+    mock_nvml.NVML_CLOCKS_THROTTLE_REASON_SW_THERMAL_SLOWDOWN = 0x80
+    mock_nvml.nvmlDeviceGetPciInfo.return_value = MagicMock(
+        busId=b"0000:01:00.0\x00", pciDeviceId=0x1EB810DE,
+        pciSubSystemId=0x12A210DE)
+    mock_nvml.nvmlDeviceGetName.return_value = b"NVIDIA A100-SXM4-80GB"
+    with patch.dict("sys.modules", {"pynvml": mock_nvml}):
+        if "collectors.gpu" in sys.modules:
+            del sys.modules["collectors.gpu"]
+        import collectors.gpu as gpu_mod2
+        with patch.object(gpu_mod2, "_sysfs_pci_vendor_id",
+                         return_value="0x10de"), \
+             patch.object(gpu_mod2, "_lspci_vendor_map",
+                         return_value={"0000:01:00.0": "Gigabyte"}):
+            result = gpu_mod2._gpu_pynvml()
+    assert len(result) == 1
+    gpu = result[0]
+    assert gpu["name"] == "NVIDIA A100-SXM4-80GB (Gigabyte)"
+    assert gpu["board_vendor"] == "NVIDIA"  # chip vendor, unchanged
+    assert gpu["pci_bus_id"] == "0000:01:00.0"
+
+
+def test_gpu_pynvml_name_not_folded_when_vendor_unknown():
+    """_gpu_pynvml does not fold the board/package vendor into the name when
+    the lspci SVendor read returns empty (the name stays as-is)."""
+    mock_nvml = MagicMock()
+    mock_nvml.nvmlInit.return_value = 0
+    mock_nvml.nvmlDeviceGetCount.return_value = 1
+    mock_nvml.nvmlDeviceGetUtilizationRates.return_value = MagicMock(gpu=73)
+    mock_nvml.nvmlDeviceGetMemoryInfo.return_value = MagicMock(used=4_000_000_000, total=8_000_000_000)
+    mock_nvml.nvmlDeviceGetTemperature.return_value = 67
+    mock_nvml.nvmlDeviceGetClockInfo.return_value = 1500
+    mock_nvml.nvmlDeviceGetCurrentClocksThrottleReasons.return_value = 0x40
+    mock_nvml.NVML_CLOCKS_THROTTLE_REASON_HW_THERMAL_SLOWDOWN = 0x40
+    mock_nvml.NVML_CLOCKS_THROTTLE_REASON_SW_THERMAL_SLOWDOWN = 0x80
+    mock_nvml.nvmlDeviceGetPciInfo.return_value = MagicMock(
+        busId=b"0000:01:00.0\x00", pciDeviceId=0x1EB810DE,
+        pciSubSystemId=0x12A210DE)
+    mock_nvml.nvmlDeviceGetName.return_value = b"NVIDIA A100-SXM4-80GB"
+    with patch.dict("sys.modules", {"pynvml": mock_nvml}):
+        if "collectors.gpu" in sys.modules:
+            del sys.modules["collectors.gpu"]
+        import collectors.gpu as gpu_mod2
+        with patch.object(gpu_mod2, "_sysfs_pci_vendor_id",
+                         return_value="0x10de"), \
+             patch.object(gpu_mod2, "_lspci_vendor_map",
+                         return_value={"0000:01:00.0": ""}):
+            result = gpu_mod2._gpu_pynvml()
+    assert len(result) == 1
+    gpu = result[0]
+    assert gpu["name"] == "NVIDIA A100-SXM4-80GB"  # not folded
+    assert gpu["board_vendor"] == "NVIDIA"  # chip vendor, unchanged
