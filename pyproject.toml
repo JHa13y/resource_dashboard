@@ -35,4 +35,8 @@ check_untyped_defs = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Tests import the top-level `app` and the `collectors` package, so the repo root
+# must be importable. Bare `pytest` (what CI runs) does not put the CWD on sys.path
+# the way `python -m pytest` does, so declare it explicitly.
+pythonpath = ["."]
 addopts = "-q"
