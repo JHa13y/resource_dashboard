@@ -175,11 +175,13 @@ def _lspci_vendor_map(bus_ids: list[str]) -> dict[str, str]:
     return mapping
 
 
-def _fold_board_vendor_into_name(name: str, bus_id: str) -> str:
+def _fold_board_vendor_into_name(name: str, bus_id: str | None) -> str:
     """Fold the board/package vendor (lspci ``SVendor:``) into the GPU name
     in parentheses (e.g. ``"NVIDIA RTX 3090"`` → ``"NVIDIA RTX 3090
     (Gigabyte)"``). If the board/package vendor is unknown (empty), the name
-    is returned unchanged (no parentheses). Best-effort: never raises."""
+    is returned unchanged (no parentheses). ``bus_id`` is optional because
+    the collectors only have a BDF for some cards — a missing one means "no
+    fold". Best-effort: never raises."""
     if not bus_id or bus_id == "unknown":
         return name
     board_vendor = _lspci_vendor_map([bus_id]).get(bus_id, "")
@@ -385,7 +387,7 @@ def _gpu_cli() -> list[dict[str, Any]]:
 # AMD GPU Monitoring (amd-smi → rocm-smi → sysfs)
 # ---------------------------------------------------------------------------
 #
-# Evidence: docs/research/amd-smi.md. amd-smi ships with ROCm 6.x+ (the
+# Field contract: documentation/gpu-detection.md. amd-smi ships with ROCm 6.x+ (the
 # amd-smi-lib package, /opt/rocm/bin); it is the official replacement for
 # rocm-smi. JSON is the most stable machine contract — CSV column order is
 # insertion-order and can shift between versions, and the human tables

@@ -5,8 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=joshua
-WorkingDirectory=/home/joshua/resource_dashboard
+# `User=` and the install paths below are placeholders that install_service.sh
+# substitutes at install time (SERVICE_USER, INSTALL_DIR).
+# Edit them here only if you install the unit by hand.
+User=dashboard
+WorkingDirectory=/opt/resource-dashboard
 # Replace LLAMA_HOST / VLLM_HOST with the hostname/IP of the machine(s)
 # running the LLM server(s). In auto mode (default) the dashboard probes
 # vLLM first, then llama.cpp; pin with --llm-backend {llama|vllm}.
@@ -16,7 +19,7 @@ WorkingDirectory=/home/joshua/resource_dashboard
 # resolved settings. A WSGI server (e.g. `waitress-serve app:wsgi`, T10)
 # uses the `wsgi` entry point, which applies the config's settings at
 # import time so it no longer runs on built-in defaults.
-ExecStart=/home/joshua/resource_dashboard/.venv/bin/python -m app --config /home/joshua/resource_dashboard/config.yaml
+ExecStart=/opt/resource-dashboard/.venv/bin/python -m app --config /opt/resource-dashboard/config.yaml
 Restart=on-failure
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1

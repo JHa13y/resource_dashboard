@@ -201,8 +201,8 @@ def _llama_find_process(state_key: str = "primary") -> psutil.Process | None:
     """Find the local llama-server process for one scrape target. Never
     raises.
 
-    Name match first (the confirmed host binary is
-    ``/home/joshua/llama.cpp/build/bin/llama-server``, psutil name
+    Name match first (the usual build layout is
+    ``/opt/llama.cpp/build/bin/llama-server``, psutil name
     ``llama-server``), then a cmdline-argument fallback; multiple matches
     resolve to the largest RSS. Returns ``None`` when no local process
     exists (remote/dev mode). A retained live handle is reused so

@@ -2,6 +2,9 @@
 name = "resource-dashboard"
 version = "0.1.0"
 description = "Resource & GPU utilization dashboard with multi-LLM and fleet aggregation"
+license = "MIT"
+authors = [{ name = "jhaley" }]
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "flask>=3.0",

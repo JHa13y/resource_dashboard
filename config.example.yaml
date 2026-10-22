@@ -35,12 +35,12 @@
 # primary backs the legacy `llm` payload key and sorts first).
 #
 # llms:
-#   - name: studio
+#   - name: local
 #     backend: strata
 #     url: http://127.0.0.1:8080
-#   - name: gpu-box
+#   - name: gpu-1
 #     backend: vllm
-#     url: http://192.168.5.30:8000
+#     url: http://192.168.1.30:8000
 #   - name: proxy
 #     backend: litellm
 #     url: http://127.0.0.1:4000
@@ -59,7 +59,7 @@
 # on duplicates.
 #
 # upstreams:
-#   - name: athena
-#     url: http://athena.lungfish-smelt.ts.net:5001
-#   - name: modelbox
-#     url: http://192.168.5.207:5001
+#   - name: node-a
+#     url: http://node-a.example.com:5001
+#   - name: node-b
+#     url: http://192.168.1.20:5001

@@ -1,8 +1,28 @@
+# --- Python build/runtime artifacts -----------------------------------------
 __pycache__/
 *.pyc
 .venv/
+*.egg-info/
+
+# --- Tool caches -------------------------------------------------------------
+# Each tool also writes a .gitignore inside its own cache dir; ignore them here
+# too so a fresh clone never shows them as untracked (and never commits them if
+# that self-written ignore is removed).
 .pytest_cache/
-docs/
-.llama_usage_state*.json
+.mypy_cache/
+.ruff_cache/
+
+# --- Local state & secrets ---------------------------------------------------
+# Machine-specific config: copy config.example.yaml to config.yaml.
 config.yaml
+# llama.cpp usage counters (per target).
+.llama_usage_state*.json
+*.log
+
+# --- Working notes -----------------------------------------------------------
+# Agent/dev scratch (plans, research logs, probes). The publishable docs live in
+# documentation/, which IS tracked.
+docs/
+
+# --- OS noise ----------------------------------------------------------------
 .DS_Store

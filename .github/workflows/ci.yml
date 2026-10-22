@@ -18,11 +18,15 @@ jobs:
           python -m pip install ruff mypy pytest
           python -m pip install -r requirements.txt
       - name: Ruff
-        run: ruff check app.py tests/test_metrics.py
+        run: ruff check app.py collectors tests/
       - name: Mypy
         run: |
           mypy app.py > mypy-report.txt || true
           count=$(grep -c 'error:' mypy-report.txt)
+          # Baseline = existing errors at T11 when this gate was added. It drifted to
+          # 43 (3 x arg-type in collectors/gpu.py from the T13 vendor-fold call sites);
+          # those are now fixed, so the gate stays at 40. Ratchet DOWN as types are
+          # fixed — never raise this number to make CI green.
           echo "mypy errors: $count (baseline: 40)"
           [ "$count" -le 40 ]
       - name: Pytest

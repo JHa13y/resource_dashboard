@@ -741,7 +741,7 @@ def _fake_llama_proc(name="llama-server", rss_gb=21.0, cpu=340.0,
     p.info = {
         "name": name,
         "cmdline": (cmdline if cmdline is not None
-                    else ["/home/joshua/llama.cpp/build/bin/llama-server",
+                    else ["/opt/llama.cpp/build/bin/llama-server",
                           "--model", "x.gguf"]),
         "memory_info": MagicMock(rss=rss),
     }
@@ -4217,7 +4217,7 @@ def test_defaults_vllm_port_5001():
 # ---------------------------------------------------------------------------
 
 # Fixture reconstructed from the amd-smi CLI source + ROCm 7.14 docs
-# (docs/research/amd-smi.md): monitor --json is an array keyed by "gpu",
+# (documentation/gpu-detection.md): monitor --json is an array keyed by "gpu",
 # numerics wrapped as {"value": N, "unit": ...}, VRAM in MB, "N/A" for
 # unavailable sensors (hotspot is N/A on many datacenter cards).
 AMD_SMI_MONITOR_JSON = json.dumps([
@@ -4880,8 +4880,8 @@ def test_load_config_valid(tmp_path):
         "llama_enabled: false\n"
         "litellm_token: sk-test\n"
         "upstreams:\n"
-        "  - name: athena\n"
-        "    url: http://athena:5001\n"
+        "  - name: node-a\n"
+        "    url: http://node-a:5001\n"
         "unknown_key: 1\n"
     )
     cfg = load_config(str(p))
@@ -4890,7 +4890,7 @@ def test_load_config_valid(tmp_path):
     assert cfg["llm_backend"] == "litellm"
     assert cfg["llama_enabled"] is False
     assert cfg["litellm_token"] == "sk-test"
-    assert cfg["upstreams"][0]["name"] == "athena"
+    assert cfg["upstreams"][0]["name"] == "node-a"
 
 
 def test_load_config_missing(tmp_path, monkeypatch):
@@ -5694,13 +5694,13 @@ def test_config_strata_and_default_view(tmp_path):
     p = tmp_path / "config.yaml"
     p.write_text(
         "llm_backend: strata\n"
-        "strata_url: http://192.168.5.219:8080\n"
+        "strata_url: http://192.0.2.10:8080\n"
         "default_view: fleet\n"
     )
     cfg = load_config(str(p))
     settings = resolve_settings(_ns(), cfg)
     assert settings["llm_backend"] == "strata"
-    assert settings["strata_url"] == "http://192.168.5.219:8080"
+    assert settings["strata_url"] == "http://192.0.2.10:8080"
     assert settings["default_view"] == "fleet"
 
 
@@ -5878,7 +5878,7 @@ def test_llms_config_multi_and_primary_first(tmp_path):
         "llms:\n"
         "  - name: strata-main\n"
         "    backend: strata\n"
-        "    url: http://192.168.5.219:8080\n"
+        "    url: http://192.0.2.10:8080\n"
         "  - name: coder\n"
         "    backend: strata\n"
         "    url: http://127.0.0.1:8081\n"
@@ -5998,7 +5998,7 @@ def test_llama_process_dropped_for_remote_url():
 
     collector = MetricsCollector(poll_interval=0.1)
     collector.llm_targets = [LLMTarget("primary", "llama",
-                                       "http://192.168.5.207:5001")]
+                                       "http://192.0.2.20:5001")]
     with patch("collectors.llm.collect_llama_metrics",
                return_value={"status": "up", "process": {"rss_gb": 3.0}}):
         entry = collector._collect_one(collector.llm_targets[0])
@@ -6422,7 +6422,7 @@ def test_health_endpoint_reports_last_cycle_and_errors(monkeypatch):
         assert collector._last_cycle_duration is not None, \
             "a cycle did not complete in time"
         # Seed a per-target error (an upstream that is down).
-        collector._record_error("apollo", "down (fetch returned None)")
+        collector._record_error("up1", "down (fetch returned None)")
         # GET /health via the Flask test client.
         monkeypatch.setattr(app_mod, "collector", collector)
         resp = app_mod.app.test_client().get("/health")
@@ -6433,7 +6433,7 @@ def test_health_endpoint_reports_last_cycle_and_errors(monkeypatch):
         assert body["last_cycle_duration_s"] >= 0
         # last_errors is a dict reflecting the seeded per-target error.
         assert isinstance(body["last_errors"], dict)
-        assert body["last_errors"]["apollo"] == "down (fetch returned None)"
+        assert body["last_errors"]["up1"] == "down (fetch returned None)"
         # status is "degraded" (a target has a recent error).
         assert body["status"] == "degraded"
     finally:
@@ -6453,30 +6453,30 @@ def test_log_rate_limiting_suppresses_repeat_failures(caplog):
     # Do not start the collector (we test _record_error/_clear_error directly).
     with caplog.at_level(logging.DEBUG, logger="app"):
         # First failure: log the exception (with traceback).
-        collector._record_error("apollo", "boom", exc=Exception("boom"),
-                               log_msg="Error collecting upstream apollo")
+        collector._record_error("up1", "boom", exc=Exception("boom"),
+                               log_msg="Error collecting upstream up1")
         # Subsequent failures (within the cooldown): suppressed (no flood).
-        collector._record_error("apollo", "boom", exc=Exception("boom"),
-                               log_msg="Error collecting upstream apollo")
-        collector._record_error("apollo", "boom", exc=Exception("boom"),
-                               log_msg="Error collecting upstream apollo")
+        collector._record_error("up1", "boom", exc=Exception("boom"),
+                               log_msg="Error collecting upstream up1")
+        collector._record_error("up1", "boom", exc=Exception("boom"),
+                               log_msg="Error collecting upstream up1")
         # Simulate a cooldown expiry (the last log was > 60 s ago).
-        collector._last_error_log_ts["apollo"] = time.monotonic() - 61.0
+        collector._last_error_log_ts["up1"] = time.monotonic() - 61.0
         # After the cooldown: a single "still failing" warning is logged.
-        collector._record_error("apollo", "boom", exc=Exception("boom"),
-                               log_msg="Error collecting upstream apollo")
+        collector._record_error("up1", "boom", exc=Exception("boom"),
+                               log_msg="Error collecting upstream up1")
         # Recovery: log once.
-        collector._clear_error("apollo", log_msg="Upstream apollo")
+        collector._clear_error("up1", log_msg="Upstream up1")
     # First failure: the exception is logged (with traceback / exc_info).
     first_failure = [r for r in caplog.records
-                    if "Error collecting upstream apollo" in r.getMessage()
+                    if "Error collecting upstream up1" in r.getMessage()
                     and r.exc_info is not None]
     assert len(first_failure) == 1, \
         f"expected 1 logged exception, got {len(first_failure)}"
-    # Only 2 "Error collecting upstream apollo" logs total: the first
+    # Only 2 "Error collecting upstream up1" logs total: the first
     # (exception) and the post-cooldown "still failing" (a warning, no exc).
     all_failure_logs = [r for r in caplog.records
-                       if "Error collecting upstream apollo" in r.getMessage()]
+                       if "Error collecting upstream up1" in r.getMessage()]
     assert len(all_failure_logs) == 2, \
         f"expected 2 failure logs (first + post-cooldown), " \
         f"got {len(all_failure_logs)}"
@@ -6737,7 +6737,7 @@ def test_gpu_pynvml_name_not_folded_when_vendor_unknown():
 
 
 # ---------------------------------------------------------------------------
-# T14: amd-smi field-mismatch fixes (live 192.168.5.220 owner bug report)
+# T14: amd-smi field-mismatch fixes (live owner bug report)
 # ---------------------------------------------------------------------------
 
 def test_t14_amd_smi_list_bus_ids_reads_bdf():

@@ -5,23 +5,33 @@
 # Usage:
 #   sudo bash install_service.sh   (or: sudo sh install_service.sh)
 #
-# The .service file lives next to this script in the project directory and is
-# linked into /etc/systemd/system via `systemctl link`, so the canonical copy
-# always stays with the code.
+# The .service file next to this script is a TEMPLATE: `User=dashboard` and the
+# /opt/resource-dashboard paths are placeholders that are substituted here at
+# install time, so the committed unit carries no machine-specific values. The
+# rendered unit is written to /etc/systemd/system/<service>.service.
+#
+# Overridable environment variables:
+#   INSTALL_DIR   project directory (default: the directory holding this script)
+#   SERVICE_USER  account the service runs as (default: the invoking user)
+#
+#   sudo INSTALL_DIR=/srv/resource_dashboard bash install_service.sh
+#   sudo SERVICE_USER=monitor bash install_service.sh
 #
 set -eu
 
-INSTALL_DIR="/home/joshua/resource_dashboard"
+INSTALL_DIR="${INSTALL_DIR:-$(cd "$(dirname "$0")" && pwd)}"
 SERVICE_NAME="resource-dashboard"
-SERVICE_FILE="${INSTALL_DIR}/${SERVICE_NAME}.service"
+SERVICE_USER="${SERVICE_USER:-${SUDO_USER:-root}}"
+SERVICE_TEMPLATE="${INSTALL_DIR}/${SERVICE_NAME}.service"
+UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "ERROR: please run as root (sudo bash install_service.sh)" >&2
     exit 1
 fi
 
-if [ ! -f "${SERVICE_FILE}" ]; then
-    echo "ERROR: ${SERVICE_FILE} not found" >&2
+if [ ! -f "${SERVICE_TEMPLATE}" ]; then
+    echo "ERROR: ${SERVICE_TEMPLATE} not found" >&2
     exit 1
 fi
 
@@ -31,10 +41,24 @@ if [ ! -x "${INSTALL_DIR}/.venv/bin/python" ]; then
     exit 1
 fi
 
-echo "==> Linking service file"
-# `systemctl link` creates a symlink in /etc/systemd/system pointing at the
-# absolute path of the service file, keeping it in place in the project dir.
-systemctl link "${SERVICE_FILE}"
+# A unit installed earlier with `systemctl link` is a symlink into the project
+# directory; writing through it would overwrite the template in the repo.
+if [ -L "${UNIT_FILE}" ]; then
+    echo "==> Removing previously linked unit (${UNIT_FILE} -> $(readlink "${UNIT_FILE}"))"
+    rm -f "${UNIT_FILE}"
+fi
+
+echo "==> Rendering ${UNIT_FILE} (user=${SERVICE_USER}, install=${INSTALL_DIR})"
+# Escape the sed replacement metacharacters in the install path.
+escaped_dir=$(printf '%s' "${INSTALL_DIR}" | sed -e 's/[&|]/\\&/g')
+sed -e "s|/opt/resource-dashboard|${escaped_dir}|g" \
+    -e "s|^User=dashboard\$|User=${SERVICE_USER}|" \
+    "${SERVICE_TEMPLATE}" > "${UNIT_FILE}"
+
+if grep -q 'User=dashboard$' "${UNIT_FILE}"; then
+    echo "ERROR: could not substitute User= in ${UNIT_FILE}" >&2
+    exit 1
+fi
 
 echo "==> Reloading systemd daemon"
 systemctl daemon-reload
