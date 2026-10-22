@@ -12,6 +12,11 @@ serving stack on a different port, and the vendor tools (`nvidia-smi`, `amd-smi`
 payload and one page, and then lets one dashboard aggregate the others so a whole fleet is
 readable from a single tab row.
 
+<p align="center">
+  <img src="documentation/assets/dashboard-local.png" width="1200"
+       alt="Dashboard in the Local view: four GPU cards (two NVIDIA RTX 3090, two AMD Radeon AI PRO R9700) showing utilization, memory, temperature, clock and power with per-card trend charts, above a local LLM card with generation and prompt token rates, KV cache usage and per-slot context bars.">
+</p>
+
 ## Features
 
 - **CPU** — overall and per-core utilization with a live trend chart.
@@ -28,6 +33,18 @@ readable from a single tab row.
   collecting locally, the aggregator polls `/api/metrics`).
 - **Real-time** — Server-Sent Events; the browser's native `EventSource` reconnects on its
   own. No polling, no refresh.
+
+## Screenshots
+
+The full page on a mixed-vendor box — four GPU cards (NVIDIA via NVML, AMD via `amd-smi`),
+two LLM targets scraped in parallel, CPU/memory trends, swap and host health:
+
+<img src="documentation/assets/dashboard-detail.png" width="900"
+     alt="Full dashboard page: four GPU cards with trend charts, a Strata LLM card and a vLLM LLM card with token rates, KV cache and latency gauges, an LLM activity slot history chart, CPU and memory trend charts, swap usage and host health.">
+
+Hostnames and model names in these images are placeholders (`node-a`, `node-b`,
+`local-model-a`, `remote-model`) — capture your own with `scripts/capture_screenshots.sh`
+if you want pictures of your own hardware.
 
 ## Quick start
 
@@ -144,6 +161,17 @@ mypy app.py                               # types (baseline-gated, see CI)
 
 [GitHub Actions](.github/workflows/ci.yml) runs ruff, a baseline-capped mypy pass and pytest
 on every push and pull request.
+
+### Regenerating the screenshots
+
+```bash
+scripts/capture_screenshots.sh --url http://your-host:5000 \
+  --redact "yourhost=node-a,peer=node-b,YourModelName=local-model-a"
+```
+
+It serves the live dashboard through a redacting proxy (page HTML, `/api/metrics` and the
+SSE frames), waits for real trend history, captures the Local view and the full page, and
+**refuses to write** if any string you asked to redact is still visible in the rendered DOM.
 
 ## Contributing
 
